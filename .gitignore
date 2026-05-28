@@ -129,5 +129,9 @@ dmypy.json
 .pyre/
 checkpoints/
 outputs/
+inputs/
 logs/
 scripts/
+.gradio/
+エラーログ/
+copilot 指示出し改善/
