@@ -1,3 +1,24 @@
+try:
+    from transformers.models.bert.modeling_bert import BertModel
+
+    if not hasattr(BertModel, "get_head_mask"):
+        def get_head_mask(self, head_mask, num_hidden_layers, is_attention_chunked=False):
+            # 新しい transformers で削除された旧 helper を GroundingDINO 互換のために補う。
+            if head_mask is None:
+                return [None] * num_hidden_layers
+            if head_mask.dim() == 1:
+                head_mask = head_mask.unsqueeze(0).unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
+                head_mask = head_mask.expand(num_hidden_layers, -1, -1, -1, -1)
+            elif head_mask.dim() == 2:
+                head_mask = head_mask.unsqueeze(1).unsqueeze(-1).unsqueeze(-1)
+            if is_attention_chunked:
+                head_mask = head_mask.unsqueeze(-1)
+            return head_mask.to(dtype=self.dtype)
+
+        BertModel.get_head_mask = get_head_mask
+except ModuleNotFoundError:
+    pass
+
 # ------------------------------------------------------------------------
 # Modified from Grounded-SAM (https://github.com/IDEA-Research/Grounded-Segment-Anything)
 # ------------------------------------------------------------------------
@@ -15,6 +36,7 @@ from torch.nn import functional as F
 import torchvision
 import networks
 import utils
+from pipelines.components.model_components import default_device, require_gpu_for_heavy_inference
 
 # Grounding DINO
 import sys
@@ -36,38 +58,56 @@ GROUNDING_DINO_CONFIG_PATH = "GroundingDINO/groundingdino/config/GroundingDINO_S
 GROUNDING_DINO_CHECKPOINT_PATH = "checkpoints/groundingdino_swint_ogc.pth"
 mam_checkpoint="checkpoints/mam_vitb.pth"
 output_dir="outputs"
-device="cuda"
+device = default_device()
+require_gpu_for_heavy_inference("gradio_app.py", device)
 background_list = os.listdir('assets/backgrounds')
 
 # initialize MAM
 mam_model = networks.get_generator_m2m(seg='sam_vit_b', m2m='sam_decoder_deep')
-mam_model.to(device)
-checkpoint = torch.load(mam_checkpoint, map_location=device)
+mam_model.to(str(device))
+checkpoint = torch.load(mam_checkpoint, map_location=device, weights_only=True)
 mam_model.m2m.load_state_dict(utils.remove_prefix_state_dict(checkpoint['state_dict']), strict=True)
 mam_model = mam_model.eval()
 
 # initialize GroundingDINO
-grounding_dino_model = Model(model_config_path=GROUNDING_DINO_CONFIG_PATH, model_checkpoint_path=GROUNDING_DINO_CHECKPOINT_PATH, device=device)
+grounding_dino_model = Model(model_config_path=GROUNDING_DINO_CONFIG_PATH, model_checkpoint_path=GROUNDING_DINO_CHECKPOINT_PATH, device=torch.device(device))
 
 # initialize StableDiffusionPipeline
-generator = StableDiffusionPipeline.from_pretrained("runwayml/stable-diffusion-v1-5", torch_dtype=torch.float16)
-generator.to(device)
+sd_dtype = torch.float16 if device.startswith("cuda") else torch.float32
+generator = StableDiffusionPipeline.from_pretrained("runwayml/stable-diffusion-v1-5", torch_dtype=sd_dtype)
+generator.to(str(device))
 
 def run_grounded_sam(input_image, text_prompt, task_type, background_prompt, background_type, box_threshold, text_threshold, iou_threshold, scribble_mode, guidance_mode):
 
-    global groundingdino_model, sam_predictor, generator
+    global grounding_dino_model, generator
 
     # make dir
     os.makedirs(output_dir, exist_ok=True)
 
-     # load image
-    image_ori = input_image["image"]
-    scribble = input_image["mask"]
+    # load image
+    # Gradio 5 ImageEditor: background=元画像, layers=[スクリブルレイヤー], composite=合成画像
+    if isinstance(input_image, dict):
+        image_ori = input_image.get('background', input_image.get('composite', input_image.get('image')))
+    else:
+        image_ori = input_image
+    if image_ori is None:
+        raise ValueError("入力画像が取得できませんでした。")
+    # RGBA → RGB（PNGアップロード時や gr.ImageEditor が 4ch で返す場合に対応）
+    if isinstance(image_ori, np.ndarray) and image_ori.ndim == 3 and image_ori.shape[2] == 4:
+        image_ori = image_ori[:, :, :3]
+    if isinstance(input_image, dict):
+        if 'layers' in input_image and len(input_image['layers']) > 0:
+            mask_layer = input_image['layers'][0]
+            scribble = mask_layer
+        else:
+            scribble = np.zeros((*image_ori.shape[:2], 4), dtype=np.uint8)
+    else:
+        scribble = np.zeros((*image_ori.shape[:2], 4), dtype=np.uint8)
     original_size = image_ori.shape[:2]
 
     if task_type == 'text':
-        if text_prompt is None:
-            print('Please input non-empty text prompt')
+        if not text_prompt:
+            raise gr.Error("テキストプロンプトを入力してください。")
         with torch.no_grad():
             detections, phrases = grounding_dino_model.predict_with_caption(
                 image=cv2.cvtColor(image_ori, cv2.COLOR_RGB2BGR),
@@ -85,17 +125,19 @@ def run_grounded_sam(input_image, text_prompt, task_type, background_prompt, bac
 
             detections.xyxy = detections.xyxy[nms_idx]
             detections.confidence = detections.confidence[nms_idx]
-    
+
+        if len(detections.xyxy) == 0:
+            raise gr.Error("テキストプロンプトに一致する領域が検出されませんでした。")
         bbox = detections.xyxy[np.argmax(detections.confidence)]
         bbox = transform.apply_boxes(bbox, original_size)
-        bbox = torch.as_tensor(bbox, dtype=torch.float).to(device)
+        bbox = torch.as_tensor(bbox, dtype=torch.float).to(str(device))
 
     image = transform.apply_image(image_ori)
-    image = torch.as_tensor(image).to(device)
+    image = torch.as_tensor(image).to(str(device))
     image = image.permute(2, 0, 1).contiguous()
 
-    pixel_mean = torch.tensor([123.675, 116.28, 103.53]).view(3,1,1).to(device)
-    pixel_std = torch.tensor([58.395, 57.12, 57.375]).view(3,1,1).to(device)
+    pixel_mean = torch.tensor([123.675, 116.28, 103.53]).view(3,1,1).to(str(device))
+    pixel_std = torch.tensor([58.395, 57.12, 57.375]).view(3,1,1).to(str(device))
 
     image = (image - pixel_mean) / pixel_std
 
@@ -111,12 +153,14 @@ def run_grounded_sam(input_image, text_prompt, task_type, background_prompt, bac
         labeled_array, num_features = ndimage.label(scribble >= 255)
 
         centers = ndimage.center_of_mass(scribble, labeled_array, range(1, num_features+1))
+        if len(centers) == 0:
+            raise gr.Error("スクリブルが検出されませんでした。画像上に描画してください。")
         centers = np.array(centers)
         ### (x,y)
         centers = transform.apply_coords(centers, original_size)
-        point_coords = torch.from_numpy(centers).to(device)
-        point_coords = point_coords.unsqueeze(0).to(device)
-        point_labels = torch.from_numpy(np.array([1] * len(centers))).unsqueeze(0).to(device)
+        point_coords = torch.from_numpy(centers).to(str(device))
+        point_coords = point_coords.unsqueeze(0).to(str(device))
+        point_labels = torch.from_numpy(np.array([1] * len(centers))).unsqueeze(0).to(str(device))
         if scribble_mode == 'split':
             point_coords = point_coords.permute(1, 0, 2)
             point_labels = point_labels.permute(1, 0)
@@ -126,6 +170,8 @@ def run_grounded_sam(input_image, text_prompt, task_type, background_prompt, bac
         scribble = scribble.transpose(2, 1, 0)[0]
         labeled_array, num_features = ndimage.label(scribble >= 255)
         centers = ndimage.center_of_mass(scribble, labeled_array, range(1, num_features+1))
+        if len(centers) == 0:
+            raise gr.Error("スクリブルが検出されませんでした。画像上に描画してください。")
         centers = np.array(centers)
         ### (x1, y1, x2, y2)
         x_min = centers[:, 0].min()
@@ -134,13 +180,13 @@ def run_grounded_sam(input_image, text_prompt, task_type, background_prompt, bac
         y_max = centers[:, 1].max()
         bbox = np.array([x_min, y_min, x_max, y_max])
         bbox = transform.apply_boxes(bbox, original_size)
-        bbox = torch.as_tensor(bbox, dtype=torch.float).to(device)
+        bbox = torch.as_tensor(bbox, dtype=torch.float).to(str(device))
 
         sample = {'image': image.unsqueeze(0), 'bbox': bbox.unsqueeze(0), 'ori_shape': original_size, 'pad_shape': pad_size}
     elif task_type == 'text':
         sample = {'image': image.unsqueeze(0), 'bbox': bbox.unsqueeze(0), 'ori_shape': original_size, 'pad_shape': pad_size}
     else:
-        print("task_type:{} error!".format(task_type))
+        raise gr.Error(f"無効な task_type: {task_type}")
 
     with torch.no_grad():
         feas, pred, post_mask = mam_model.forward_inference(sample)
@@ -184,8 +230,8 @@ def run_grounded_sam(input_image, text_prompt, task_type, background_prompt, bac
         com_img = alpha_pred[..., None] * image_ori + (1 - alpha_pred[..., None]) * np.uint8(background_img)
         com_img = np.uint8(com_img)
     else:
-        if background_prompt is None:
-            print('Please input non-empty background prompt')
+        if not background_prompt:
+            raise gr.Error("背景プロンプトを入力してください。")
         else:
             background_img = generator(background_prompt).images[0]
             background_img = np.array(background_img)
@@ -207,11 +253,7 @@ if __name__ == "__main__":
 
     print(args)
 
-    block = gr.Blocks()
-    if not args.no_gradio_queue:
-        block = block.queue()
-
-    with block:
+    with gr.Blocks() as block:
         gr.Markdown(
         """
         # Matting Anything Demo
@@ -237,12 +279,12 @@ if __name__ == "__main__":
 
         with gr.Row():
             with gr.Column():
-                input_image = gr.Image(source='upload', type="numpy", value="assets/demo.jpg", tool="sketch")
+                input_image = gr.ImageEditor(type="numpy", value="assets/demo.jpg", label="Upload Image")
                 task_type = gr.Dropdown(["scribble_point", "scribble_box", "text"], value="text", label="Prompt type")
                 text_prompt = gr.Textbox(label="Text prompt", placeholder="the girl in the middle")
                 background_type = gr.Dropdown(["generated_by_text", "real_world_sample"], value="generated_by_text", label="Background type")
                 background_prompt = gr.Textbox(label="Background prompt", placeholder="downtown area in New York")
-                run_button = gr.Button(label="Run")
+                run_button = gr.Button(value="Run")
                 with gr.Accordion("Advanced options", open=False):
                     box_threshold = gr.Slider(
                         label="Box Threshold", minimum=0.0, maximum=1.0, value=0.25, step=0.05
@@ -263,10 +305,11 @@ if __name__ == "__main__":
             with gr.Column():
                 gallery = gr.Gallery(
                     label="Generated images", show_label=True, elem_id="gallery"
-                ).style(preview=True, grid=3, object_fit="scale-down")
+                )
 
         run_button.click(fn=run_grounded_sam, inputs=[
                         input_image, text_prompt, task_type, background_prompt, background_type, box_threshold, text_threshold, iou_threshold, scribble_mode, guidance_mode], outputs=gallery)
 
-    block.queue(concurrency_count=100)
+    if not args.no_gradio_queue:
+        block.queue()
     block.launch(server_name='0.0.0.0', server_port=args.port, debug=args.debug, share=args.share)
