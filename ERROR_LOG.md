@@ -131,8 +131,8 @@ UserWarning: Failed to load custom C++ ops. Running on CPU mode Only!
 GroundingDINO の CUDA カーネル（`ms_deform_attn`）がロードできず CPU 強制になる。
 
 **原因**:
-インストールセルで `!export CUDA_HOME=...` を使っていたが、`!` コマンドは**別のサブシェル**で実行されるため、次の `!pip install -e GroundingDINO` には環境変数が引き継がれない。  
-結果として `CUDA_HOME=None` の状態でビルドされ CUDA 拡張がスキップされる。  
+インストールセルで `!export CUDA_HOME=...` を使っていたが、`!` コマンドは**別のサブシェル**で実行されるため、次の `!pip install -e GroundingDINO` には環境変数が引き継がれない。
+結果として `CUDA_HOME=None` の状態でビルドされ CUDA 拡張がスキップされる。
 `BUILD_WITH_CUDA` は GroundingDINO の setup.py で `AM_I_DOCKER=True` と AND 条件のため単独では機能しない。実際に効くのは `CUDA_HOME` を設定して `torch.cuda.is_available()` が True の場合のみ。
 
 **対処法**:
@@ -208,7 +208,7 @@ NameError: name '_C' is not defined
 ```
 
 **原因**:
-`_C`（GroundingDINO の CUDA カスタムカーネル）のインポートが失敗すると警告のみ出して `_C` は未定義のままになる。  
+`_C`（GroundingDINO の CUDA カスタムカーネル）のインポートが失敗すると警告のみ出して `_C` は未定義のままになる。
 しかし `MultiScaleDeformableAttention.forward()` は `torch.cuda.is_available() and value.is_cuda` が True なら `MultiScaleDeformableAttnFunction` 経由で `_C` を呼ぶため、CUDA テンソルが来ると NameError になる。
 
 **原因コード（修正前）**:
@@ -260,7 +260,7 @@ use_reentrant=False is recommended for most use cases.
 ```
 
 **原因**:
-PyTorch 2.x 途中から `torch.utils.checkpoint.checkpoint()` に `use_reentrant` の明示が必要になった。  
+PyTorch 2.x 途中から `torch.utils.checkpoint.checkpoint()` に `use_reentrant` の明示が必要になった。
 GroundingDINO の `transformer.py`（2箇所）と `backbone/swin_transformer.py`（1箇所）が引数なしで呼んでいた。
 
 **対処法**:
@@ -291,7 +291,7 @@ RuntimeError: The size of tensor a (4) must match the size of tensor b (3) at no
 `gradio_app.py` 内の `image = (image - pixel_mean) / pixel_std` で発生。
 
 **原因**:
-`gr.ImageEditor` の `background` キーは RGBA (4ch) ndarray を返す場合がある（PNG アップロード時、または Gradio が内部で RGBA 変換する場合）。  
+`gr.ImageEditor` の `background` キーは RGBA (4ch) ndarray を返す場合がある（PNG アップロード時、または Gradio が内部で RGBA 変換する場合）。
 これを `torch.as_tensor().permute(2,0,1)` すると `(4,H,W)` テンソルになるが、`pixel_mean` は `(3,1,1)` なのでブロードキャスト時に次元不一致エラーが発生する。
 
 **対処法**:
@@ -322,7 +322,7 @@ Please use `torch.amp.autocast('cuda', args...)` instead.
 `transformer.py` の `forward_ffn()` メソッド内で発生。
 
 **原因**:
-PyTorch 2.x 以降、`torch.cuda.amp.autocast` は deprecated。  
+PyTorch 2.x 以降、`torch.cuda.amp.autocast` は deprecated。
 `torch.amp.autocast(device_type, ...)` が新しい推奨 API。
 
 **対処法**:
@@ -888,3 +888,136 @@ Connection errored out.
 - positive / negative は `gr.Radio(["positive", "negative"])` で受け、helper 側で label `1` / `0` に変換する。
 - `tests/unit/test_jupytext_notebooks.py` で prompt canvas block 自体が `interactive=True` かつ `interactive=False` を含まないことを確認する。
 - `Connection errored out` はブラウザ側の汎用表示なので、再発時は Gradio 起動セル / サーバー stdout の traceback を一次情報として確認する。
+
+---
+
+### [ERR027] Colab Gradio share link 用 frpc 欠落で 127.0.0.1 しか表示されない
+
+| 項目 | 内容 |
+|------|------|
+| **深刻度** | High |
+| **頻度** | Colab 上で Gradio share 用 frpc バイナリの自動取得に失敗した時 |
+| **初回発生日** | 2026-05-29 |
+
+**エラー内容**:
+```
+* Running on local URL:  http://127.0.0.1:7861
+
+Could not create share link. Missing file:
+/usr/local/lib/python3.12/dist-packages/gradio/frpc_linux_amd64_v0.3
+```
+ブラウザで `http://127.0.0.1:7861` を開くと `ERR_CONNECTION_REFUSED` になる。
+
+**原因**:
+Colab の `127.0.0.1` は Colab VM 内部を指すため、手元ブラウザから直接アクセスできない。Colab では Gradio の public share URL を使う必要があるが、share tunnel 用の `frpc_linux_amd64_v0.3` が Gradio package 配下に存在せず、ネットワーク制限や一時的な取得失敗により public URL が生成されていなかった。
+
+**対処法**:
+Haystack 版 Colab Notebook の Gradio 起動セルでは、Colab 判定を `google.colab` の import spec で行い、Colab では必ず `--share` を渡す。frpc 取得や checksum 検証を Notebook 側で過剰に先取りせず、Gradio 5 の既定の share link 生成に任せる。Notebook 出力には、`Running on public URL: https://...gradio.live` を開き、local `127.0.0.1` URL は開かないことを明示する。
+
+**再発防止**:
+- Colab では `Running on local URL` ではなく `Running on public URL` の有無を成功判定にする。
+- Notebook の Gradio 起動セルは `google.colab` の import spec で Colab 判定し、Colab では `!python app.py --share` を実行する。
+- `frpc` の手動取得・checksum 検証を Notebook 側で先取りして Gradio 起動前に止めない。
+- public URL が出ない状態で `127.0.0.1` を開くよう案内しない。
+- `Connection errored out` や `ERR_CONNECTION_REFUSED` はブラウザ表示だけで判断せず、Colab stdout の share link / traceback ログを一次情報にする。
+
+---
+
+### [ERR028] VideoWriter.warm_up が Haystack の no-arg warm_up 契約に反する
+
+| 項目 | 内容 |
+|------|------|
+| **深刻度** | High |
+| **頻度** | 動画版 Haystack Pipeline warm_up 時 |
+| **初回発生日** | 2026-05-29 |
+
+**エラー内容**:
+```
+動画処理に失敗しました: VideoWriter.warm_up() missing 1 required positional argument: 'frame_shape'
+```
+
+**原因**:
+Haystack は Component の `warm_up()` を実行時入力なしで呼ぶ。一方で動画 writer は RGBA codec の可用性確認に frame shape が必要なため、`warm_up(self, frame_shape, preferred_rgba_codec=...)` として実装していた。これは Component lifecycle と runtime 入力依存処理を混在させた設計で、Pipeline 側から no-arg warm_up された時に `TypeError` になる。
+
+同時に動画版 UI は静止画版にあった Text Prompt / GroundingDINO から bbox 候補を作る導線を持たず、複合対象（`person playing drums`, `person riding bicycle`）を第 1 フレームで意味的に指定する実験目的から外れていた。
+
+**対処法**:
+- `VideoWriter.warm_up()` は Haystack 契約通り no-arg / no-op に戻す。
+- frame shape が必要な codec 選択は `_select_rgba_codec(frame_shape, preferred_rgba_codec)` に分離し、`run()` 内で RGBA frame が確定してから実行する。
+- 動画版 UI に任意の `Text Prompt to Box (GroundingDINO)` accordion を追加し、第 1 フレーム検出の top bbox を SAM2 video prompt state にコピーする。
+- Movie Notebook で GroundingDINO checkpoint を取得し、`GROUNDING_DINO_CKPT_PATH` を Gradio 実行プロセスへ渡す。
+
+**再発防止**:
+- Haystack Component の `warm_up()` は runtime 入力に依存させない。入力 shape / fps / codec など実行時にしか分からない値は `run()` で扱う。
+- 静止画版 / 動画版の SAM2 Haystack UI を変更する時は、Text Prompt / GroundingDINO 導線が両方に残っているか確認する。
+- 複合対象選択の要件は `REFERENCE.md` と `.github/copilot-instructions.md` に明記し、動画版でも `person playing drums` / `person riding bicycle` を UI placeholder またはテストで固定する。
+
+---
+
+### [ERR029] 動画版 Pipeline が 5% 表示のまま長時間進み、失敗 stage が分からない
+
+| 項目 | 内容 |
+|------|------|
+| **深刻度** | Medium |
+| **頻度** | 動画版 Haystack Pipeline の初回実行 / 長尺動画 |
+| **初回発生日** | 2026-05-29 |
+
+**エラー内容**:
+```
+動画背景除去を実行後、UI は Pipeline 5% 付近のまま約10分待機し、その後エラーで停止する。
+```
+
+`エラーログ/エラーログ_09.md` では final traceback が欠けていたが、ログには `frame loading (JPEG): 240/240 [00:43]`、`propagate in video: 240/240 [04:29]`、`Settings -> Mode=base, Device=cuda` が出ており、SAM2 video propagation までは進んでいた。
+
+**原因**:
+Gradio callback が `progress(0.05, desc="Pipeline を起動しています")` を表示した後、end-to-end Haystack Pipeline 完了まで次の進捗を出していなかった。動画読込、SAM2 一時 JPEG 化、SAM2 video propagation、transparent-background frame 処理、動画/連番書き出しが直列で走るため、長時間の初回実行が「5%で止まった」ように見えた。加えて、例外発生時にどの stage で落ちたかを UI エラーへ含めていなかった。
+
+**対処法**:
+- end-to-end Pipeline は維持し、`VideoReader` / `SAM2VideoPropagator` / `TransparentBGVideoExtractor` / `VideoWriter` / `FrameSequenceWriter` に任意の `progress_callback` 入力を追加する。
+- Gradio 側で Component 内部進捗を全体進捗へマッピングし、動画読込、SAM2 伝搬、transparent-background、書き出しの stage と frame 数を表示する。
+- 例外時は `stage=<最後に報告された処理>` と elapsed 秒を `gr.Error` に含め、final traceback が欠けても切り分け可能にする。
+- 初回 UX の既定を短尺クイックプレビューへ変更し、長尺/全 frame は Advanced で明示的に増やす導線にする。
+
+**再発防止**:
+- 5分超が見込まれる Component は、Gradio callback の固定 progress だけでなく Component 内部 progress を返す。
+- 動画読込を重複させる stage 分割は避け、1 回の `VideoReader` 出力を downstream に接続する end-to-end Pipeline を維持する。
+- エラーログには final traceback と `stage=` 付き Gradio error を必ず残す。
+- 初回確認用 default は短尺にし、UI に処理 frame 数・各パラメーターの意味・品質/速度トレードオフを明記する。
+
+---
+
+### [ERR030] 動画版 transparent-background が出力 frame を全保持し Colab RAM を使い切る
+
+| 項目 | 内容 |
+|------|------|
+| **深刻度** | Critical |
+| **頻度** | 高解像度動画 / `both` 出力 / 長尺処理で発生 |
+| **初回発生日** | 2026-05-29 |
+
+**エラー内容**:
+```
+使用可能な RAM をすべて使用した後でセッションがクラッシュ。
+...
+propagate in video: 100% 60/60
+Settings -> Mode=base, Device=cuda, Torchscript=disabled
+```
+
+`エラーログ/エラーログ_10.md` では Python traceback が残る前に Colab runtime が kill されている。SAM2 の 60/60 伝搬完了後、transparent-background 初期化ログまで進んでいるため、SAM2 ではなく後段の frame matting / output retention が主要因。
+
+**原因**:
+動画版 `TransparentBGVideoExtractor` が `rgba_frames`, `alpha_frames`, `preview_frames` を全 frame 分 list に保持し、その後 `VideoWriter` / `FrameSequenceWriter` に渡していた。入力 RGB frame list と SAM2 mask list に加えて、RGBA(4ch)・alpha(1ch)・preview(3ch) を全保持するため、特に高解像度・長尺・`both` 出力で peak RAM が急増する。Colab では OS がプロセスを kill するため、Gradio 側に `gr.Error` や traceback が出ないことがある。
+
+**対処法**:
+- `TransparentBGVideoExtractor` を streaming 出力へ変更し、frame ごとに transparent-background 結果を動画/PNG へ即時保存する。
+- `matte` dict は `rgba_frames` / `alpha_frames` / `preview_frames` を空 list にし、保存済み path と metadata だけを下流へ渡す compact contract にする。
+- 既存 `VideoWriter` / `FrameSequenceWriter` は保存済み path/dir を持つ compact matte を pass-through できるようにする。
+- Gradio callback は `include_outputs_from` で `video_reader` / `sam2_video_propagator` / `transparent_bg_video` の巨大中間出力を返さず、writer の compact 結果だけを読む。
+- Text Prompt 使用後に GroundingDINO/BERT cache が残る副因を避けるため、動画実行直前に `release_text_detector()` で semantic detector を解放する。
+- 初回既定を `max_frames=30` に下げ、まず短尺で prompt と品質を確認してから長尺へ増やす。
+
+**再発防止**:
+- 動画 pipeline で RGB / mask / RGBA / alpha / preview の全 frame list を同時保持しない。
+- Haystack の中間出力を Gradio callback に返す場合は、返却 dict に numpy frame list が含まれないか確認する。
+- `output_mode=both` は動画と連番の二重書き出しになるため、初回確認では `video` か `sequence` の片方を推奨する。
+- Text Prompt 後に動画処理へ進む場合は、GroundingDINO/BERT cache を解放してから SAM2 / transparent-background を走らせる。
+- 高解像度・長尺処理で runtime kill が起きた場合は、最終 traceback がないこと自体を OOM の兆候として扱い、最後に出た stage ログから peak RAM 箇所を切り分ける。

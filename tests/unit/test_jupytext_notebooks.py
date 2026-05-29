@@ -13,11 +13,34 @@ def test_haystack_notebook_sources_are_jupytext_percent_files() -> None:
 def test_haystack_notebook_sources_launch_expected_apps() -> None:
     mam_source = Path("Matting_Anything_Haystack.py").read_text(encoding="utf-8")
     sam2_source = Path("Sam2_Transparent_Background_Haystack.py").read_text(encoding="utf-8")
+    movie_source = Path("Sam2_Transparent_Background_Haystack_for_Movie.py").read_text(encoding="utf-8")
 
     assert "gradio_app_haystack.py" in mam_source
     assert "gradio_app_sam2_transparent_BG_haystack.py" in sam2_source
     assert "--share" in mam_source
     assert "--share" in sam2_source
+    assert "--share" in movie_source
+
+
+def test_colab_gradio_launch_cells_preserve_gradio_share_defaults() -> None:
+    """Colab では Gradio の share 生成に任せ、public URL を開く案内を出す。"""
+    notebook_sources = [
+        Path("Matting_Anything_Haystack.py").read_text(encoding="utf-8"),
+        Path("Sam2_Transparent_Background_Haystack.py").read_text(encoding="utf-8"),
+        Path("Sam2_Transparent_Background_Haystack_for_Movie.py").read_text(encoding="utf-8"),
+    ]
+
+    for source in notebook_sources:
+        assert "def is_colab_runtime()" in source
+        assert 'find_spec("google.colab")' in source
+        assert "except (ModuleNotFoundError, ValueError):" in source
+        assert source.count("def is_colab_runtime()") == 1
+        assert 'SHARE_FLAG = "--share" if IS_COLAB else ""' in source
+        assert "Running on public URL" in source
+        assert "gradio.live" in source
+        assert "not the local 127.0.0.1 URL" in source
+        assert "ensure_gradio_share_binary_for_colab" not in source
+        assert "checksum verification failed" not in source
 
 
 def test_sam2_haystack_notebook_installs_groundingdino_runtime_dependencies() -> None:
@@ -64,7 +87,9 @@ def test_sam2_movie_notebook_has_colab_device_diagnostics() -> None:
     assert "torch.cuda.is_available()" in movie_source
     assert "torch.version.cuda" in movie_source
     assert "SAM2 checkpoint:" in movie_source
+    assert "GroundingDINO checkpoint:" in movie_source
     assert 'os.environ["SAM2_CKPT_PATH"]' in movie_source
+    assert 'os.environ["GROUNDING_DINO_CKPT_PATH"]' in movie_source
     assert "MATTING_ANYTHING_ALLOW_CPU=1" in movie_source
     assert "emergency CPU fallback" in movie_source
     assert "CUDA GPU runtime is required before launching Gradio" in movie_source
@@ -326,6 +351,12 @@ def test_sam2_movie_ui_auto_loads_first_frame_and_simplifies_settings() -> None:
     assert 'gr.Button("第1フレームを再取得")' in app_source
     assert 'with gr.Accordion("Advanced: 動画処理設定", open=False)' in app_source
     assert 'prompt_mode = gr.Radio(["point", "box"], value="box"' in app_source
+    assert 'max_frames = gr.Slider(1, 2000, value=30' in app_source
+    assert 'frame_step = gr.Slider(1, 10, value=1' in app_source
+    assert "SAM2 Prompt Canvas" in app_source
+    assert "対角 2 点" in app_source
+    assert "Text Prompt（意味解釈）→ SAM2（マスク/トラッキング）→ transparent-background" in app_source
+    assert "パラメーター" in app_source
 
 
 def test_sam2_movie_ui_hides_codec_for_sequence_and_point_label_for_box_mode() -> None:

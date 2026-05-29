@@ -6,6 +6,7 @@ import datetime
 import os
 import shutil
 import tempfile
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +27,9 @@ from .video_common import (
 )
 
 
+ProgressCallback = Callable[[str, float, str], None]
+
+
 def _resolve_output_dir(output_dir: str) -> Path:
     """出力ディレクトリを PROJECT_ROOT 基準の絶対パスへ解決する。"""
     output_path = Path(output_dir)
@@ -35,12 +39,69 @@ def _resolve_output_dir(output_dir: str) -> Path:
     return project_root / output_path
 
 
+def _notify_progress(
+    progress_callback: ProgressCallback | None,
+    stage: str,
+    fraction: float,
+    description: str,
+) -> None:
+    """Gradio 側へ Component 内部の進捗を通知する。"""
+    if progress_callback is None:
+        return
+    progress_callback(stage, min(max(float(fraction), 0.0), 1.0), description)
+
+
+class _OpenCVFrameVideoWriter:
+    """1 frame ずつ OpenCV 動画へ書き出す軽量 writer。"""
+
+    def __init__(self, path: Path, first_frame: np.ndarray, fps: float, fourcc_name: str, channels: int) -> None:
+        first = np.asarray(first_frame)
+        height, width = first.shape[:2]
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self._path = path
+        self._channels = channels
+        self._writer = cv2.VideoWriter(
+            str(path),
+            cv2.VideoWriter_fourcc(*fourcc_name),
+            float(fps),
+            (width, height),
+            isColor=channels != 1,
+        )
+        if not self._writer.isOpened():
+            raise RuntimeError(f"VideoWriter を開けません: {path}")
+
+    def write(self, frame: np.ndarray) -> None:
+        frame_array = np.asarray(frame).astype(np.uint8, copy=False)
+        if self._channels == 1:
+            if frame_array.ndim == 2:
+                self._writer.write(frame_array)
+            elif frame_array.shape[2] == 4:
+                self._writer.write(cv2.cvtColor(frame_array, cv2.COLOR_RGBA2GRAY))
+            else:
+                self._writer.write(cv2.cvtColor(frame_array, cv2.COLOR_RGB2GRAY))
+        elif frame_array.ndim == 2:
+            self._writer.write(cv2.cvtColor(frame_array, cv2.COLOR_GRAY2BGR))
+        elif frame_array.shape[2] == 4:
+            self._writer.write(cv2.cvtColor(frame_array, cv2.COLOR_RGBA2BGRA))
+        else:
+            self._writer.write(cv2.cvtColor(frame_array, cv2.COLOR_RGB2BGR))
+
+    def close(self) -> None:
+        self._writer.release()
+
+
 @component
 class VideoReader:
     """動画ファイルを RGB frame list と metadata に分解する Component。"""
 
     @component.output_types(frames=list, metadata=dict)
-    def run(self, video_path: str, max_frames: int = 300, frame_step: int = 1) -> dict[str, Any]:
+    def run(
+        self,
+        video_path: str,
+        max_frames: int = 300,
+        frame_step: int = 1,
+        progress_callback: ProgressCallback | None = None,
+    ) -> dict[str, Any]:
         """OpenCV で動画を読み込み、RGB uint8 frame の list を返す。"""
         if not video_path:
             raise ValueError("video_path が空です。")
@@ -55,8 +116,10 @@ class VideoReader:
             codec_int = int(capture.get(cv2.CAP_PROP_FOURCC) or 0)
             codec = "".join(chr((codec_int >> 8 * index) & 0xFF) for index in range(4)).strip()
             indices = set(sample_frame_indices(frame_count, int(max_frames), int(frame_step)))
+            target_count = max(len(indices), 1)
             frames: list[np.ndarray] = []
             source_indices: list[int] = []
+            _notify_progress(progress_callback, "video_reader", 0.0, "動画を読み込んでいます")
             current_index = 0
             while True:
                 ok, frame_bgr = capture.read()
@@ -65,6 +128,13 @@ class VideoReader:
                 if current_index in indices:
                     frames.append(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))
                     source_indices.append(current_index)
+                    if len(frames) == 1 or len(frames) % 10 == 0 or len(frames) >= target_count:
+                        _notify_progress(
+                            progress_callback,
+                            "video_reader",
+                            len(frames) / target_count,
+                            f"動画を読み込んでいます ({len(frames)}/{target_count} frames)",
+                        )
                     if len(frames) >= int(max_frames):
                         break
                 current_index += 1
@@ -122,24 +192,36 @@ class SAM2VideoPropagator:
         labels: list[int] | None = None,
         box: list[int] | None = None,
         object_id: int = 1,
+        progress_callback: ProgressCallback | None = None,
     ) -> dict[str, Any]:
         """first-frame prompt を SAM2 video predictor に登録し、frame mask 列を返す。"""
         if not frames:
             raise ValueError("frames が空です。")
         if not points and box is None:
             raise ValueError("SAM2 video prompt が空です。points または box を指定してください。")
+        _notify_progress(progress_callback, "sam2_video", 0.0, "SAM2 video predictor を初期化しています")
         self.warm_up()
+        _notify_progress(progress_callback, "sam2_video", 0.08, "SAM2 用の一時 frame を準備しています")
         assert self._video_predictor is not None
         import torch
 
         frame_masks: dict[int, np.ndarray] = {}
         source_indices = list((metadata or {}).get("metadata", {}).get("sampled_frame_indices", range(len(frames))))
+        total_frames = max(len(frames), 1)
         with tempfile.TemporaryDirectory(prefix="sam2_video_frames_") as temp_dir:
             temp_path = Path(temp_dir)
             for frame_index, frame in enumerate(frames):
                 frame_rgb = ensure_rgb_array(frame)
                 cv2.imwrite(str(temp_path / f"{frame_index:06d}.jpg"), cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR))
+                if frame_index == 0 or (frame_index + 1) % 10 == 0 or frame_index + 1 == total_frames:
+                    _notify_progress(
+                        progress_callback,
+                        "sam2_video",
+                        0.08 + 0.12 * ((frame_index + 1) / total_frames),
+                        f"SAM2 用の一時 frame を準備しています ({frame_index + 1}/{total_frames})",
+                    )
             with torch.inference_mode():
+                _notify_progress(progress_callback, "sam2_video", 0.22, "SAM2 の video state を初期化しています")
                 state = self._video_predictor.init_state(video_path=str(temp_path))
                 add_kwargs: dict[str, Any] = {"inference_state": state, "frame_idx": 0, "obj_id": int(object_id)}
                 if points:
@@ -148,7 +230,10 @@ class SAM2VideoPropagator:
                 if box is not None:
                     add_kwargs["box"] = np.asarray(box, dtype=np.float32)
                 self._video_predictor.add_new_points_or_box(**add_kwargs)
+                _notify_progress(progress_callback, "sam2_video", 0.25, "SAM2 mask を動画全体へ伝搬しています")
+                propagated_count = 0
                 for out_frame_idx, out_obj_ids, out_mask_logits in self._video_predictor.propagate_in_video(state):
+                    propagated_count += 1
                     object_ids = [int(value) for value in out_obj_ids]
                     target_index = object_ids.index(int(object_id)) if int(object_id) in object_ids else 0
                     mask_logits = out_mask_logits[target_index]
@@ -158,6 +243,13 @@ class SAM2VideoPropagator:
                         mask_array = (np.asarray(mask_logits) > 0.0).squeeze()
                     source_index = int(source_indices[int(out_frame_idx)]) if int(out_frame_idx) < len(source_indices) else int(out_frame_idx)
                     frame_masks[source_index] = mask_array.astype(bool)
+                    if propagated_count == 1 or propagated_count % 10 == 0 or propagated_count == total_frames:
+                        _notify_progress(
+                            progress_callback,
+                            "sam2_video",
+                            0.25 + 0.75 * (propagated_count / total_frames),
+                            f"SAM2 mask を動画全体へ伝搬しています ({propagated_count}/{total_frames})",
+                        )
         masks = build_frame_mask_sequence(
             frame_masks,
             object_ids=[int(object_id)],
@@ -170,10 +262,16 @@ class SAM2VideoPropagator:
 
 @component
 class TransparentBGVideoExtractor:
-    """各 frame に transparent-background を適用し、メモリ上の matte frame 列を作る Component。"""
+    """各 frame に transparent-background を適用し、結果を逐次書き出す Component。"""
 
-    def __init__(self, project_root: str | None = None, device: str | None = None) -> None:
+    def __init__(
+        self,
+        project_root: str | None = None,
+        device: str | None = None,
+        output_dir: str = "outputs",
+    ) -> None:
         self.extractor = TransparentBGExtractor(project_root=project_root, device=device)
+        self.output_dir = _resolve_output_dir(output_dir)
 
     @component.output_types(matte=dict)
     def run(
@@ -187,46 +285,98 @@ class TransparentBGVideoExtractor:
         tb_threshold: float = 0.0,
         tb_output_type: str = "rgba",
         crop_padding: int = 40,
+        rgba_codec: str = "webm_vp9",
+        progress_callback: ProgressCallback | None = None,
     ) -> dict[str, dict[str, Any]]:
-        """frame ごとに `TransparentBGExtractor` を呼び、書き出し前の結果をまとめる。"""
+        """frame ごとに `TransparentBGExtractor` を呼び、出力を RAM に溜めず保存する。"""
         if not frames:
             raise ValueError("frames が空です。")
         normalized_mode = normalize_output_mode(output_mode)
         frame_masks = (masks or {}).get("frame_masks", {})
         source_indices = list((metadata or {}).get("metadata", {}).get("sampled_frame_indices", range(len(frames))))
-        rgba_frames: list[np.ndarray] = []
-        alpha_frames: list[np.ndarray] = []
-        preview_frames: list[np.ndarray] = []
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        for local_index, frame in enumerate(frames):
-            source_index = int(source_indices[local_index]) if local_index < len(source_indices) else local_index
-            mask = frame_masks.get(source_index)
-            result = self.extractor.run(
-                image=frame,
-                mask=mask,
-                tb_mode=tb_mode,
-                tb_jit=tb_jit,
-                tb_threshold=tb_threshold,
-                tb_output_type=tb_output_type,
-                crop_padding=int(crop_padding),
-            )
-            rgba_frames.append(result["rgba"])
-            alpha_frames.append(result["alpha"])
-            preview_frames.append(result["preview"])
+        output_root = self.output_dir / timestamp
+        video_dir = output_root / "video"
+        sequence_root = output_root / "sequence"
+        rgba_dir = sequence_root / "rgba"
+        alpha_dir = sequence_root / "alpha"
+        preview_dir = sequence_root / "preview"
+        fps = float((metadata or {}).get("fps", 30.0))
+        rgba_video_path: Path | None = None
+        alpha_video_path: Path | None = None
+        preview_video_path: Path | None = None
+        rgba_stream: _OpenCVFrameVideoWriter | None = None
+        alpha_stream: _OpenCVFrameVideoWriter | None = None
+        preview_stream: _OpenCVFrameVideoWriter | None = None
+        codec_fallback: list[tuple[str, str]] = []
+        used_rgba_codec: str | None = None
+        total_frames = max(len(frames), 1)
+        _notify_progress(progress_callback, "transparent_bg", 0.0, "transparent-background を初期化しています")
+        try:
+            for local_index, frame in enumerate(frames):
+                source_index = int(source_indices[local_index]) if local_index < len(source_indices) else local_index
+                mask = frame_masks.get(source_index)
+                result = self.extractor.run(
+                    image=frame,
+                    mask=mask,
+                    tb_mode=tb_mode,
+                    tb_jit=tb_jit,
+                    tb_threshold=tb_threshold,
+                    tb_output_type=tb_output_type,
+                    crop_padding=int(crop_padding),
+                )
+                rgba_frame = normalize_rgba_frame(result["rgba"])
+                alpha_frame = np.asarray(result["alpha"]).astype(np.uint8, copy=False)
+                preview_frame = ensure_rgb_array(result["preview"])
+                if local_index == 0 and normalized_mode in {"video", "both"}:
+                    _notify_progress(progress_callback, "transparent_bg", 0.03, "動画 codec を確認しています")
+                    video_helper = VideoWriter(str(self.output_dir))
+                    fourcc, suffix, codec_fallback = video_helper._select_rgba_codec(
+                        rgba_frame.shape[:2],
+                        preferred_rgba_codec=rgba_codec,
+                    )
+                    rgba_video_path = video_dir / f"rgba{suffix}"
+                    alpha_video_path = video_dir / "alpha.mp4"
+                    preview_video_path = video_dir / "preview.mp4"
+                    used_rgba_codec = suffix.lstrip(".")
+                    rgba_stream = _OpenCVFrameVideoWriter(rgba_video_path, rgba_frame, fps, fourcc, channels=4)
+                    alpha_stream = _OpenCVFrameVideoWriter(alpha_video_path, alpha_frame, fps, "mp4v", channels=1)
+                    preview_stream = _OpenCVFrameVideoWriter(preview_video_path, preview_frame, fps, "mp4v", channels=3)
+                if rgba_stream is not None:
+                    rgba_stream.write(rgba_frame)
+                if alpha_stream is not None:
+                    alpha_stream.write(alpha_frame)
+                if preview_stream is not None:
+                    preview_stream.write(preview_frame)
+                if normalized_mode in {"sequence", "both"}:
+                    write_png_frame(rgba_dir / f"frame_{local_index:06d}.png", rgba_frame)
+                    write_png_frame(alpha_dir / f"frame_{local_index:06d}.png", alpha_frame)
+                    write_png_frame(preview_dir / f"frame_{local_index:06d}.png", preview_frame)
+                if local_index == 0 or (local_index + 1) % 5 == 0 or local_index + 1 == total_frames:
+                    _notify_progress(
+                        progress_callback,
+                        "transparent_bg",
+                        (local_index + 1) / total_frames,
+                        f"transparent-background を frame ごとに適用・保存しています ({local_index + 1}/{total_frames})",
+                    )
+        finally:
+            for stream in (rgba_stream, alpha_stream, preview_stream):
+                if stream is not None:
+                    stream.close()
         matte = {
-            "rgba_video_path": None,
-            "alpha_video_path": None,
-            "preview_video_path": None,
-            "rgba_sequence_dir": None,
-            "alpha_sequence_dir": None,
-            "preview_sequence_dir": None,
-            "sequence_pattern": None,
-            "fps": float((metadata or {}).get("fps", 30.0)),
+            "rgba_video_path": str(rgba_video_path) if rgba_video_path else None,
+            "alpha_video_path": str(alpha_video_path) if alpha_video_path else None,
+            "preview_video_path": str(preview_video_path) if preview_video_path else None,
+            "rgba_sequence_dir": str(rgba_dir) if normalized_mode in {"sequence", "both"} else None,
+            "alpha_sequence_dir": str(alpha_dir) if normalized_mode in {"sequence", "both"} else None,
+            "preview_sequence_dir": str(preview_dir) if normalized_mode in {"sequence", "both"} else None,
+            "sequence_pattern": "frame_{:06d}.png" if normalized_mode in {"sequence", "both"} else None,
+            "fps": fps,
             "frame_count": len(frames),
             "output_mode": normalized_mode,
-            "rgba_frames": rgba_frames,
-            "alpha_frames": alpha_frames,
-            "preview_frames": preview_frames,
+            "rgba_frames": [],
+            "alpha_frames": [],
+            "preview_frames": [],
             "metadata": {
                 "source": "transparent-background-video",
                 "timestamp": timestamp,
@@ -234,6 +384,9 @@ class TransparentBGVideoExtractor:
                 "tb_mode": tb_mode,
                 "tb_output_type": tb_output_type,
                 "crop_padding": int(crop_padding),
+                "streamed_outputs": True,
+                "codec_fallback": codec_fallback,
+                "used_rgba_codec": used_rgba_codec,
             },
         }
         return {"matte": matte}
@@ -261,7 +414,15 @@ class VideoWriter:
         self._codec_cache[codec] = ok
         return ok
 
-    def warm_up(self, frame_shape: tuple[int, int], preferred_rgba_codec: str = "webm_vp9") -> tuple[str, str, list[tuple[str, str]]]:
+    def warm_up(self) -> None:
+        """Haystack Pipeline の no-arg warm_up 契約に合わせる。"""
+        return None
+
+    def _select_rgba_codec(
+        self,
+        frame_shape: tuple[int, int],
+        preferred_rgba_codec: str = "webm_vp9",
+    ) -> tuple[str, str, list[tuple[str, str]]]:
         """利用可能な動画 codec を確認し、RGBA 用 codec を選ぶ。"""
         fallback: list[tuple[str, str]] = []
         candidates = []
@@ -277,7 +438,16 @@ class VideoWriter:
             fallback.append((label, "failed (skipped)"))
         raise ValueError("RGBA 動画を書き出せる codec が見つかりません。連番出力を選択してください。")
 
-    def _write_video(self, path: Path, frames: list[np.ndarray], fps: float, fourcc_name: str, channels: int = 3) -> None:
+    def _write_video(
+        self,
+        path: Path,
+        frames: list[np.ndarray],
+        fps: float,
+        fourcc_name: str,
+        channels: int = 3,
+        progress_callback: ProgressCallback | None = None,
+        progress_prefix: str = "動画を書き出しています",
+    ) -> None:
         if not frames:
             raise ValueError(f"動画に書き出す frame がありません: {path}")
         first = np.asarray(frames[0])
@@ -286,19 +456,40 @@ class VideoWriter:
         if not writer.isOpened():
             raise RuntimeError(f"VideoWriter を開けません: {path}")
         try:
-            for frame in frames:
+            total_frames = max(len(frames), 1)
+            for frame_index, frame in enumerate(frames):
                 frame_array = np.asarray(frame).astype(np.uint8, copy=False)
-                if frame_array.ndim == 2:
+                if channels == 1:
+                    if frame_array.ndim == 2:
+                        writer.write(frame_array)
+                    elif frame_array.shape[2] == 4:
+                        writer.write(cv2.cvtColor(frame_array, cv2.COLOR_RGBA2GRAY))
+                    else:
+                        writer.write(cv2.cvtColor(frame_array, cv2.COLOR_RGB2GRAY))
+                elif frame_array.ndim == 2:
                     writer.write(cv2.cvtColor(frame_array, cv2.COLOR_GRAY2BGR))
                 elif frame_array.shape[2] == 4:
                     writer.write(cv2.cvtColor(frame_array, cv2.COLOR_RGBA2BGRA))
                 else:
                     writer.write(cv2.cvtColor(frame_array, cv2.COLOR_RGB2BGR))
+                written_count = frame_index + 1
+                if written_count == 1 or written_count % 20 == 0 or written_count == total_frames:
+                    _notify_progress(
+                        progress_callback,
+                        "video_writer",
+                        written_count / total_frames,
+                        f"{progress_prefix} ({written_count}/{total_frames})",
+                    )
         finally:
             writer.release()
 
     @component.output_types(matte=dict)
-    def run(self, matte: dict, rgba_codec: str = "webm_vp9") -> dict[str, dict[str, Any]]:
+    def run(
+        self,
+        matte: dict,
+        rgba_codec: str = "webm_vp9",
+        progress_callback: ProgressCallback | None = None,
+    ) -> dict[str, dict[str, Any]]:
         """出力モードが video/both のとき動画ファイルを書き出す。"""
         output_mode = normalize_output_mode(matte.get("output_mode", "video"))
         if output_mode == "sequence":
@@ -310,14 +501,45 @@ class VideoWriter:
         alpha_frames = list(matte.get("alpha_frames", []))
         preview_frames = [ensure_rgb_array(frame) for frame in matte.get("preview_frames", [])]
         if not rgba_frames:
+            if matte.get("rgba_video_path") and matte.get("alpha_video_path") and matte.get("preview_video_path"):
+                return {"matte": matte}
             raise ValueError("RGBA frame が空です。")
-        fourcc, suffix, fallback = self.warm_up(rgba_frames[0].shape[:2], preferred_rgba_codec=rgba_codec)
+        _notify_progress(progress_callback, "video_writer", 0.0, "RGBA 動画 codec を確認しています")
+        fourcc, suffix, fallback = self._select_rgba_codec(rgba_frames[0].shape[:2], preferred_rgba_codec=rgba_codec)
         rgba_path = video_dir / f"rgba{suffix}"
         alpha_path = video_dir / "alpha.mp4"
         preview_path = video_dir / "preview.mp4"
-        self._write_video(rgba_path, rgba_frames, matte.get("fps", 30.0), fourcc, channels=4)
-        self._write_video(alpha_path, alpha_frames, matte.get("fps", 30.0), "mp4v", channels=1)
-        self._write_video(preview_path, preview_frames, matte.get("fps", 30.0), "mp4v", channels=3)
+        _notify_progress(progress_callback, "video_writer", 0.10, "RGBA 動画を書き出しています")
+        self._write_video(
+            rgba_path,
+            rgba_frames,
+            matte.get("fps", 30.0),
+            fourcc,
+            channels=4,
+            progress_callback=progress_callback,
+            progress_prefix="RGBA 動画を書き出しています",
+        )
+        _notify_progress(progress_callback, "video_writer", 0.45, "Alpha 動画を書き出しています")
+        self._write_video(
+            alpha_path,
+            alpha_frames,
+            matte.get("fps", 30.0),
+            "mp4v",
+            channels=1,
+            progress_callback=progress_callback,
+            progress_prefix="Alpha 動画を書き出しています",
+        )
+        _notify_progress(progress_callback, "video_writer", 0.75, "Preview 動画を書き出しています")
+        self._write_video(
+            preview_path,
+            preview_frames,
+            matte.get("fps", 30.0),
+            "mp4v",
+            channels=3,
+            progress_callback=progress_callback,
+            progress_prefix="Preview 動画を書き出しています",
+        )
+        _notify_progress(progress_callback, "video_writer", 1.0, "動画書き出しが完了しました")
         updated = dict(matte)
         updated["rgba_video_path"] = str(rgba_path)
         updated["alpha_video_path"] = str(alpha_path)
@@ -335,7 +557,11 @@ class FrameSequenceWriter:
         self.output_dir = _resolve_output_dir(output_dir)
 
     @component.output_types(matte=dict)
-    def run(self, matte: dict) -> dict[str, dict[str, Any]]:
+    def run(
+        self,
+        matte: dict,
+        progress_callback: ProgressCallback | None = None,
+    ) -> dict[str, dict[str, Any]]:
         """出力モードが sequence/both のとき PNG 連番を書き出す。"""
         output_mode = normalize_output_mode(matte.get("output_mode", "video"))
         if output_mode == "video":
@@ -348,17 +574,30 @@ class FrameSequenceWriter:
         rgba_frames = [normalize_rgba_frame(frame) for frame in matte.get("rgba_frames", [])]
         alpha_frames = list(matte.get("alpha_frames", []))
         preview_frames = [ensure_rgb_array(frame) for frame in matte.get("preview_frames", [])]
+        if not rgba_frames and matte.get("rgba_sequence_dir") and matte.get("alpha_sequence_dir") and matte.get("preview_sequence_dir"):
+            return {"matte": matte}
         self.output_dir.mkdir(parents=True, exist_ok=True)
         estimated_bytes = sum(frame.nbytes for frame in rgba_frames + alpha_frames + preview_frames)
         free_bytes = shutil.disk_usage(self.output_dir).free
         if free_bytes < estimated_bytes:
             raise RuntimeError("連番出力に必要な空き容量が不足しています。")
+        total_writes = max(len(rgba_frames) + len(alpha_frames) + len(preview_frames), 1)
+        written_count = 0
         for index, frame in enumerate(rgba_frames):
             write_png_frame(rgba_dir / f"frame_{index:06d}.png", frame)
+            written_count += 1
+            if written_count == 1 or written_count % 20 == 0 or written_count == total_writes:
+                _notify_progress(progress_callback, "frame_sequence_writer", written_count / total_writes, "RGBA PNG 連番を書き出しています")
         for index, frame in enumerate(alpha_frames):
             write_png_frame(alpha_dir / f"frame_{index:06d}.png", frame)
+            written_count += 1
+            if written_count % 20 == 0 or written_count == total_writes:
+                _notify_progress(progress_callback, "frame_sequence_writer", written_count / total_writes, "Alpha PNG 連番を書き出しています")
         for index, frame in enumerate(preview_frames):
             write_png_frame(preview_dir / f"frame_{index:06d}.png", frame)
+            written_count += 1
+            if written_count % 20 == 0 or written_count == total_writes:
+                _notify_progress(progress_callback, "frame_sequence_writer", written_count / total_writes, "Preview PNG 連番を書き出しています")
         updated = dict(matte)
         updated["rgba_sequence_dir"] = str(rgba_dir)
         updated["alpha_sequence_dir"] = str(alpha_dir)

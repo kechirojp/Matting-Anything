@@ -8,8 +8,8 @@
 
 | 項目 | 内容 |
 |------|------|
-| **作業中のタスク** | SAM2 / GroundingDINO 遅延 telemetry・GPU first 方針反映（完了・Colab実測待ち） |
-| **最終更新日** | 2026-05-28（GPU first policy） |
+| **作業中のタスク** | エラーログ09 動画進捗/UX改善（完了）。SAM2 / GroundingDINO 遅延 telemetry は Colab実測待ち |
+| **最終更新日** | 2026-05-29（エラーログ09 動画進捗/UX改善） |
 | **担当者/セッション** | GitHub Copilot |
 
 ---
@@ -17,6 +17,94 @@
 ## 進行中タスクの詳細
 
 <!-- 現在取り組んでいるタスクの目的・進捗・残作業を記述 -->
+
+### タスク名: エラーログ09 動画進捗/UX改善（2026-05-29）
+- **目的**: `Sam2_Transparent_Background_Haystack_for_Movie.ipynb` の初回実行が 5% 付近で長時間止まって見える問題を解消し、使い方・フロー順・パラメーター説明を改善する
+- **進捗**: 完了
+- **変更ファイル**: `pipelines/components/video_model_components.py`, `gradio_app_sam2_transparent_BG_haystack_for_Movie.py`, `Sam2_Transparent_Background_Haystack_for_Movie.py`, `Sam2_Transparent_Background_Haystack_for_Movie.ipynb`, `tests/unit/test_video_pipeline_wiring.py`, `tests/unit/test_jupytext_notebooks.py`, `.github/copilot-instructions.md`, `REFERENCE.md`, `ERROR_LOG.md`, `エラーログ/エラーログ_09.md`, `WHITEBOARD.md`
+- **原因**: エラーログ09には final traceback が欠けていたが、240 frames の動画読込と SAM2 propagation は完走していた。UI は Pipeline 開始時の 5% 表示後に内部 stage 進捗を出しておらず、初回のモデル読込・SAM2伝搬・transparent-background 処理が停止に見えていた
+- **対応**:
+  1. end-to-end Pipeline は維持し、`VideoReader` / `SAM2VideoPropagator` / `TransparentBGVideoExtractor` / `VideoWriter` / `FrameSequenceWriter` に任意の `progress_callback` を追加
+  2. Gradio 側で stage progress を `video_reader` / `sam2_video` / `transparent_bg` / writer にマッピングし、エラー時は最後の stage と elapsed 秒を表示
+  3. 初回既定を `max_frames=60`, `frame_step=1` のクイックプレビューへ変更
+  4. UI と notebook に箇条書きフロー、`SAM2 Prompt Canvas` の説明、bbox の「対角 2 点」説明、Text Prompt→SAM2→transparent-background の順序説明、パラメーター説明表を追加
+  5. `ERROR_LOG.md` に ERR029、`エラーログ/エラーログ_09.md` に原因・修正・再発防止を追記
+- **関連 ERR 横展開**: ERR004/ERR006（GroundingDINO CUDA ops）、ERR010/ERR025（SAM2/GPU preflight）、ERR018（Haystack Component 契約）、ERR028（VideoWriter warm_up 契約）、ERR029（動画進捗/長時間処理）
+- **UI 確認**: `.github/skills/webapp-testing/scripts/with_server.py` で Gradio を `127.0.0.1:7861` に実起動し、Playwright で `movie_ui_error09.png` と `movie_ui_error09_elements.txt` を取得。説明文、Text Prompt、Advanced パラメーター、操作要素を確認
+- **UX 判断**: 必須入力は「動画 + SAM2 prompt」のまま増やさず、Text Prompt は任意導線。初回は短尺 preview を既定にし、最終出力時だけ Advanced で frame 数を増やす
+- **検証**: `tests/unit/test_video_pipeline_wiring.py tests/unit/test_jupytext_notebooks.py` 38 passed。`gradio_app_sam2_transparent_BG_haystack_for_Movie.py --help` 成功。`git diff --check -- . ':!*.ipynb'` 成功。サブエージェント code-review の進捗非単調指摘を反映済み
+
+### タスク名: 動画版 Text Prompt / GroundingDINO 導線復旧と VideoWriter warm_up 修正（2026-05-29）
+- **目的**: `VideoWriter.warm_up() missing 1 required positional argument: 'frame_shape'` を解消し、動画版でも `person playing drums` / `person riding bicycle` のような複合対象を Text Prompt から選べる導線を復旧する
+- **進捗**: 完了
+- **変更ファイル**: `pipelines/components/video_model_components.py`, `gradio_app_sam2_transparent_BG_haystack_for_Movie.py`, `Sam2_Transparent_Background_Haystack_for_Movie.py`, `Sam2_Transparent_Background_Haystack_for_Movie.ipynb`, `tests/unit/test_video_pipeline_wiring.py`, `tests/unit/test_jupytext_notebooks.py`, `.github/copilot-instructions.md`, `REFERENCE.md`, `ERROR_LOG.md`, `エラーログ/エラーログ_08.md`, `WHITEBOARD.md`
+- **原因**:
+  1. Haystack は `warm_up()` を no-arg で呼ぶが、`VideoWriter.warm_up(frame_shape, ...)` が runtime frame shape に依存していた
+  2. 動画版は静止画版にある Text Prompt / GroundingDINO bbox 作成導線を持たず、複合対象を第 1 フレームで意味的に指定するプロジェクト目的に合っていなかった
+- **対応**:
+  1. `VideoWriter.warm_up()` を no-op / no-arg にし、codec 選択は `_select_rgba_codec(...)` として `run()` 内へ移動
+  2. 動画版 UI に `Optional: Text Prompt to Box (GroundingDINO)` を追加し、検出 top bbox を `prompt_state["box"]` にコピー
+  3. Movie Notebook で GroundingDINO checkpoint 取得と `GROUNDING_DINO_CKPT_PATH` 設定を追加し、Jupytext で `.ipynb` を再生成
+  4. `.github/copilot-instructions.md` / `REFERENCE.md` に、静止画 / 動画の両方で Text Prompt / GroundingDINO 導線を維持する規約を追記
+  5. `ERROR_LOG.md` に ERR028 を追加
+- **関連 ERR 横展開**: ERR018（Haystack 中間出力 / Component 契約）、ERR019（SAM2 prompt UI）、ERR021/ERR026（Prompt Canvas）、ERR023/ERR024/ERR005（GroundingDINO 依存・互換）、ERR025（GPU policy）、ERR027（Colab public URL）
+- **UI 確認**: `.github/skills/webapp-testing/scripts/with_server.py` で Gradio を `127.0.0.1:7861` に実起動し、Playwright で `movie_ui.png` スクリーンショットと `movie_ui_elements.txt` 操作要素一覧を取得。Text Prompt textbox、`Text Prompt から bbox を検出`、Detected boxes、既存の bbox / Extend / Run 導線を確認
+- **UX 判断**: Text Prompt は任意 accordion に置き、既存の最短手動 bbox フローは維持。必須入力は「動画 + bbox/point」のまま増やさず、複合対象時だけ Text Prompt を使える設計にした
+- **検証**: `tests/unit/test_video_pipeline_wiring.py tests/unit/test_jupytext_notebooks.py` 37 passed。`gradio_app_sam2_transparent_BG_haystack_for_Movie.py --help` 成功。Playwright UI 確認成功。サブエージェント code-review で重要指摘なし
+
+### タスク名: Colab Gradio share frpc 欠落 / 127.0.0.1 接続拒否対応（2026-05-29）
+- **目的**: Colab Gradio 起動時に public share URL が生成されず、`http://127.0.0.1:7861` を開いて `ERR_CONNECTION_REFUSED` になる問題を修正する
+- **進捗**: 完了
+- **変更ファイル**: `Matting_Anything_Haystack.py`, `Matting_Anything_Haystack.ipynb`, `Sam2_Transparent_Background_Haystack.py`, `Sam2_Transparent_Background_Haystack.ipynb`, `Sam2_Transparent_Background_Haystack_for_Movie.py`, `Sam2_Transparent_Background_Haystack_for_Movie.ipynb`, `tests/unit/test_jupytext_notebooks.py`, `ERROR_LOG.md`, `REFERENCE.md`, `WHITEBOARD.md`
+- **原因**: Colab の `127.0.0.1` は Colab VM 内部の local URL で手元ブラウザから開けない。Gradio share tunnel 用 `frpc_linux_amd64_v0.3` が package 配下に欠落し、public URL が生成されていなかった
+- **対応**:
+  1. 前回追加した `ensure_gradio_share_binary_for_colab()` / frpc 手動取得 / checksum fail-fast を撤回
+  2. Haystack 版 Colab Notebook 3本の Gradio 起動セルで、`google.colab` の import spec による Colab 判定へ変更
+  3. Colab では Gradio 5 の既定 share 機能に任せて `--share` を渡し、`Running on public URL` の `gradio.live` を開くよう案内
+  4. Jupytext 正本 `.py` から `.ipynb` を再生成
+  5. `ERROR_LOG.md` に ERR027、`REFERENCE.md` に Colab Gradio share URL ルールを追加
+- **関連 ERR 横展開**: ERR010（SAM2 import preflight）、ERR011/ERR016（Gradio 接続系汎用表示）、ERR023（GroundingDINO runtime 依存）、ERR025（Colab GPU preflight）、ERR026（Gradio `Connection errored out` はサーバーログを一次情報にする）
+- **レビュー**: `code-review` サブエージェントでレビュー実施後、ユーザー指摘により checksum fail-fast は Colab UX を悪化させる過剰介入と判断して撤回
+- **検証**: `tests/unit/test_jupytext_notebooks.py` 29 passed。`gradio_app_haystack.py --help`, `gradio_app_sam2_transparent_BG_haystack.py --help`, `gradio_app_sam2_transparent_BG_haystack_for_Movie.py --help` 成功。`git diff --check -- . ':!*.ipynb'` 成功
+
+### タスク名: レビュー必須化・共通処理影響確認ルール反映（2026-05-29）
+- **目的**: コードレビュー、設計 / 実装プランレビュー、仕様影響レビューを差分の大小・行数・ファイル数に関わらず必須化し、共通処理変更時に静止画版 / 動画版 / notebook / pipeline など差分ファイルの代表経路も挙動確認する運用を明文化する
+- **進捗**: 完了
+- **変更ファイル**: `.github/copilot-instructions.md`, `.github/instructions/workflow.instructions.md`, `WHITEBOARD.md`
+- **変更内容**:
+  1. レビュー step を、コード / 設計 / 実装プラン / 仕様影響レビューは作成・変更・提示した場合にサブエージェントレビュー必須となるよう更新
+  2. `.github/skills/reviewing-code/` はサブエージェントレビューを起動・整理する入口として扱うことを明記
+  3. 共通処理変更時の確認対象として、静止画 Gradio、動画版 Gradio、Haystack Notebook 正本 `.py`、MAM Haystack Gradio、関連 pipeline / unit test を明記
+  4. 共通処理例として `pipelines/components/common.py`, `model_components.py`, `video_model_components.py`, `ui_helpers.py`, 設定 / 評価 / 前処理モジュールを明記
+  5. 検証コマンドに MAM Haystack Gradio smoke を追加
+  6. サブエージェント利用不可時のセルフレビューは完全な代替ではなく、利用不可理由をユーザーへ明示するルールを追記
+- **レビュー**: `Explore` サブエージェントでレビュー実施。frontmatter 追加提案は `copilot-instructions.md` では不要と判断して不採用。レビュー手段統一、共通処理確認対象具体化、MAM smoke 追加、セルフレビュー注意書きは反映済み
+- **検証**: プロンプト文書修正のみのため pytest はスキップ。`git diff --check -- .github/copilot-instructions.md .github/instructions/workflow.instructions.md WHITEBOARD.md` 成功。`get_errors` は修正前の同一ファイルアンカー診断を引き続き返したが、現ファイルには `](#...)` 形式の markdown link がないため拡張機能側の診断キャッシュと判断
+
+### タスク名: copilot-instructions 診断修正（2026-05-29）
+- **目的**: Chat Customizations Evaluations の指定診断に従い、`.github/copilot-instructions.md` の曖昧さ、矛盾、優先順位、検証 OS 判定、領域横断チェック、REMINDER の正本関係を明確化する
+- **進捗**: 完了
+- **変更ファイル**: `.github/copilot-instructions.md`, `WHITEBOARD.md`
+- **変更内容**:
+  1. 代表呼び出し元の選定基準を「変更した関数 / クラスを直接呼ぶ箇所、または同じ public API を共有するファイル」に定義
+  2. MD 間の優先順位を `ERROR_LOG.md` > `REFERENCE.md` > `WHITEBOARD.md` に明文化
+  3. medium / large の実装前 WHITEBOARD 更新、small のテスト省略記録、判別困難時の RED テスト既定を整理
+  4. 大きな差分のレビュー閾値を 100 行超または 3 ファイル超に定義
+  5. 変更規模の境界例、検証コマンドの OS 判定、禁止事項衝突時の暫定対応禁止を追記
+  6. 領域横断変更の ERR 照合表、重いモデル初期化の定量基準、GroundingDINO `--no-build-isolation` ルールを追記
+  7. REMINDER は本文を正とする要約であることを明記し、壊れた同一ファイルアンカーを避けて本文見出し参照に整理
+- **検証**: プロンプト文書修正のみのため pytest はスキップ。`git diff --check -- .github/copilot-instructions.md WHITEBOARD.md` 成功。`get_errors` は修正前の同一ファイルアンカー診断を残して返したが、現ファイルには該当 markdown link がないため拡張機能側の診断キャッシュと判断
+
+### タスク名: copilot-instructions /chronicle improve 反映（2026-05-29）
+- **目的**: 過去セッションの friction（Preflight 繰り返し指示、SAM2/GroundingDINO 遅延調査の計測不足、Colab Gradio 起動後エラー、SAM2 Prompt Canvas 接続エラー）を `.github/copilot-instructions.md` に反映する
+- **進捗**: 完了
+- **変更ファイル**: `.github/copilot-instructions.md`, `WHITEBOARD.md`
+- **変更内容**:
+  1. エラー対応開始時に instruction 読み込み状態・標準 Preflight・参照エラーログ・関連 ERR 横展開を明示するルールを追加
+  2. SAM2 Prompt Canvas は `sources=[]` かつ `interactive=True` を維持する top-level ルールを追加
+  3. SAM2 / GroundingDINO Colab Gradio 起動前に `sam2` import、CUDA ポリシー、GroundingDINO runtime 依存を確認し fail fast するルールを追加
+  4. SAM2 / GroundingDINO 遅延調査では stage timing / CUDA / device / checkpoint / cache を計測してから判断するルールを追加
+- **検証**: ドキュメント変更のみ。`git diff --check` 成功
 
 ### タスク名: SAM2 positive point `Connection errored out` 対応（2026-05-28）
 - **目的**: 静止画 Haystack 版で SAM2 mask の positive point を選択した時に Gradio 側で `Connection errored out` が出る問題を修正する
@@ -410,3 +498,28 @@
   - Windows ローカル: `J:\マイドライブ\AI_picasso\Matting-Anything`
   - Google Colab: `/content/drive/MyDrive/AI_picasso/Matting-Anything`（Drive 自動マウント）
   - 環境変数 `PROJECT_ROOT` を設定すればどちらでも手動上書き可
+
+## 2026-05-29 13:02 作業開始: 動画版 Text Prompt / VideoWriter warm_up
+- 対象: gradio_app_sam2_transparent_BG_haystack_for_Movie.py, pipelines/components/video_model_components.py, tests.
+- 方針: Haystack warm_up は無引数化し、動画版には任意の GroundingDINO Text Prompt -> bbox -> SAM2 video prompt 導線を追加する。
+- UI 変更のため Gradio 実起動と Playwright 確認を実施する。
+
+## 2026-05-29 15:28 作業開始: エラーログ09 動画進捗/UX改善
+- instruction 読み込み確認済み: .github/copilot-instructions.md と .github/instructions/workflow.instructions.md を確認。
+- Preflight: WHITEBOARD/REFERENCE/ERROR_LOG/エラーログ_09 と project-reference/error-knowledge-base を確認。
+- 方針: end-to-end Pipeline は維持し、Component progress callback で 5% 固定表示を解消。初回クイックプレビュー既定と使い方説明/パラメータ説明を改善する。
+
+## 2026-05-29 19:18 作業開始: エラーログ10 Colab RAM クラッシュ対策
+- instruction 読み込み確認済み: .github/copilot-instructions.md と .github/instructions/workflow.instructions.md を確認。
+- Preflight: WHITEBOARD/REFERENCE/ERROR_LOG/エラーログ_10 と project-reference/error-knowledge-base を確認。
+- 方針: transparent-background の RGBA/alpha/preview frame 全保持をやめ、処理中に動画/連番へ書き出す。Gradio へ巨大中間出力を返さない。
+
+## 2026-05-29 19:28 完了: エラーログ10 Colab RAM クラッシュ対策
+- 原因: transparent-background 動画処理で RGB/mask に加えて RGBA/alpha/preview frame list を全保持し、Colab RAM 枯渇で traceback 前に runtime kill。
+- 修正: TransparentBGVideoExtractor を streaming 保存へ変更し、compact matte を下流へ渡す。writer は保存済み path/dir を pass-through。Gradio は巨大中間出力を include_outputs_from に含めない。
+- UX: 初回 max_frames 既定を 30 にして短尺プレビュー優先。Notebook 正本と ipynb を更新。
+- 検証: pytest -m 'not integration' -q は 85 passed / 3 deselected。Movie Gradio --help と git diff --check は成功。code-review 指摘の writer progress callback も修正済み。
+
+## 2026-05-29 19:31 追記: Text Prompt cache 解放
+- Text Prompt 使用後の GroundingDINO/BERT 常駐を副因として確認。動画実行直前に release_text_detector() で cache を解放する。
+- 検証: targeted tests / Movie --help / diff check 成功。非 integration 全体を再実行中。

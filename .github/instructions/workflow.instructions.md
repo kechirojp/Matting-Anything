@@ -109,7 +109,9 @@ description: "Use when starting any coding task, fixing bugs, reviewing code, or
 
 ## 5. コード作成・改修後のレビュー
 
-コードを作成または変更したら、**サブエージェントにレビューを依頼**する。ここで言う「サブエージェント」とは `runSubagent` ツールで起動する別の Copilot エージェントインスタンス（`Explore` agent や `code-reviewer` 相当のエージェント）を指す。
+コードを作成または変更したら、差分の大小・行数・ファイル数に関わらず **サブエージェントにレビューを依頼**する。設計 / 実装プラン、仕様影響レビューを作成・変更・提示した場合も必ずレビュー対象にする。ここで言う「サブエージェント」とは `runSubagent` ツールで起動する別の Copilot エージェントインスタンス（`Explore` agent や `code-reviewer` 相当のエージェント）を指す。
+
+背景除去モデル、SAM / SAM2、動画版、静止画版は細かい差分ファイルを持つため、共通処理を変更した場合は直接変更したファイルだけでなく、その共通処理を使う静止画版 / 動画版 / notebook / pipeline の代表経路も挙動確認する。共通処理の例は `pipelines/components/common.py`、`pipelines/components/model_components.py`、`pipelines/components/video_model_components.py`、`pipelines/components/ui_helpers.py`、設定 / 評価 / 前処理の共通モジュール。影響確認対象の例は静止画 Gradio、動画版 Gradio、Haystack Notebook 正本 `.py`、MAM Haystack Gradio、関連 pipeline / unit test。
 
 ```
 以下のコードをレビューしてください。
@@ -123,7 +125,7 @@ description: "Use when starting any coding task, fixing bugs, reviewing code, or
 
 ### サブエージェントが利用できない場合のフォールバック
 
-環境制約・コスト・オフライン等でサブエージェントが利用できない場合は、以下のセルフレビューチェックリストを実行し、その旨と結果を `WHITEBOARD.md` に記載する。
+環境制約・コスト・オフライン等でサブエージェントが利用できない場合は、以下のセルフレビューチェックリストを実行し、その旨と結果を `WHITEBOARD.md` に記載する。セルフレビューはサブエージェントレビューの完全な代替ではないため、利用不可だった理由をユーザーへ明示する。
 
 - [ ] 正確性: 期待動作とテスト結果が一致する
 - [ ] パフォーマンス: GPU メモリ・計算量に問題がない

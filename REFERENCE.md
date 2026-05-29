@@ -1,6 +1,28 @@
 # リファレンスボード — プロジェクト参照ガイド
+## 0. プロジェクトの目的
+このプロジェクトの目的は
+ドラムをたたいている人＝＞ドラム＋人
+自転車に乗っている人＝＞自転車＋人
+と
+セグメンテイションできることを目指す
+現状は
+ドラムをたたいている人＝＞ドラム＋人を選びたいにもかかわらず人しか選ばないことがおきてしまうため
+Matting anythingリポジトリを選んで実験している※静止画動画含めて
 
-> **用途**: コーディング中に迷ったら必ずここを参照する。  
+つまり
+画像の意味解釈ができるモデル　そのオブジェクトが何なのか　もしくは発展的にそのオブジェクトが何をしているのか　意味をプロンプトなどでユーザーがテキスト入力などができるモデル
+
+SAMに限らずオブジェクトをトラックできる機能をもったモデルで　動画に対応する
+GroundingDINOなどの画像の意味解釈ができるモデルと組み合わせて　ユーザーがテキスト入力で意味的にオブジェクトを選べるようにする
+プラス
+SAM（Segment Anything Model）などオブジェクトトラッキング機能をバックボーンに用いた背景除去システム。
+GroundingDINO、SAM / SAM2、transparent-background、Gradio 5、Haystack 2.x を組み合わせたデモと Colab を含む。
+
+
+
+
+
+> **用途**: コーディング中に迷ったら必ずここを参照する。
 > 設定値・API 仕様・ファイル配置・モデル仕様の「正解」を集約したドキュメント。
 
 ---
@@ -111,6 +133,13 @@
 - CPU 実行は緊急回避専用。意図的に非常に遅い CPU 推論を許可する場合だけ `MATTING_ANYTHING_ALLOW_CPU=1` を設定する。
 - Gradio status の `cuda_available=False` は正常運用ではなく環境修正対象として扱う。
 - Colab Notebook は Gradio 起動前に `nvidia-smi`, `torch.cuda.is_available()`, `torch.version.cuda` を確認し、CUDA 不可かつ `MATTING_ANYTHING_ALLOW_CPU=1` 未設定なら起動前に停止する（ERR025）。
+
+### 2-4-2. Colab Gradio share URL
+
+- Colab では Notebook 出力の `http://127.0.0.1:<port>` は Colab VM 内部の local URL であり、手元ブラウザから直接開かない。
+- Haystack 版 Colab Notebook は Gradio の `--share` デフォルト動作に任せ、`Running on public URL: https://...gradio.live` を表示させる（ERR027）。
+- Colab 判定は `sys.modules` だけに依存せず、`google.colab` の import spec で判定する。`--share` が渡らないと public URL は表示されない。
+- frpc 取得や checksum 検証を Notebook 側で過剰に先取りすると、Gradio の public URL 生成前に停止して UX を悪化させるため避ける。share link 生成失敗時は Colab stdout の Gradio エラーを一次情報にする。
 
 ### 2-5. transparent-background
 
@@ -314,9 +343,25 @@ VideoMatteResult = {
 
 出力ディレクトリは `outputs/<timestamp>/video/` と `outputs/<timestamp>/sequence/{rgba,alpha,preview}/`。PNG 連番は `frame_000000.png` 形式で保存する。
 
+動画版の `TransparentBGVideoExtractor` は RAM 安全性のため、RGBA / alpha / preview frame list を全保持しない。frame ごとに動画または PNG 連番へ逐次保存し、`VideoMatteResult` の `rgba_frames` / `alpha_frames` / `preview_frames` は空 list の compact matte として扱う。Gradio callback も `video_reader` / `sam2_video_propagator` / `transparent_bg_video` の巨大中間出力を `include_outputs_from` に含めない。
+
+Text Prompt / GroundingDINO を使った後に動画処理へ進む場合、GroundingDINO / BERT の cache が SAM2 / transparent-background と同時常駐して Colab RAM を圧迫する。動画実行直前に `release_text_detector()` で semantic detector cache を解放する。
+
 ### 5-4. SAM2 prompt UI helper 共通化
 
 SAM2 prompt の端吸着・bbox 正規化・overlay 描画は `pipelines/components/ui_helpers.py` を共通利用する。対象関数は `clamp_prompt_point`, `normalize_box_from_points`, `draw_prompt_overlay`, `select_sam2_prompt`, `extend_box_to_edge`。静止画版と動画版 UI は同じ helper を import する。
+
+### 5-5. 動画版 Text Prompt / GroundingDINO 導線
+
+動画版 Haystack UI でも静止画版と同じく、複合対象（例: `person playing drums`, `person riding bicycle`）を意味プロンプトで選ぶ導線を維持する。`gradio_app_sam2_transparent_BG_haystack_for_Movie.py` は GroundingDINO をボタン押下時まで遅延構築し、第 1 フレームに対して Text Prompt 検出を実行する。検出結果の top bbox は `prompt_state["box"]` にコピーされ、以後の `SAM2VideoPropagator` がその bbox を動画全体へ伝搬する。
+
+Movie Notebook 正本 `Sam2_Transparent_Background_Haystack_for_Movie.py` では `GROUNDING_DINO_CKPT_PATH` を取得・環境変数へ設定し、Gradio 起動前診断で SAM2 と GroundingDINO の GPU / checkpoint 状態を確認する。
+
+### 5-6. 動画版の進捗表示と初回既定
+
+動画版 end-to-end Pipeline は `VideoReader` を 1 回だけ実行し、その出力を SAM2 / transparent-background に接続する。進捗を細分化したい場合も Pipeline を複数に分けて動画読込を重複させず、`progress_callback` を `VideoReader` / `SAM2VideoPropagator` / `TransparentBGVideoExtractor` / writer Components に渡して Component 内部から stage / frame 進捗を通知する。
+
+初回 UI 既定はクイックプレビューを優先し、`max_frames=30`, `frame_step=1` とする。長尺・全 frame の最終出力は Advanced で明示的に増やす。例外時は Gradio error に最後の stage と elapsed 秒を含め、Colab ログに final traceback と stage を残す。
 
 ---
 

@@ -24,8 +24,27 @@
 # 実装本体は [gradio_app_sam2_transparent_BG_haystack_for_Movie.py](./gradio_app_sam2_transparent_BG_haystack_for_Movie.py) と
 # [pipelines/](./pipelines/) に集約しています。
 #
+# ## UI の使い方
+#
+# 1. **Cell 1〜2.5** を順に実行し、CUDA / SAM2 / GroundingDINO checkpoint 診断が OK であることを確認します。
+# 2. **Cell 3** を実行し、Colab では `Running on public URL: https://...gradio.live` を開きます。
+# 3. Gradio の **Input Video** に動画をアップロードします。右側の **SAM2 Prompt Canvas** に第 1 フレームが表示されます。
+# 4. 複合対象を意味で選びたい場合は **Optional: Text Prompt to Box (GroundingDINO)** を開き、
+#    `person playing drums` や `person riding bicycle` のように入力して bbox 候補を作ります。
+# 5. **SAM2 Prompt Canvas** 上で bbox を確認・補正します。手動 bbox は対象を囲む四角形の **対角 2 点**
+#    （例: 左上→右下、または右下→左上）をクリックする操作です。
+# 6. まず既定値の **最大 30 frames / frame_step=1** でクイックプレビューし、問題なければ Advanced で
+#    最大処理フレーム数を増やして最終出力します。transparent-background の出力は処理中に書き出され、
+#    RGBA/alpha/preview frame 全体を RAM に保持しない設計です。
+#
+# **フローの意味**:
+# 静止画版・動画版とも本質的な順序は
+# `Text Prompt（画像意味解釈） → SAM2（マスク/トラッキング） → transparent-background（背景除去）` です。
+# 動画版の SAM2 Prompt Canvas は SAM2 への入力先で、Text Prompt はそこへ bbox を自動で書き込む補助機能です。
+#
 # **今回の目的:**
 # - 動画をアップロードする
+# - 必要に応じて Text Prompt / GroundingDINO で複合対象の bbox 候補を作る
 # - 第 1 フレーム上で SAM2 point / box prompt を指定する
 # - SAM2 video predictor で mask を動画全体へ伝搬する
 # - transparent-background を frame ごとに適用する
@@ -55,7 +74,17 @@ print("Install done")
 # ============================================================
 from pathlib import Path
 
-IS_COLAB = "google.colab" in sys.modules
+def is_colab_runtime() -> bool:
+    """Google Colab runtime かを、import 済み状態に依存せず判定する。"""
+    import importlib.util
+
+    try:
+        return importlib.util.find_spec("google.colab") is not None
+    except (ModuleNotFoundError, ValueError):
+        return False
+
+
+IS_COLAB = is_colab_runtime()
 COLAB_DRIVE_PROJECT = Path("/content/drive/MyDrive/AI_picasso/Matting-Anything")
 
 if IS_COLAB:
@@ -95,6 +124,7 @@ for directory in (SAM2_CKPT_DIR, TB_CKPT_DIR, INPUT_DIR, OUTPUT_DIR):
 
 SAM2_CKPT_PATH = SAM2_CKPT_DIR / "sam2.1_hiera_large.pt"
 SAM2_CONFIG_NAME = "configs/sam2.1/sam2.1_hiera_l.yaml"
+GROUNDING_DINO_CKPT_PATH = CKPT_ROOT / "groundingdino_swint_ogc.pth"
 
 
 def fetch_if_missing(path: Path, url: str) -> None:
@@ -112,9 +142,14 @@ fetch_if_missing(
     SAM2_CKPT_PATH,
     "https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_large.pt",
 )
+fetch_if_missing(
+    GROUNDING_DINO_CKPT_PATH,
+    "https://github.com/IDEA-Research/GroundingDINO/releases/download/v0.1.0-alpha/groundingdino_swint_ogc.pth",
+)
 
 print(f"PROJECT_ROOT = {PROJECT_ROOT}")
 print(f"SAM2_CKPT_PATH = {SAM2_CKPT_PATH}")
+print(f"GROUNDING_DINO_CKPT_PATH = {GROUNDING_DINO_CKPT_PATH}")
 print(f"TB_CKPT_DIR = {TB_CKPT_DIR}")
 print(f"OUTPUT_DIR = {OUTPUT_DIR}")
 
@@ -158,8 +193,18 @@ exists = SAM2_CKPT_PATH.exists()
 size_mb = SAM2_CKPT_PATH.stat().st_size / (1024 * 1024) if exists and SAM2_CKPT_PATH.is_file() else None
 is_drive_path = "/drive/" in str(SAM2_CKPT_PATH).replace("\\", "/").lower()
 print(f"SAM2 checkpoint: path={SAM2_CKPT_PATH}, exists={exists}, size_mb={size_mb}, drive_path={is_drive_path}")
+grounding_exists = GROUNDING_DINO_CKPT_PATH.exists()
+grounding_size_mb = (
+    GROUNDING_DINO_CKPT_PATH.stat().st_size / (1024 * 1024)
+    if grounding_exists and GROUNDING_DINO_CKPT_PATH.is_file()
+    else None
+)
 print(
-    "GPU policy: SAM2 video tracking requires CUDA by default. "
+    "GroundingDINO checkpoint: "
+    f"path={GROUNDING_DINO_CKPT_PATH}, exists={grounding_exists}, size_mb={grounding_size_mb}"
+)
+print(
+    "GPU policy: SAM2 video tracking and GroundingDINO text detection require CUDA by default. "
     "Set MATTING_ANYTHING_ALLOW_CPU=1 only for emergency CPU fallback."
 )
 CPU_FALLBACK_ALLOWED = os.environ.get("MATTING_ANYTHING_ALLOW_CPU", "").strip().lower() in {"1", "true", "yes", "on"}
@@ -188,8 +233,10 @@ assert APP_PATH.exists(), f"アプリが見つかりません: {APP_PATH}"
 os.environ["PROJECT_ROOT"] = str(PROJECT_ROOT)
 os.environ["SAM2_CKPT_PATH"] = str(SAM2_CKPT_PATH)
 os.environ["SAM2_CONFIG_NAME"] = SAM2_CONFIG_NAME
+os.environ["GROUNDING_DINO_CKPT_PATH"] = str(GROUNDING_DINO_CKPT_PATH)
 
-IS_COLAB = "google.colab" in sys.modules
 SHARE_FLAG = "--share" if IS_COLAB else ""
+if IS_COLAB:
+    print("Colab detected: use the 'Running on public URL' gradio.live link, not the local 127.0.0.1 URL.")
 
 !{sys.executable} "{APP_PATH}" {SHARE_FLAG}

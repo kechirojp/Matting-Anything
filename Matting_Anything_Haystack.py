@@ -73,7 +73,17 @@ except Exception as exc:
 # ======================================================
 from pathlib import Path
 
-IS_COLAB = "google.colab" in sys.modules
+def is_colab_runtime() -> bool:
+    """Google Colab runtime かを、import 済み状態に依存せず判定する。"""
+    import importlib.util
+
+    try:
+        return importlib.util.find_spec("google.colab") is not None
+    except (ModuleNotFoundError, ValueError):
+        return False
+
+
+IS_COLAB = is_colab_runtime()
 COLAB_DRIVE_PROJECT = Path("/content/drive/MyDrive/AI_picasso/Matting-Anything")
 
 if IS_COLAB:
@@ -147,7 +157,8 @@ print("MAM と SAM v1 checkpoint は未配置なら手動配置してくださ�
 APP_PATH = PROJECT_ROOT / "gradio_app_haystack.py"
 assert APP_PATH.exists(), f"アプリが見つかりません: {APP_PATH}"
 
-IS_COLAB = "google.colab" in sys.modules
 SHARE_FLAG = "--share" if IS_COLAB else ""
+if IS_COLAB:
+    print("Colab detected: use the 'Running on public URL' gradio.live link, not the local 127.0.0.1 URL.")
 
 !{sys.executable} "{APP_PATH}" {SHARE_FLAG}
