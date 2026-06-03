@@ -8,8 +8,8 @@
 
 | 項目 | 内容 |
 |------|------|
-| **作業中のタスク** | エラーログ09 動画進捗/UX改善（完了）。SAM2 / GroundingDINO 遅延 telemetry は Colab実測待ち |
-| **最終更新日** | 2026-05-29（エラーログ09 動画進捗/UX改善） |
+| **作業中のタスク** | 役割別モデル差し替え（レジストリ + Gradio プルダウン）Phase R2 完了 |
+| **最終更新日** | 2026-06-05（copilot-instructions.md SAMURAI/Dropdown 切替記述を修正） |
 | **担当者/セッション** | GitHub Copilot |
 
 ---
@@ -17,6 +17,49 @@
 ## 進行中タスクの詳細
 
 <!-- 現在取り組んでいるタスクの目的・進捗・残作業を記述 -->
+
+### タスク名: 役割別モデル差し替え（レジストリ + Gradio プルダウン）計画策定（2026-06-03 設計のみ）
+- **目的**: detector(GroundingDINO) / tracker(SAM2,SAMURAI) / background(transparent-background) を config 駆動で差し替え、Gradio に役割別プルダウンを設ける設計を策定。コード実装はまだ行わない（large・設計先行）
+- **成果物**: `2026-06-03_モデル差し替え_レジストリ_Gradioプルダウン_計画.md`
+- **ユーザー指示3点を反映**:
+  1. SAM2 ⇄ SAMURAI の切替は**環境・インストール分離**を前提（同名 `sam2` パッケージのため 1 プロセス内ランタイム切替はしない）。`is_available()` は各環境にインストールされた変種を検出し `requires` 一致 entry のみ Dropdown に出す（§5.1）
+  2. **GPU 必須**（プロ用途）。`require_gpu_for_heavy_inference` 踏襲。現状 TB/MAM は未呼び出しのため実装フェーズで追加（§2.0）
+  3. transparent-background をベースに開発。背景透過モデルも将来切替可能にするため **`MAMAlphaPredictor` の I/O 契約と background ロール統一契約（rgba/alpha/preview/matte_result）+ `MAMBackgroundAdapter` 要件**を §3.2 に定義（実装は次フェーズ）
+- **サブエージェントレビュー（Explore）**: 判定 **REVISE**。指摘を反映: (a) metadata の `model_id` は現状 TB 未実装→実装フェーズで constructor `registry_entry_id` 追加と明記、(b) GPU チェック未呼び出しの現状ギャップを §2.0 に明記、(c) `model_params` は dict ではなく run() 個別引数を registry entry から callback 展開と明確化、(d) アダプタの entry_id は constructor 経由、(e) is_available の変種検出は import + 環境変数（同名フォークのため import 単独では判別不可）で行うと明示
+- **残作業**: 実装フェーズ（Phase R1 レジストリローダ〜R4 docs）はユーザー承認後に着手
+- **Phase R1 完了記録（2026-06-03）**:
+  - 実装: `config/inference_models.toml`（detector 1件・tracker 4件・background 3件）
+  - 実装: `pipelines/components/model_registry.py`（`load_model_registry` / `entries_for` / `entry_by_id` / `is_available` / `build_dropdown_choices` / `clear_registry_cache`、`threading.Lock` によるスレッドセーフキャッシュ）
+  - `pipelines/components/__init__.py` にエクスポート追加（`clear_registry_cache` 含む）
+  - テスト: `tests/unit/test_model_registry.py` 21件 PASSED
+  - サブエージェントレビュー（Explore）: デプロイブロッカー3件（`clear_registry_cache` 欠落 / `pytest.raises(ValueError, KeyError)` 曖昧 / スレッドセーフ未対応）→ 全修正完了。中程度指摘（`is_available` docstring / 未知 requires への `warnings.warn`）→ 対応完了。
+- **次のアクション**: Phase R3（tracker Dropdown 結線 or MAMBackgroundAdapter）
+- **Phase R2 完了記録（2026-06-04）**:
+  - 実装: 3アプリ（静止画・動画・MAM）に `gr.Dropdown(build_dropdown_choices("background"))` 追加、`_PIPELINE_CACHE` で pipeline 再利用、`entry_by_id` で `tb_mode` 取得
+  - 動画版: `run_video_background_removal` の `tracker_model` / `background_model` / `tb_jit` を位置引数（デフォルトなし）にして SyntaxError を回避（後続の `tb_threshold` 等もデフォルトなしのため）
+  - MAM版: `background_model` パラメータ受け取りのみ・パイプライン未接続（暫定）。Dropdown `info=` に「現バージョンでは MAM パイプラインに未接続」と明記
+  - テスト: 7件 RED→GREEN。全 122 テスト PASS（3 deselected: integration）
+  - サブエージェントレビュー（Explore）: 全観点 PASS。MEDIUM指摘「動画版 `tb_jit` デフォルト `= False` 明示化」は後続位置引数の制約上変更不要と判断（現状正しい）
+- **関連 ERR 横展開**: ERR018（include_outputs_from 明示）、ERR030（RAM 非保持）
+
+### タスク名: トラッキング可視化 UI + SAMURAI config切替（2026-06-03 完了）
+- **目的**: (1) SAM2/SAMURAI のマスクが動画フレームを正しく追従しているか目視確認できる「Tracking Overlay」動画を生成し Gradio に表示する。(2) 今後より良いトラッキングモデルへ柔軟・安定に差し替えられるよう、config/env 駆動でモデル切替し、使用 config / samurai_mode を mask metadata に記録する
+- **規模**: large（新 Component + pipeline 結線 + Gradio UI + docs）。TDD フロー 1〜11 全適用、サブエージェントレビュー必須、UI 変更は Playwright 確認必須
+- **設計方針（疎結合 / YAGNI）**:
+  - 純粋描画関数 `render_tracking_overlay_frame()` を `pipelines/components/common.py` に追加（単一責務・テスト容易）
+  - 副作用を持つ `TrackingOverlayWriter` Component を `video_model_components.py` に追加。入力 frames/masks/metadata/enabled/progress_callback、出力 `overlay_video_path`。frame ごとに輪郭+半透明塗りを描き mp4 へ逐次書き出し、RAM に全 frame を保持しない（ERR030）
+  - SAMURAI は専用抽象化を作らず、既存 `SAM2_CONFIG_NAME` / `SAM2_CKPT_PATH` env 切替を正式機構とし、`SAM2VideoPropagator` が masks metadata に `tracker_config` / `tracker_checkpoint` / `samurai_mode` を記録
+- **残作業**: なし（完了）
+- **完了記録（2026-06-03）**:
+  - 実装: `render_tracking_overlay_frame()`（`pipelines/components/common.py`）、`TrackingOverlayWriter`（`pipelines/components/video_model_components.py`、frame ごとに mp4+PNG 逐次書き出し・RAM 非保持）、pipeline 結線（`pipelines/sam2_tb_video_pipeline.py`）、Gradio UI（`overlay_enabled` Checkbox + `Tracking Overlay (追跡確認用)` Video 出力、`include_outputs_from` に `tracking_overlay`、stage progress range 追加）
+  - SAMURAI: `SAM2VideoPropagator.tracker_metadata()` が `tracker_config` / `tracker_checkpoint` / `samurai_mode` を返し overlay metadata へ伝搬
+  - テスト: `tests/unit/test_tracking_overlay.py`（新規 5件）、`tests/unit/test_video_pipeline_wiring.py`（overlay/samurai metadata 追加）。非 integration 全体 **94 passed, 3 deselected**
+  - サブエージェントレビュー（reviewing-code）: 判定 **APPROVE**。minor 4件中 #2（overlay metadata に `tracker_checkpoint` 欠落）を修正。#1 progress range 表示順は表示のみ・#3 output_mode 無視は YAGNI・#4 webapp 確認は実施で対応不要
+  - UI 検証（ui-ux-pro-max / webapp-testing + Playwright `tests/manual/verify_tracking_overlay_ui.py`）: Checkbox / Video 出力 / info text を画面で確認（3/3 OK + スクショ確認）
+  - 回帰修正: 自己混入した jupytext 単一行 substring 回帰（`prompt_mode` / `max_frames` / `frame_step` の Radio/Slider 開始行）を単一行へ戻して解消
+  - docs: `.github/copilot-instructions.md`（samurai/ 直接変更禁止＋config切替＋Tracking Overlay 要件＋REMINDER）、`REFERENCE.md`（SAMURAI / Tracking Overlay セクション追加）
+  - テスト省略記録: docs（markdown）更新は挙動変更なしのため RED テスト省略（フロー step 7）
+- **関連 ERR 横展開**: ERR018（Haystack Component 契約 / include_outputs_from）、ERR029（進捗）、ERR030（全 frame RAM 保持禁止・逐次保存）
 
 ### タスク名: エラーログ09 動画進捗/UX改善（2026-05-29）
 - **目的**: `Sam2_Transparent_Background_Haystack_for_Movie.ipynb` の初回実行が 5% 付近で長時間止まって見える問題を解消し、使い方・フロー順・パラメーター説明を改善する

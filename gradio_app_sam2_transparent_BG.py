@@ -574,16 +574,26 @@ with gr.Blocks(title="SAM2 + transparent-background", theme=gr.themes.Soft()) as
             )
 
             with gr.Row():
-                input_mode = gr.Radio(["point", "box"], value="point", label="入力モード")
+                input_mode = gr.Radio(
+                    ["point", "box"],
+                    value="point",
+                    label="入力モード",
+                    info="point: クリック1点ごとに前景/背景ヒントを与える（複数点可）。box: 2クリックで対象を囲む矩形を1個指定する。単位なしの選択値。",
+                )
                 current_label = gr.Radio(
                     ["positive", "negative"],
                     value="positive",
                     label="Point 種別 (positive=対象 / negative=除外)",
+                    info="point モード時のみ有効。positive: クリック位置を前景（残す）とする。negative: クリック位置を背景（除外）とする。box モードでは無視される。",
                 )
 
             with gr.Row():
                 btn_clear = gr.Button("🧹 全クリア", variant="secondary")
-                multimask = gr.Checkbox(value=True, label="複数候補マスク出力")
+                multimask = gr.Checkbox(
+                    value=True,
+                    label="複数候補マスク出力",
+                    info="ON: SAM2 が候補マスクを最大3枚（Mask 0/1/2）返し、採用マスクを選べる。OFF: スコア最上位の1枚のみ返す。真偽値。",
+                )
                 btn_predict = gr.Button("🚀 SAM2 推論", variant="primary")
 
             sam_info = gr.Markdown()
@@ -594,7 +604,12 @@ with gr.Blocks(title="SAM2 + transparent-background", theme=gr.themes.Soft()) as
                 mask_view_1 = gr.Image(label="Mask 1", height=180)
                 mask_view_2 = gr.Image(label="Mask 2", height=180)
             # Gradio 5.x の /info 生成バグ回避のため choices は文字列値で運用
-            mask_idx = gr.Radio(["0", "1", "2"], value="0", label="採用マスク")
+            mask_idx = gr.Radio(
+                ["0", "1", "2"],
+                value="0",
+                label="採用マスク",
+                info="transparent-background のガードに使う SAM2 マスク番号。0/1/2 は上の Mask 0/1/2 に対応する候補インデックス（単位なし）。複数候補が無い場合は 0 のまま。",
+            )
 
         # ============ 右カラム: transparent-background ============
         with gr.Column(scale=1):
@@ -627,9 +642,9 @@ with gr.Blocks(title="SAM2 + transparent-background", theme=gr.themes.Soft()) as
             gr.Markdown("### 4️⃣ パイプライン制御")
             with gr.Group():
                 crop_pad = gr.Slider(
-                    0, 200, value=40, step=5,
+                    0, 64, value=5, step=1,
                     label="SAM2 bbox の padding (px)",
-                    info="SAM2 が検出した bounding box の四辺に加える余白ピクセル数。小さいと髪や衣服の端が切れやすい。大きいほど広い範囲を処理するため精度は上がるが処理時間が増える。SAM2 なしモードでは無視される。",
+                    info="SAM2 が検出した bounding box の四辺に加える余白（px、整数）。主目的は髪・衣服端の検出漏れ防止。2K 解像度基準で目安 5px。大きすぎると mask が背景を巻き込み壊れるため、細部が切れる時のみ 10〜30 に増やす。SAM2 なしモードでは無視される。",
                 )
                 use_guard = gr.Checkbox(
                     value=True,
@@ -647,7 +662,9 @@ with gr.Blocks(title="SAM2 + transparent-background", theme=gr.themes.Soft()) as
                     info="ON: pymatting の estimate_foreground_ml で背景色が前景ピクセルに混入する「色汚染」を除去する。グリーンバック撮影などで輪郭が緑がかる場合に有効。処理時間が若干増加する。",
                 )
                 save_to_disk = gr.Checkbox(
-                    value=True, label="結果を outputs/ に保存する"
+                    value=True,
+                    label="結果を outputs/ に保存する",
+                    info="ON: RGBA・アルファ・プレビュー画像を outputs/<日時>/ に PNG 保存する。OFF: 画面表示のみで保存しない。真偽値。",
                 )
 
             with gr.Accordion("📖 用語・アルゴリズム解説（クリックで展開）", open=False):

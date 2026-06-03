@@ -53,10 +53,11 @@ from pipelines.components.ui_helpers import (
 from pipelines.components.model_components import GroundingDINOMultiBoxDetector
 from pipelines.components.model_components import format_stage_timings
 from pipelines.sam2_tb_pipeline import build_mask_to_matte_pipeline, build_sam2_maskset_pipeline
+from pipelines.components.model_registry import build_dropdown_choices, entry_by_id
 
 
 SAM2_PIPELINE = None
-TB_PIPELINE = None
+_PIPELINE_CACHE: dict[tuple[str, str], Any] = {}
 TEXT_DETECTOR = None
 SAM2_STATE: dict[str, Any] = {}
 PROMPT_CANVAS_HEIGHT = 420
@@ -99,12 +100,15 @@ def get_sam2_pipeline():
     return SAM2_PIPELINE
 
 
-def get_tb_pipeline():
-    """transparent-background MatteExtractor Pipeline を遅延構築する。"""
-    global TB_PIPELINE
-    if TB_PIPELINE is None:
-        TB_PIPELINE = build_mask_to_matte_pipeline()
-    return TB_PIPELINE
+def get_tb_pipeline(background_model_id: str = "tb_base"):
+    """transparent-background MatteExtractor Pipeline を遅延構築する。
+
+    同じ model_id の場合はキャッシュを返す（warm_up 再実行なし）。
+    """
+    key = ("background", background_model_id)
+    if key not in _PIPELINE_CACHE:
+        _PIPELINE_CACHE[key] = build_mask_to_matte_pipeline()
+    return _PIPELINE_CACHE[key]
 
 
 def get_text_detector() -> GroundingDINOMultiBoxDetector:
@@ -392,7 +396,7 @@ def clear_union_mask(input_image):
 def run_transparent_bg(
     input_image,
     mask_source: str,
-    tb_mode: str,
+    background_model_id: str,
     tb_jit: bool,
     tb_threshold: float,
     tb_output_type: str,
@@ -400,6 +404,8 @@ def run_transparent_bg(
 ):
     """標準 mask 契約から transparent-background MatteExtractor を実行する。"""
     try:
+        entry = entry_by_id("background", background_model_id)
+        tb_mode = entry.get("tb_mode", "base")
         mask = None
         if mask_source == "Union Mask":
             mask = SAM2_STATE.get("union_mask")
@@ -409,7 +415,7 @@ def run_transparent_bg(
             mask = SAM2_STATE.get("mask")
             if mask is None:
                 raise gr.Error("Best Candidate Mask がありません。先に SAM2 候補を生成してください。")
-        result = get_tb_pipeline().run(
+        result = get_tb_pipeline(background_model_id).run(
             {
                 "image_normalizer": {"image": input_image},
                 "transparent_bg": {
@@ -494,10 +500,22 @@ SAM2 に渡す対象範囲の指定だけです。対象範囲は **Text Prompt 
                     placeholder="person playing drums / person riding bicycle",
                     info="例: person playing drums / person riding bicycle。GroundingDINO で bbox 候補を作ります。",
                 )
-                box_threshold = gr.Slider(0.0, 1.0, value=0.25, step=0.01, label="Box Threshold")
-                text_threshold = gr.Slider(0.0, 1.0, value=0.25, step=0.01, label="Text Threshold")
-                iou_threshold = gr.Slider(0.0, 1.0, value=0.5, step=0.01, label="NMS IoU Threshold")
-                top_k = gr.Slider(1, 10, value=5, step=1, label="Top-K Text Boxes")
+                box_threshold = gr.Slider(
+                    0.0, 1.0, value=0.25, step=0.01, label="Box Threshold",
+                    info="GroundingDINO の物体信頼度しきい値（0〜1 のスコア、単位なし）。高いほど検出が厳しく誤検出が減るが取りこぼしが増える。低いほど候補が増える。目安 0.25。",
+                )
+                text_threshold = gr.Slider(
+                    0.0, 1.0, value=0.25, step=0.01, label="Text Threshold",
+                    info="検出 box と text 語句の一致しきい値（0〜1、単位なし）。高いほど語句との合致を厳しく要求する。目安 0.25。",
+                )
+                iou_threshold = gr.Slider(
+                    0.0, 1.0, value=0.5, step=0.01, label="NMS IoU Threshold",
+                    info="重複 box を間引く NMS の IoU しきい値（0〜1、単位なし）。低いほど重なりを強く除去し重複検出が減る。高いほど近接 box を残す。目安 0.5。",
+                )
+                top_k = gr.Slider(
+                    1, 10, value=5, step=1, label="Top-K Text Boxes",
+                    info="保持する検出 box の最大個数（個数、整数）。スコア上位から K 個まで採用する。複数対象を union する時は大きめにする。目安 5。",
+                )
                 detect_button = gr.Button("Detect Text Boxes", variant="secondary")
                 detected_boxes = gr.Dataframe(headers=["index", "confidence", "phrase", "box"], label="Detected Text Boxes")
             with gr.Accordion("SAM2 Candidate Masks", open=True):
@@ -514,7 +532,10 @@ SAM2 に渡す対象範囲の指定だけです。対象範囲は **Text Prompt 
                     info="positive は残したい領域、negative は除外したい領域のヒントです。",
                     visible=False,
                 )
-                multimask = gr.Checkbox(value=True, label="Multimask", info="ON では SAM2 が複数候補 mask を返します。")
+                multimask = gr.Checkbox(
+                    value=True, label="Multimask",
+                    info="ON: SAM2 が候補 mask を最大3枚返し、Candidate から選べる。OFF: スコア最上位1枚のみ。真偽値。",
+                )
                 gr.Markdown("Box は2クリックで確定。被写体が画面端に接している時は Extend Box Edge を使います。")
                 with gr.Row():
                     extend_left_button = gr.Button("Extend Left")
@@ -528,10 +549,16 @@ SAM2 に渡す対象範囲の指定だけです。対象範囲は **Text Prompt 
                 candidate_indices = gr.Textbox(
                     label="Candidate Mask Indices",
                     value="0",
-                    info="union したい候補 index を 0,1,2 のように入力します。",
+                    info="union したい候補 mask の index を 0,1,2 のようにカンマ区切りで入力。index は Candidate Masks の番号（0 起点の整数）。例: person と drums を結合するなら 0,1。",
                 )
-                union_dilate_kernel = gr.Slider(0, 51, value=0, step=1, label="Union Dilate Kernel")
-                union_min_area = gr.Slider(0, 5000, value=0, step=1, label="Union Min Area")
+                union_dilate_kernel = gr.Slider(
+                    0, 51, value=0, step=1, label="Union Dilate Kernel",
+                    info="union mask を太らせる膨張カーネルサイズ（px、奇数推奨）。0 で膨張なし。値が大きいほどマスク間の隔たりを埋めてつなげるが輪郭が太る。目安 0〜15。",
+                )
+                union_min_area = gr.Slider(
+                    0, 5000, value=0, step=1, label="Union Min Area",
+                    info="union 結果から除去する微小領域の面積しきい値（px²、ピクセル数）。0 で除去なし。値以下の島ノイズを消す。目安 0〜500。",
+                )
                 with gr.Row():
                     add_union_button = gr.Button("Add to Union", variant="primary")
                     remove_union_button = gr.Button("Remove from Union")
@@ -544,13 +571,33 @@ SAM2 に渡す対象範囲の指定だけです。対象範囲は **Text Prompt 
                     label="Mask Source for MatteExtractor",
                     info="通常は Best Candidate Mask のままで進めます。複合対象を統合した時だけ Union Mask を選びます。",
                 )
-                tb_mode = gr.Radio(choices=["base", "fast", "base-nightly"], value="base", label="Mode")
-                tb_jit = gr.Checkbox(value=False, label="JIT")
-                tb_threshold = gr.Slider(0.0, 1.0, value=0.0, step=0.01, label="Threshold")
-                tb_output_type = gr.Radio(choices=["rgba", "green", "white", "blur"], value="rgba", label="Preview")
-                crop_padding = gr.Slider(0, 160, value=40, step=1, label="Crop Padding")
+                background_model = gr.Dropdown(
+                    choices=build_dropdown_choices("background"),
+                    value="tb_base",
+                    label="背景除去モデル（Background Model）",
+                    info="transparent-background モデルを選択します。切替時は再初期化が走ります。tb_base: 標準品質（推奨）。tb_fast: 軽量・高速だが精度低。tb_base_nightly: 最新実験版 base。単位なしの選択値。",
+                )
+                tb_jit = gr.Checkbox(
+                    value=False, label="JIT",
+                    info="ON: TorchScript JIT で推論を高速化（初回コンパイルに時間）。OFF: 通常実行。真偽値。",
+                )
+                tb_threshold = gr.Slider(
+                    0.0, 1.0, value=0.0, step=0.01, label="Threshold",
+                    info="アルファを二値化するしきい値（0.0〜1.0 の正規化アルファ、単位なし）。0.0: 二値化せず髪などのソフトな半透明を残す。値を上げるほどその値未満を透明にし輪郭が硬くなる。目安 0.0。",
+                )
+                tb_output_type = gr.Radio(
+                    choices=["rgba", "green", "white", "blur"], value="rgba", label="Preview",
+                    info="プレビュー背景の表示方法。rgba: 透明（市松模様）。green: 緑背景。white: 白背景。blur: 元背景をぼかす。出力 RGBA 本体には影響しない。単位なしの選択値。",
+                )
+                crop_padding = gr.Slider(
+                    0, 64, value=5, step=1, label="Crop Padding",
+                    info="SAM2 mask の外接矩形の外側に加える余白（px、整数）。主目的は髪・手足先など細部の検出漏れ防止。2K 解像度基準で目安 5px。大きすぎると mask が背景を巻き込み壊れるため、細部が切れる時のみ 10〜30 に増やす。",
+                )
         with gr.Column(scale=1):
-            display_size = gr.Radio(choices=["window", "original"], value="window", label="Image Display Size")
+            display_size = gr.Radio(
+                choices=["window", "original"], value="window", label="Image Display Size",
+                info="プレビュー画像の表示サイズ。window: ウィンドウに収まるよう縮小表示。original: 等倉大で表示。出力画像の解像度には影響しない。単位なしの選択値。",
+            )
             sam2_status = gr.Textbox(label="SAM2 Status")
             union_status = gr.Textbox(label="Union Status")
             candidate_table = gr.Dataframe(headers=["index", "score", "label", "box"], label="SAM2 Candidate Mask Table")
@@ -612,7 +659,7 @@ SAM2 に渡す対象範囲の指定だけです。対象範囲は **Text Prompt 
     clear_union_button.click(clear_union_mask, inputs=[input_image], outputs=[union_preview, union_status])
     run_button.click(
         run_transparent_bg,
-        inputs=[input_image, mask_source, tb_mode, tb_jit, tb_threshold, tb_output_type, crop_padding],
+        inputs=[input_image, mask_source, background_model, tb_jit, tb_threshold, tb_output_type, crop_padding],
         outputs=[rgba_output, alpha_output, preview_output, paths_output, bbox_output],
     )
     display_size.change(

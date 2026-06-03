@@ -7,6 +7,7 @@ import argparse
 import gradio as gr
 
 from pipelines.mam_pipeline import build_mam_pipeline, build_mam_scribble_pipeline
+from pipelines.components.model_registry import build_dropdown_choices
 
 
 TEXT_PIPELINE = None
@@ -35,6 +36,7 @@ def run_haystack_mam(
     task_type: str,
     background_prompt: str,
     background_type: str,
+    background_model: str = "tb_base",
     box_threshold: float,
     text_threshold: float,
     iou_threshold: float,
@@ -100,6 +102,12 @@ with gr.Blocks(title="Matting-Anything Haystack") as demo:
             task_type = gr.Radio(choices=["text", "scribble_box", "scribble_point"], value="text", label="Task")
             text_prompt = gr.Textbox(value="person", label="Text Prompt")
             with gr.Accordion("Advanced", open=False):
+                background_model = gr.Dropdown(
+                    choices=build_dropdown_choices("background"),
+                    value="tb_base",
+                    label="背景除去モデル（Background Model）",
+                    info="将来の transparent-background 切替用（現バージョンでは MAM パイプラインに未接続）。",
+                )
                 background_type = gr.Radio(
                     choices=["real_world_sample", "stable_diffusion"],
                     value="real_world_sample",
@@ -126,6 +134,7 @@ with gr.Blocks(title="Matting-Anything Haystack") as demo:
             task_type,
             background_prompt,
             background_type,
+            background_model,
             box_threshold,
             text_threshold,
             iou_threshold,

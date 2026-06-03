@@ -28,6 +28,15 @@ from .ui_helpers import (
     normalize_box_from_points,
     select_sam2_prompt,
 )
+from .model_registry import (
+    ModelEntry,
+    build_dropdown_choices,
+    clear_registry_cache,
+    entries_for,
+    entry_by_id,
+    is_available,
+    load_model_registry,
+)
 from .video_common import FrameSampler
 from .video_model_components import (
     FrameSequenceWriter,
@@ -66,4 +75,12 @@ __all__ = [
     "extend_box_to_edge",
     "normalize_box_from_points",
     "select_sam2_prompt",
+    # model_registry
+    "ModelEntry",
+    "build_dropdown_choices",
+    "clear_registry_cache",
+    "entries_for",
+    "entry_by_id",
+    "is_available",
+    "load_model_registry",
 ]

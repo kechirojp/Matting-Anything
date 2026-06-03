@@ -14,7 +14,7 @@ import cv2
 import numpy as np
 from haystack import component
 
-from .common import ensure_rgb_array
+from .common import ensure_rgb_array, render_tracking_overlay_frame
 from .model_components import TransparentBGExtractor, default_device, require_gpu_for_heavy_inference
 from .video_common import (
     build_frame_mask_sequence,
@@ -174,6 +174,15 @@ class SAM2VideoPropagator:
         self.device = device or default_device()
         self._video_predictor: Any | None = None
 
+    def tracker_metadata(self) -> dict[str, Any]:
+        """使用中の tracker config / checkpoint と samurai_mode を可視化用に公開する。"""
+        config = str(self.config_name)
+        return {
+            "tracker_config": config,
+            "tracker_checkpoint": str(self.checkpoint_path),
+            "samurai_mode": "samurai" in config.lower(),
+        }
+
     def warm_up(self) -> None:
         """SAM2 video predictor を遅延・冪等に初期化する。"""
         if self._video_predictor is not None:
@@ -253,7 +262,13 @@ class SAM2VideoPropagator:
         masks = build_frame_mask_sequence(
             frame_masks,
             object_ids=[int(object_id)],
-            metadata={"points": points or [], "labels": labels or [], "box": box, "source_metadata": metadata or {}},
+            metadata={
+                "points": points or [],
+                "labels": labels or [],
+                "box": box,
+                "source_metadata": metadata or {},
+                **self.tracker_metadata(),
+            },
         )
         if self.device == "cuda":
             torch.cuda.empty_cache()
@@ -390,6 +405,89 @@ class TransparentBGVideoExtractor:
             },
         }
         return {"matte": matte}
+
+
+@component
+class TrackingOverlayWriter:
+    """各 frame に追跡 mask の輪郭+半透明塗りを重ね、追従確認用 overlay 動画を逐次書き出す Component。"""
+
+    _OBJECT_COLORS = (
+        (30, 144, 255),
+        (255, 140, 0),
+        (46, 204, 113),
+        (155, 89, 182),
+        (231, 76, 60),
+    )
+
+    def __init__(self, output_dir: str = "outputs", fill_alpha: float = 0.45) -> None:
+        self.output_dir = _resolve_output_dir(output_dir)
+        self.fill_alpha = float(fill_alpha)
+
+    @component.output_types(overlay=dict)
+    def run(
+        self,
+        frames: list,
+        masks: dict = None,
+        metadata: dict = None,
+        enabled: bool = True,
+        progress_callback: ProgressCallback | None = None,
+    ) -> dict[str, dict[str, Any]]:
+        """frame ごとに mask overlay を描き、追跡確認用の mp4 / PNG 連番を保存する。"""
+        if not enabled:
+            return {"overlay": {"overlay_video_path": None, "frame_count": 0, "enabled": False}}
+        if not frames:
+            raise ValueError("frames が空です。")
+        frame_masks = (masks or {}).get("frame_masks", {})
+        object_ids = list((masks or {}).get("object_ids", [1]))
+        source_indices = list((metadata or {}).get("metadata", {}).get("sampled_frame_indices", range(len(frames))))
+        color = self._OBJECT_COLORS[(int(object_ids[0]) - 1) % len(self._OBJECT_COLORS)] if object_ids else self._OBJECT_COLORS[0]
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_root = self.output_dir / timestamp
+        video_dir = output_root / "video"
+        overlay_sequence_dir = output_root / "sequence" / "overlay"
+        fps = float((metadata or {}).get("fps", 30.0))
+        overlay_video_path = video_dir / "tracking_overlay.mp4"
+        overlay_stream: _OpenCVFrameVideoWriter | None = None
+        total_frames = max(len(frames), 1)
+        _notify_progress(progress_callback, "tracking_overlay", 0.0, "追跡確認用 overlay を生成しています")
+        try:
+            for local_index, frame in enumerate(frames):
+                source_index = int(source_indices[local_index]) if local_index < len(source_indices) else local_index
+                frame_rgb = ensure_rgb_array(frame)
+                mask = frame_masks.get(source_index)
+                if mask is None:
+                    overlay_frame = frame_rgb
+                else:
+                    overlay_frame = render_tracking_overlay_frame(frame_rgb, mask, color=color, fill_alpha=self.fill_alpha)
+                if overlay_stream is None:
+                    overlay_stream = _OpenCVFrameVideoWriter(overlay_video_path, overlay_frame, fps, "mp4v", channels=3)
+                overlay_stream.write(overlay_frame)
+                write_png_frame(overlay_sequence_dir / f"frame_{local_index:06d}.png", overlay_frame)
+                if local_index == 0 or (local_index + 1) % 5 == 0 or local_index + 1 == total_frames:
+                    _notify_progress(
+                        progress_callback,
+                        "tracking_overlay",
+                        (local_index + 1) / total_frames,
+                        f"追跡確認用 overlay を frame ごとに保存しています ({local_index + 1}/{total_frames})",
+                    )
+        finally:
+            if overlay_stream is not None:
+                overlay_stream.close()
+        tracker_metadata = {key: (masks or {}).get("metadata", {}).get(key) for key in ("tracker_config", "tracker_checkpoint", "samurai_mode")}
+        overlay = {
+            "overlay_video_path": str(overlay_video_path),
+            "overlay_sequence_dir": str(overlay_sequence_dir),
+            "sequence_pattern": "frame_{:06d}.png",
+            "fps": fps,
+            "frame_count": len(frames),
+            "enabled": True,
+            "metadata": {
+                "source": "tracking-overlay",
+                "timestamp": timestamp,
+                **tracker_metadata,
+            },
+        }
+        return {"overlay": overlay}
 
 
 @component

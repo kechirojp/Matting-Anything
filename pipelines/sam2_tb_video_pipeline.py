@@ -7,6 +7,7 @@ from haystack import Pipeline
 from .components.video_model_components import (
     FrameSequenceWriter,
     SAM2VideoPropagator,
+    TrackingOverlayWriter,
     TransparentBGVideoExtractor,
     VideoReader,
     VideoWriter,
@@ -39,6 +40,7 @@ def build_sam2_tb_video_pipeline() -> Pipeline:
     pipeline.add_component("transparent_bg_video", TransparentBGVideoExtractor())
     pipeline.add_component("video_writer", VideoWriter())
     pipeline.add_component("frame_sequence_writer", FrameSequenceWriter())
+    pipeline.add_component("tracking_overlay", TrackingOverlayWriter())
 
     pipeline.connect("video_reader.frames", "sam2_video_propagator.frames")
     pipeline.connect("video_reader.metadata", "sam2_video_propagator.metadata")
@@ -47,4 +49,7 @@ def build_sam2_tb_video_pipeline() -> Pipeline:
     pipeline.connect("sam2_video_propagator.masks", "transparent_bg_video.masks")
     pipeline.connect("transparent_bg_video.matte", "video_writer.matte")
     pipeline.connect("transparent_bg_video.matte", "frame_sequence_writer.matte")
+    pipeline.connect("video_reader.frames", "tracking_overlay.frames")
+    pipeline.connect("video_reader.metadata", "tracking_overlay.metadata")
+    pipeline.connect("sam2_video_propagator.masks", "tracking_overlay.masks")
     return pipeline

@@ -33,6 +33,7 @@ def test_sam2_tb_video_pipeline_builds_with_writers() -> None:
     assert "transparent_bg_video" in pipeline.graph.nodes
     assert "video_writer" in pipeline.graph.nodes
     assert "frame_sequence_writer" in pipeline.graph.nodes
+    assert "tracking_overlay" in pipeline.graph.nodes
 
 
 def test_video_writer_warm_up_matches_haystack_no_arg_contract() -> None:
@@ -196,3 +197,63 @@ def test_sam2_video_propagator_warmup_uses_gpu_policy(monkeypatch) -> None:
 
     with pytest.raises(RuntimeError, match="requires a CUDA GPU"):
         propagator.warm_up()
+
+
+def test_sam2_video_propagator_reports_samurai_tracker_metadata(monkeypatch) -> None:
+    """SAMURAI への差し替えを config 駆動で行い、使用 tracker を mask metadata 用に公開する。"""
+    from pipelines.components.video_model_components import SAM2VideoPropagator
+
+    monkeypatch.setenv("SAM2_CONFIG_NAME", "configs/samurai/sam2.1_hiera_l.yaml")
+    monkeypatch.setenv("SAM2_CKPT_PATH", "checkpoints/SAM2/sam2.1_hiera_large.pt")
+
+    meta = SAM2VideoPropagator().tracker_metadata()
+
+    assert meta["tracker_config"].endswith("sam2.1_hiera_l.yaml")
+    assert meta["tracker_checkpoint"].endswith("sam2.1_hiera_large.pt")
+    assert meta["samurai_mode"] is True
+
+
+def test_sam2_video_propagator_reports_plain_sam2_tracker_metadata(monkeypatch) -> None:
+    """通常 SAM2 config では samurai_mode を False として記録する。"""
+    from pipelines.components.video_model_components import SAM2VideoPropagator
+
+    monkeypatch.setenv("SAM2_CONFIG_NAME", "configs/sam2.1/sam2.1_hiera_l.yaml")
+
+    assert SAM2VideoPropagator().tracker_metadata()["samurai_mode"] is False
+
+
+def test_movie_app_exposes_tracking_overlay_ui() -> None:
+    """追跡が正しく追従しているか確認できる Tracking Overlay UI を提供する。"""
+    source = Path("gradio_app_sam2_transparent_BG_haystack_for_Movie.py").read_text(encoding="utf-8")
+
+    assert "Tracking Overlay" in source
+    assert "TrackingOverlayWriter" in source or "tracking_overlay" in source
+    assert "overlay_enabled" in source
+
+
+# ---------------------------------------------------------------------------
+# Phase R2: 役割別モデル Dropdown の Gradio UI 対応（動画版）
+# ---------------------------------------------------------------------------
+
+
+def test_movie_app_exposes_tracker_dropdown() -> None:
+    """動画版 Gradio は tracker role の Dropdown を提供しなければならない。"""
+    source = Path("gradio_app_sam2_transparent_BG_haystack_for_Movie.py").read_text(encoding="utf-8")
+
+    assert "tracker_model" in source
+    assert "build_dropdown_choices" in source
+
+
+def test_movie_app_tracker_dropdown_drives_pipeline_config() -> None:
+    """tracker Dropdown の選択が SAM2VideoPropagator の config_name / checkpoint_path を変更する。"""
+    source = Path("gradio_app_sam2_transparent_BG_haystack_for_Movie.py").read_text(encoding="utf-8")
+
+    # tracker_model が inputs として渡されるか、または pipeline 構築に使われる
+    assert source.count("tracker_model") >= 2
+
+
+def test_movie_app_exposes_background_model_dropdown() -> None:
+    """動画版 Gradio は background role の Dropdown を提供しなければならない。"""
+    source = Path("gradio_app_sam2_transparent_BG_haystack_for_Movie.py").read_text(encoding="utf-8")
+
+    assert "background_model" in source

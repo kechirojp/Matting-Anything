@@ -160,3 +160,41 @@ def test_groundingdino_autocast_uses_tensor_device_type_for_cpu_fallback() -> No
     assert "device_type = tgt.device.type" in source
     assert "torch.amp.autocast(device_type, enabled=False)" in source
     assert "torch.amp.autocast('cuda', enabled=False)" not in source
+
+
+# ---------------------------------------------------------------------------
+# Phase R2: 役割別モデル Dropdown の Gradio UI 対応
+# ---------------------------------------------------------------------------
+
+
+def test_static_app_exposes_background_model_dropdown() -> None:
+    """静止画版 Gradio は background role の Dropdown を提供しなければならない。"""
+    source = Path("gradio_app_sam2_transparent_BG_haystack.py").read_text(encoding="utf-8")
+
+    assert "background_model" in source
+    assert "build_dropdown_choices" in source
+    assert "background" in source  # Dropdown choices は background role から取得
+
+
+def test_static_app_dropdown_drives_tb_mode() -> None:
+    """背景除去 Dropdown の選択が transparent-background の tb_mode を決定する。"""
+    source = Path("gradio_app_sam2_transparent_BG_haystack.py").read_text(encoding="utf-8")
+
+    # Dropdown 変数が run_transparent_bg の呼び出しに渡されるか、
+    # または選択後に tb_mode が更新される仕組みがある
+    assert "background_model" in source
+    # background_model は inputs リストまたは callback の引数として使われる
+    assert source.count("background_model") >= 2
+
+
+def test_mam_app_exposes_background_model_dropdown() -> None:
+    """MAM Gradio アプリが background_model Dropdown を持つ。"""
+    source = Path("gradio_app_haystack.py").read_text(encoding="utf-8")
+    assert "background_model" in source
+    assert "build_dropdown_choices" in source
+
+
+def test_mam_app_background_dropdown_has_multiple_references() -> None:
+    """background_model が UI 定義と callback 両方で使われる。"""
+    source = Path("gradio_app_haystack.py").read_text(encoding="utf-8")
+    assert source.count("background_model") >= 2

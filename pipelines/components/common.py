@@ -272,6 +272,35 @@ def compose_mask_preview(
     return image_rgb
 
 
+def render_tracking_overlay_frame(
+    frame: np.ndarray,
+    mask: np.ndarray,
+    color: tuple[int, int, int] = (30, 144, 255),
+    fill_alpha: float = 0.45,
+    contour_thickness: int = 2,
+) -> np.ndarray:
+    """1 frame に追跡 mask の半透明塗りと輪郭を重ね、追従確認用 overlay を作る。"""
+    overlay = ensure_rgb_array(frame).copy()
+    mask_bool = np.asarray(mask).astype(bool)
+    if mask_bool.ndim != 2:
+        raise ValueError(f"mask は (H,W) 形式である必要があります: shape={mask_bool.shape}")
+    if mask_bool.shape != overlay.shape[:2]:
+        mask_bool = cv2.resize(
+            mask_bool.astype(np.uint8),
+            (overlay.shape[1], overlay.shape[0]),
+            interpolation=cv2.INTER_NEAREST,
+        ).astype(bool)
+    if not mask_bool.any():
+        return overlay
+    color_array = np.array(color, dtype=np.float32)
+    alpha = float(np.clip(fill_alpha, 0.0, 1.0))
+    overlay[mask_bool] = (overlay[mask_bool] * (1.0 - alpha) + color_array * alpha).astype(np.uint8)
+    if contour_thickness > 0:
+        contours, _ = cv2.findContours(mask_bool.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cv2.drawContours(overlay, contours, -1, tuple(int(value) for value in color), int(contour_thickness))
+    return overlay
+
+
 def mask_set_to_status(mask_set: dict[str, Any]) -> str:
     """MaskSet の件数・最高 score・source を UI 表示用文字列にまとめる。"""
     masks = normalize_masks(mask_set["masks"])

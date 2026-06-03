@@ -1,0 +1,86 @@
+# 推論モデルレジストリ
+# このファイルは pipelines/components/model_registry.py が読み込む設定ファイルです。
+# モデルを追加するときはここに entry を追記し、コードは変更しません。
+#
+# 必須フィールド（全 role 共通）:
+#   id         ... Python 識別子に準じる一意の文字列
+#   label      ... Gradio Dropdown に表示する人間可読ラベル
+#   component  ... 既知 Component クラス名（model_registry.py の _KNOWN_COMPONENTS に登録済みのもの）
+#
+# オプションフィールド（role 別追加フィールド）:
+#   requires   ... 利用条件（"sam2_facebook" / "sam2_samurai"）→ 環境変数 INFERENCE_TRACKER_VARIANT で判定
+#   その他     ... Component の constructor 引数として model_components.py が参照する値（例: tb_mode, config_name）
+#
+# ─────────────────────────────────────────
+# detector: テキストプロンプトから bbox を検出するモデル
+# ─────────────────────────────────────────
+
+[[detector]]
+id = "groundingdino_swint_ogc"
+label = "GroundingDINO SwinT-OGC (default)"
+component = "GroundingDINODetector"
+config_path = "GroundingDINO/groundingdino/config/GroundingDINO_SwinT_OGC.py"
+checkpoint_path = "checkpoints/groundingdino_swint_ogc.pth"
+
+# ─────────────────────────────────────────
+# tracker: 動画フレーム間でマスクを伝播させるモデル
+# ─────────────────────────────────────────
+
+[[tracker]]
+id = "sam2_hiera_l"
+label = "SAM2.1 Hiera-Large (standard)"
+component = "SAM2VideoPropagator"
+config_name = "configs/sam2.1/sam2.1_hiera_l.yaml"
+checkpoint_path = "checkpoints/SAM2/sam2.1_hiera_large.pt"
+requires = "sam2_facebook"
+# INFERENCE_TRACKER_VARIANT=sam2_facebook の環境でのみ表示
+
+[[tracker]]
+id = "sam2_hiera_b_plus"
+label = "SAM2.1 Hiera-B+ (lighter)"
+component = "SAM2VideoPropagator"
+config_name = "configs/sam2.1/sam2.1_hiera_b+.yaml"
+checkpoint_path = "checkpoints/SAM2/sam2.1_hiera_base_plus.pt"
+requires = "sam2_facebook"
+
+[[tracker]]
+id = "samurai_hiera_l"
+label = "SAMURAI Hiera-Large (motion-aware)"
+component = "SAM2VideoPropagator"
+config_name = "configs/samurai/sam2.1_hiera_l.yaml"
+checkpoint_path = "checkpoints/SAM2/sam2.1_hiera_large.pt"
+requires = "sam2_samurai"
+# INFERENCE_TRACKER_VARIANT=sam2_samurai の環境でのみ表示
+
+[[tracker]]
+id = "samurai_hiera_b_plus"
+label = "SAMURAI Hiera-B+ (motion-aware / lighter)"
+component = "SAM2VideoPropagator"
+config_name = "configs/samurai/sam2.1_hiera_b+.yaml"
+checkpoint_path = "checkpoints/SAM2/sam2.1_hiera_base_plus.pt"
+requires = "sam2_samurai"
+
+# ─────────────────────────────────────────
+# background: アルファマット / 背景除去モデル
+# ─────────────────────────────────────────
+
+[[background]]
+id = "tb_base"
+label = "transparent-background base（高精度）"
+component = "TransparentBGExtractor"
+tb_mode = "base"
+# 推奨: 精度重視の場合
+
+[[background]]
+id = "tb_fast"
+label = "transparent-background fast（軽量）"
+component = "TransparentBGExtractor"
+tb_mode = "fast"
+# 推奨: 速度重視の場合
+
+[[background]]
+id = "tb_base_nightly"
+label = "transparent-background base-nightly（最新実験版）"
+component = "TransparentBGExtractor"
+tb_mode = "base-nightly"
+# 実験的な最新モデル。安定性は base より低い場合があります
