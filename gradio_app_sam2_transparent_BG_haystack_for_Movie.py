@@ -105,8 +105,8 @@ def create_prompt_canvas_placeholder():
     canvas = np.full((height, width, 3), 248, dtype=np.uint8)
     cv2.rectangle(canvas, (1, 1), (width - 2, height - 2), (220, 225, 232), 2)
     cv2.putText(canvas, "SAM2 Video Prompt", (36, height // 2 - 22), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (70, 78, 92), 2)
-    cv2.putText(canvas, "Load the first frame, then click here.", (36, height // 2 + 22), cv2.FONT_HERSHEY_SIMPLEX, 0.72, (105, 113, 128), 2)
-    cv2.putText(canvas, "Only first-frame prompt is supported in this version.", (36, height // 2 + 58), cv2.FONT_HERSHEY_SIMPLEX, 0.72, (105, 113, 128), 2)
+    cv2.putText(canvas, "Load a frame, then click here.", (36, height // 2 + 22), cv2.FONT_HERSHEY_SIMPLEX, 0.72, (105, 113, 128), 2)
+    cv2.putText(canvas, "Pick the prompt frame below; multiple boxes are unioned.", (36, height // 2 + 58), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (105, 113, 128), 2)
     return canvas
 
 
@@ -174,11 +174,15 @@ def detect_text_boxes_for_video(
         state["box"] = [int(round(float(value))) for value in boxes[0].tolist()]
         state["box_buffer"] = []
         rows = []
+        candidate_boxes = []
         for index, box in enumerate(boxes):
             phrase = phrases[index] if index < len(phrases) else text_prompt.strip()
             confidence = float(confidences[index]) if index < len(confidences) else 0.0
             box_values = [int(round(float(value))) for value in box.tolist()]
+            candidate_boxes.append(box_values)
             rows.append([index + 1, phrase, f"{confidence:.3f}", ", ".join(str(value) for value in box_values)])
+        # 複合対象 union 用に全候補 bbox を保持する（apply_selected_boxes で部分採用される）。
+        state["boxes"] = candidate_boxes
         preview = draw_prompt_overlay(first_frame, state)
         status = f"GroundingDINO detected {len(rows)} candidate(s). Top bbox copied to SAM2 prompt: {state['box']}"
         return preview, state, rows, status
@@ -186,6 +190,96 @@ def detect_text_boxes_for_video(
         raise
     except Exception as exc:
         raise gr.Error(f"Text Prompt 検出に失敗しました: {exc}") from exc
+
+
+def _candidate_choice_label(rank: int, phrase: str, box_values: list[int]) -> str:
+    """CheckboxGroup 用に候補 bbox を一意な文字列ラベルへ変換する。"""
+    bbox_text = ",".join(str(int(value)) for value in box_values)
+    return f"#{rank} {phrase} [{bbox_text}]"
+
+
+def populate_candidate_choices(detected_rows):
+    """検出結果 Dataframe から候補選択 CheckboxGroup の選択肢を作る（top1 を既定 ON）。"""
+    rows = list(detected_rows or [])
+    labels: list[str] = []
+    for row in rows:
+        try:
+            rank = int(row[0])
+            phrase = str(row[1])
+            box_values = [int(round(float(value))) for value in str(row[3]).split(",")]
+        except (ValueError, IndexError):
+            continue
+        labels.append(_candidate_choice_label(rank, phrase, box_values))
+    default = [labels[0]] if labels else []
+    return gr.update(choices=labels, value=default)
+
+
+def apply_selected_boxes(first_frame, prompt_state: dict | None, selected_labels):
+    """選択された候補 bbox を複合対象 union 用に prompt_state["boxes"] へ反映する。"""
+    try:
+        if first_frame is None:
+            raise gr.Error("先に第 1 フレームを取得してください。")
+        labels = list(selected_labels or [])
+        if not labels:
+            raise gr.Error("少なくとも 1 つの候補 bbox を選択してください。")
+        selected_boxes: list[list[int]] = []
+        for label in labels:
+            # ラベル末尾の "[x1,y1,x2,y2]" を抽出する。phrase 内に "[]" を含んでも
+            # 最後の括弧群が bbox なので rsplit で確実に取り出す。
+            tail = str(label).rsplit("[", 1)
+            if len(tail) != 2:
+                continue
+            bbox_text = tail[1].rstrip("] ").strip()
+            try:
+                box_values = [int(round(float(value))) for value in bbox_text.split(",")]
+            except ValueError:
+                continue
+            if len(box_values) == 4:
+                selected_boxes.append(box_values)
+        if not selected_boxes:
+            raise gr.Error("選択した候補から bbox を解釈できませんでした。")
+        state = copy_prompt_state(prompt_state)
+        state["boxes"] = selected_boxes
+        # 複合対象 union を使う場合は単一 box を解除して描画と伝搬の二重指定を避ける。
+        state["box"] = None
+        state["box_buffer"] = []
+        preview = draw_prompt_overlay(first_frame, state)
+        status = f"複合対象 union を {len(selected_boxes)} 個の bbox で構成しました（各 box を別 obj として追跡し OR 統合）。"
+        return preview, state, status
+    except gr.Error:
+        raise
+    except Exception as exc:
+        raise gr.Error(f"候補 bbox の適用に失敗しました: {exc}") from exc
+
+
+def extract_prompt_frame(video_path: str | None, prompt_frame_idx: int, frame_step: int):
+    """指定したサンプリング後フレーム位置を取り出し、SAM2 prompt の起点フレームにする。"""
+    try:
+        if not video_path:
+            raise gr.Error("先に動画をアップロードしてください。")
+        # sampled_index: VideoReader が frame_step でサンプリングした後の frames list 上の位置。
+        # 元動画の frame 番号 ≈ sampled_index * frame_step。propagator の prompt_frame_idx も
+        # 同じ frames list index として渡すため両者が一致する。
+        sampled_index = max(int(prompt_frame_idx), 0)
+        result = get_reader_pipeline().run(
+            {"video_reader": {"video_path": video_path, "max_frames": sampled_index + 1, "frame_step": int(frame_step)}},
+            include_outputs_from={"video_reader"},
+        )
+        frames = result["video_reader"]["frames"]
+        metadata = result["video_reader"]["metadata"]
+        frame = frames[min(sampled_index, len(frames) - 1)]
+        state = empty_prompt_state()
+        raw_index = sampled_index * int(frame_step)
+        status = (
+            f"プロンプト起点フレームをシーケンス位置 {sampled_index}（元動画フレーム≈{raw_index}）に設定しました。"
+            f"このフレームで bbox / point / Text Prompt を作り直してください。"
+            f" 画像サイズ {metadata['width']}x{metadata['height']}。"
+        )
+        return frame, state, status
+    except gr.Error:
+        raise
+    except Exception as exc:
+        raise gr.Error(f"プロンプトフレームの取得に失敗しました: {exc}") from exc
 
 
 def _sequence_preview_files(result: dict[str, Any]) -> list[str]:
@@ -231,6 +325,8 @@ def build_video_progress_callback(progress, stage_state: dict[str, Any]):
 def run_video_background_removal(
     video_path: str | None,
     prompt_state: dict | None,
+    prompt_frame_idx: int,
+    bidirectional: bool,
     max_frames: int,
     frame_step: int,
     output_mode_label: str,
@@ -255,8 +351,9 @@ def run_video_background_removal(
         points = state.get("points") or []
         labels = state.get("labels") or []
         box = state.get("box")
-        if not points and box is None:
-            raise gr.Error("SAM2 Prompt Canvas 上で point または bbox を指定してください。")
+        boxes = state.get("boxes") or []
+        if not points and box is None and not boxes:
+            raise gr.Error("SAM2 Prompt Canvas 上で point / bbox を指定するか、候補 bbox を選択してください。")
         output_mode = normalize_output_mode(output_mode_label)
         processed_frames = _estimate_processed_frames(int(max_frames), int(frame_step))
         progress_callback = build_video_progress_callback(progress, stage_state)
@@ -279,6 +376,9 @@ def run_video_background_removal(
                     "points": points,
                     "labels": labels,
                     "box": box,
+                    "boxes": boxes,
+                    "prompt_frame_idx": int(prompt_frame_idx),
+                    "bidirectional": bool(bidirectional),
                     "progress_callback": progress_callback,
                 },
                 "transparent_bg_video": {
@@ -378,6 +478,17 @@ with gr.Blocks(title="SAM2 + Transparent Background Haystack for Movie") as demo
         extend_top_btn = gr.Button("Extend Top")
         extend_bottom_btn = gr.Button("Extend Bottom")
 
+    with gr.Row():
+        prompt_frame_idx = gr.Slider(
+            0, 1999, value=0, step=1, label="プロンプト起点フレーム位置",
+            info="SAM2 プロンプトを与えるフレームの位置（サンプリング後シーケンスの 0 始まりの番号、整数）。0 で第1フレーム。最大処理フレーム数より小さい値にする。途中フレームから前後双方向に追跡したい時に上げる。目安 0。",
+        )
+        show_frame_btn = gr.Button("このフレームを表示")
+    bidirectional = gr.Checkbox(
+        value=False, label="双方向伝播（前後フレームへ追跡）",
+        info="ON: 起点フレームから過去方向と未来方向の両方へ追跡を伝搬し、各 frame のマスクを OR 統合する（途中フレームを起点にした時に有効。処理時間は約2倍）。OFF: 起点フレームから未来方向のみ。真偽値。",
+    )
+
     prompt_state = gr.State(value=empty_prompt_state())
     prompt_status = gr.Textbox(label="Prompt Status", interactive=False)
 
@@ -409,6 +520,13 @@ with gr.Blocks(title="SAM2 + Transparent Background Haystack for Movie") as demo
             label="Detected boxes",
             interactive=False,
         )
+        box_candidate_group = gr.CheckboxGroup(
+            choices=[],
+            value=[],
+            label="複合対象に使う候補 bbox を選択（union 用）",
+            info="複数選択すると各 bbox を別オブジェクトとして追跡し、frame ごとに OR 統合する（例: person playing drums で人とドラムを両方選ぶ）。検出後に top1 が自動 ON。選択後に下のボタンで反映。単位なしの選択値。",
+        )
+        apply_boxes_btn = gr.Button("選択した候補 bbox を複合対象として反映")
 
     run_btn = gr.Button("動画背景除去を実行", variant="primary")
 
@@ -499,12 +617,26 @@ with gr.Blocks(title="SAM2 + Transparent Background Haystack for Movie") as demo
         detect_text_boxes_for_video,
         inputs=[prompt_canvas, text_prompt, text_box_threshold, text_text_threshold, text_top_k, prompt_state],
         outputs=[prompt_canvas, prompt_state, detected_boxes, prompt_status],
+    ).then(
+        populate_candidate_choices,
+        inputs=[detected_boxes],
+        outputs=[box_candidate_group],
+    )
+    apply_boxes_btn.click(
+        apply_selected_boxes,
+        inputs=[prompt_canvas, prompt_state, box_candidate_group],
+        outputs=[prompt_canvas, prompt_state, prompt_status],
+    )
+    show_frame_btn.click(
+        extract_prompt_frame,
+        inputs=[input_video, prompt_frame_idx, frame_step],
+        outputs=[prompt_canvas, prompt_state, prompt_status],
     )
     output_mode.change(update_codec_visibility, inputs=[output_mode], outputs=[rgba_codec])
     prompt_mode.change(update_point_label_visibility, inputs=[prompt_mode], outputs=[point_label])
     run_btn.click(
         run_video_background_removal,
-        inputs=[input_video, prompt_state, max_frames, frame_step, output_mode, rgba_codec, tracker_model, background_model, tb_jit, tb_threshold, tb_output_type, crop_padding, overlay_enabled],
+        inputs=[input_video, prompt_state, prompt_frame_idx, bidirectional, max_frames, frame_step, output_mode, rgba_codec, tracker_model, background_model, tb_jit, tb_threshold, tb_output_type, crop_padding, overlay_enabled],
         outputs=[rgba_video, alpha_video, preview_video, tracking_overlay_video, sequence_files, sequence_dirs, run_status],
     )
 

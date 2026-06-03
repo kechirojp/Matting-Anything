@@ -199,6 +199,95 @@ def test_sam2_video_propagator_warmup_uses_gpu_policy(monkeypatch) -> None:
         propagator.warm_up()
 
 
+def test_sam2_video_propagator_run_supports_multi_box_and_bidirectional() -> None:
+    """Phase B: run() should accept boxes/prompt_frame_idx/bidirectional."""
+    import inspect
+
+    from pipelines.components.video_model_components import SAM2VideoPropagator
+
+    params = inspect.signature(SAM2VideoPropagator.run).parameters
+    assert "boxes" in params
+    assert "prompt_frame_idx" in params
+    assert "bidirectional" in params
+
+
+class _FakeMultiObjVideoPredictor:
+    """2 obj を左右半分の mask として返す fake video predictor。"""
+
+    def __init__(self) -> None:
+        self.added: list[dict] = []
+        self.reverse_calls: list[bool] = []
+
+    def init_state(self, video_path):  # noqa: D401 - fake
+        return {"video_path": video_path}
+
+    def add_new_points_or_box(self, inference_state, frame_idx, obj_id, box=None, points=None, labels=None):
+        import numpy as np
+
+        self.added.append(
+            {
+                "frame_idx": int(frame_idx),
+                "obj_id": int(obj_id),
+                "box": None if box is None else np.asarray(box).tolist(),
+            }
+        )
+
+    def propagate_in_video(self, state, reverse=False):
+        import numpy as np
+
+        self.reverse_calls.append(bool(reverse))
+        height, width = 4, 6
+        for frame_idx in range(2):
+            obj1 = np.full((1, height, width), -1.0, dtype=np.float32)
+            obj1[0, :, :3] = 1.0  # 左半分
+            obj2 = np.full((1, height, width), -1.0, dtype=np.float32)
+            obj2[0, :, 3:] = 1.0  # 右半分
+            yield frame_idx, [1, 2], [obj1, obj2]
+
+
+def test_sam2_video_propagator_unions_objects_and_runs_two_passes() -> None:
+    """Phase B: 複数 box は obj_id 1..N 登録 → frame ごと union、bidirectional で 2-pass。"""
+    import pytest
+
+    pytest.importorskip("torch")
+    import numpy as np
+
+    from pipelines.components.video_model_components import SAM2VideoPropagator
+
+    propagator = SAM2VideoPropagator(device="cpu")
+    fake = _FakeMultiObjVideoPredictor()
+    propagator._video_predictor = fake  # warm_up を冪等にスキップさせる
+
+    frames = [np.zeros((4, 6, 3), dtype=np.uint8) for _ in range(2)]
+    result = propagator.run(
+        frames=frames,
+        boxes=[[0, 0, 2, 3], [3, 0, 5, 3]],
+        prompt_frame_idx=1,
+        bidirectional=True,
+    )
+
+    masks = result["masks"]
+    # 2 box が obj_id 1,2 として prompt_frame_idx=1 で登録される。
+    assert [item["obj_id"] for item in fake.added] == [1, 2]
+    assert all(item["frame_idx"] == 1 for item in fake.added)
+    # bidirectional → forward + reverse の 2 pass。
+    assert fake.reverse_calls == [False, True]
+    # 左半分(obj1) ∪ 右半分(obj2) = 全面 True。
+    assert masks["object_ids"] == [1, 2]
+    for mask in masks["frame_masks"].values():
+        assert bool(np.all(mask))
+
+
+def test_movie_app_exposes_frame_selection_and_union_controls() -> None:
+    """Phase D: 動画 UI にフレーム選択・候補選択・双方向伝播の導線があること。"""
+    source = Path("gradio_app_sam2_transparent_BG_haystack_for_Movie.py").read_text(encoding="utf-8")
+
+    assert "apply_selected_boxes" in source
+    assert "prompt_frame_idx" in source
+    assert "bidirectional" in source
+    assert "CheckboxGroup" in source
+
+
 def test_sam2_video_propagator_reports_samurai_tracker_metadata(monkeypatch) -> None:
     """SAMURAI への差し替えを config 駆動で行い、使用 tracker を mask metadata 用に公開する。"""
     from pipelines.components.video_model_components import SAM2VideoPropagator

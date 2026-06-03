@@ -382,11 +382,15 @@ Text Prompt / GroundingDINO を使った後に動画処理へ進む場合、Grou
 
 ### 5-4. SAM2 prompt UI helper 共通化
 
-SAM2 prompt の端吸着・bbox 正規化・overlay 描画は `pipelines/components/ui_helpers.py` を共通利用する。対象関数は `clamp_prompt_point`, `normalize_box_from_points`, `draw_prompt_overlay`, `select_sam2_prompt`, `extend_box_to_edge`。静止画版と動画版 UI は同じ helper を import する。
+SAM2 prompt の端吸着・bbox 正規化・overlay 描画は `pipelines/components/ui_helpers.py` を共通利用する。対象関数は `clamp_prompt_point`, `normalize_box_from_points`, `draw_prompt_overlay`, `select_sam2_prompt`, `extend_box_to_edge`。静止画版と動画版 UI は同じ helper を import する。`prompt_state` は単一 `box` に加えて複合対象用の `boxes`（int 4 要素 list の list）を保持し、`empty_prompt_state()` / `copy_prompt_state()` / `draw_prompt_overlay()` が複数 bbox を扱う（`draw_prompt_overlay` は色循環 + 番号ラベルで `boxes` を描画してから単一 gold `box` を重ねる）。
 
-### 5-5. 動画版 Text Prompt / GroundingDINO 導線
+### 5-5. 動画版 Text Prompt / GroundingDINO 導線 + 複合対象 union / フレーム選択 / 双方向伝播
 
-動画版 Haystack UI でも静止画版と同じく、複合対象（例: `person playing drums`, `person riding bicycle`）を意味プロンプトで選ぶ導線を維持する。`gradio_app_sam2_transparent_BG_haystack_for_Movie.py` は GroundingDINO をボタン押下時まで遅延構築し、第 1 フレームに対して Text Prompt 検出を実行する。検出結果の top bbox は `prompt_state["box"]` にコピーされ、以後の `SAM2VideoPropagator` がその bbox を動画全体へ伝搬する。
+動画版 Haystack UI でも静止画版と同じく、複合対象（例: `person playing drums`, `person riding bicycle`）を意味プロンプトで選ぶ導線を維持する。`gradio_app_sam2_transparent_BG_haystack_for_Movie.py` は GroundingDINO をボタン押下時まで遅延構築し、Text Prompt 検出を実行する。検出結果は top bbox を `prompt_state["box"]` に、全候補 bbox を `prompt_state["boxes"]` にコピーする。候補は `CheckboxGroup`（`populate_candidate_choices` がラベル生成、`apply_selected_boxes` が選択 bbox を `prompt_state["boxes"]` へ反映）でユーザーが複数選び、複合対象として union できる。
+
+`SAM2VideoPropagator.run` は `boxes`（複数）/ `prompt_frame_idx`（起点フレーム）/ `bidirectional`（双方向）を受け取る。複数 bbox は obj_id 1..N として登録し、frame ごとに全 obj の mask を OR union して 1 枚へ統合するため、下流契約 `frame_masks: source_index → 1 枚` は不変（`TransparentBGVideoExtractor` / writer 改修不要）。`bidirectional=True` のとき forward / backward の 2 パスを走らせ各 frame で結果を OR 統合する。これらの新パラメータは Component run kwargs の auto-socket 経由で `pipeline.run(data={...})` から渡せるため pipeline 結線は不変。`boxes=None` のときは従来の単一 box/point・`prompt_frame_idx=0`・forward only パスを完全に維持する（後方互換）。
+
+UI では起点フレームを `gr.Slider`（サンプリング後シーケンス index 0〜max_frames-1）+「このフレームを表示」ボタン（`extract_prompt_frame` が raw_index = slider × frame_step で抽出し index 整合を担保）で指定し、双方向は `gr.Checkbox` で切り替える。フレーム選択 Slider は座標手入力ではないため ERR017 に抵触しない。
 
 Movie Notebook 正本 `Sam2_Transparent_Background_Haystack_for_Movie.py` では `GROUNDING_DINO_CKPT_PATH` を取得・環境変数へ設定し、Gradio 起動前診断で SAM2 と GroundingDINO の GPU / checkpoint 状態を確認する。
 

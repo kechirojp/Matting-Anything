@@ -8,8 +8,8 @@
 
 | 項目 | 内容 |
 |------|------|
-| **作業中のタスク** | 役割別モデル差し替え（レジストリ + Gradio プルダウン）Phase R2 完了 |
-| **最終更新日** | 2026-06-05（copilot-instructions.md SAMURAI/Dropdown 切替記述を修正） |
+| **作業中のタスク** | 動画版 Phase A〜E 実装（フレーム選択UI + 複数obj union + 双方向伝播）完了 |
+| **最終更新日** | 2026-06-05（動画版 Phase A〜E 完了・Playwright 確認済み） |
 | **担当者/セッション** | GitHub Copilot |
 
 ---
@@ -17,6 +17,24 @@
 ## 進行中タスクの詳細
 
 <!-- 現在取り組んでいるタスクの目的・進捗・残作業を記述 -->
+
+### タスク名: 動画版 Phase A〜E 実装（2026-06-05 着手, large）
+- **目的**: `2026-06-02_SAM2動画_複合対象トラッキング_フレーム選択_双方向伝播_計画.md` の Phase A〜E（§11.3 で次フェーズに先送りされていた部分）を実装する。複合対象（例 `person playing drums`）を「複数 bbox → 各 obj_id 登録 → frame ごと union → 双方向伝播」で確実に追跡する。
+- **ギャップ確認（精読済み）**:
+  - `ui_helpers.empty_prompt_state()` に `"boxes"` キーなし → Phase A
+  - `copy_prompt_state()` / `draw_prompt_overlay()` が `boxes` を扱わない → Phase A
+  - `SAM2VideoPropagator.run` に `boxes` / `prompt_frame_idx` / `bidirectional` なし、`frame_idx` が 0 ハードコード、forward only、単一 obj → Phase B
+  - movie app にフレーム選択 Slider / 候補 CheckboxGroup / `apply_selected_boxes` / bidirectional 無し → Phase D
+- **設計判断**:
+  - `prompt_frame_idx` = propagator が受け取る **frames リスト内の 0-based index**。UI のフレーム Slider は「サンプリング後シーケンス index（0〜max_frames-1）」を指し、preview は raw_index = slider * frame_step で抽出（VideoReader のサンプリングと一致）させ index 整合を担保。
+  - union は propagator 内で `union_masks(mode="or")` 相当（np.any）で frame ごとに 1 枚へ統合。下流契約 `frame_masks: source_index→1枚` は不変 → TransparentBG/Writer 改修不要（Phase C は結線確認のみ）。
+  - 後方互換: `boxes=None` のとき従来の単一 box/point・frame_idx=0・forward only パスを完全維持。
+- **手順**: WHITEBOARD(済) → RED テスト → Phase A→B→C→D → GREEN → サブエージェントレビュー → Playwright UI 確認 → 記録更新。ユーザーは「Phase A〜E 全部実装」を承認済み。
+- **完了状況（2026-06-05）**: ✅ Phase A（`ui_helpers` boxes 対応）/ B（`SAM2VideoPropagator` multi-box・prompt_frame_idx・bidirectional union）/ C（pipeline 結線は run kwargs auto-socket で改修不要と確認）/ D（movie app に フレーム Slider・このフレームを表示・双方向 Checkbox・候補 CheckboxGroup・`apply_selected_boxes` 追加）/ E（GREEN）すべて完了。
+  - **テスト**: `127 passed, 1 skipped, 3 deselected`（union 伝播テストは torch 不在環境で `importorskip` により skip、GPU 環境で実行可）。
+  - **サブエージェントレビュー（Explore）**: 重大バグなし。中程度指摘 #1（候補ラベルの bbox 抽出が phrase 内 `[]` で誤マッチ）を rsplit 方式へ修正、未使用となった `import re` を削除。#2（frame_step 整合）はコメント追記で補強、#3（候補 parse の握りつぶし）は軽微につき据え置き。
+  - **Playwright UI 確認**: `gradio_app_..._for_Movie.py` を 7861 で起動、5 つの新コントロール（起点フレーム Slider / このフレームを表示 / 双方向伝播 Checkbox / 候補 bbox CheckboxGroup / 反映ボタン）の描画と info= 完備を確認。Prompt Canvas プレースホルダーの「Only first-frame prompt」表記を frame 選択対応の文言へ更新。スクショ: `outputs/movie_ui_phase_d.png`。
+  - **共通処理影響**: `ui_helpers.py` 変更は加算的・後方互換（静止画版も同 GREEN スイートで担保）。
 
 ### タスク名: 役割別モデル差し替え（レジストリ + Gradio プルダウン）計画策定（2026-06-03 設計のみ）
 - **目的**: detector(GroundingDINO) / tracker(SAM2,SAMURAI) / background(transparent-background) を config 駆動で差し替え、Gradio に役割別プルダウンを設ける設計を策定。コード実装はまだ行わない（large・設計先行）

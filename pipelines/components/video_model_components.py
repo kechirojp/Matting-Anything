@@ -200,23 +200,43 @@ class SAM2VideoPropagator:
         points: list[tuple[int, int]] | None = None,
         labels: list[int] | None = None,
         box: list[int] | None = None,
+        boxes: list[list[int]] | None = None,
         object_id: int = 1,
+        prompt_frame_idx: int = 0,
+        bidirectional: bool = False,
         progress_callback: ProgressCallback | None = None,
     ) -> dict[str, Any]:
-        """first-frame prompt を SAM2 video predictor に登録し、frame mask 列を返す。"""
+        """prompt を SAM2 video predictor に登録し、frame mask 列を返す。
+
+        複合対象 union: ``boxes`` を渡すと各 box を obj_id 1..N として登録し、frame ごとに
+        全 obj の mask を OR 統合した単一 mask を返す。``bidirectional`` の場合は
+        ``prompt_frame_idx`` を起点に forward / reverse の 2 pass を伝搬する。``boxes`` 未指定時は
+        従来の単一 box / point・object_id・forward only パスを維持する（後方互換）。
+        """
         if not frames:
             raise ValueError("frames が空です。")
-        if not points and box is None:
-            raise ValueError("SAM2 video prompt が空です。points または box を指定してください。")
+        if not points and box is None and not boxes:
+            raise ValueError("SAM2 video prompt が空です。points / box / boxes のいずれかを指定してください。")
+        prompt_frame_idx = int(prompt_frame_idx)
+        if prompt_frame_idx < 0 or prompt_frame_idx >= len(frames):
+            raise ValueError(f"prompt_frame_idx が範囲外です: {prompt_frame_idx}（許容 0〜{len(frames) - 1}）")
         _notify_progress(progress_callback, "sam2_video", 0.0, "SAM2 video predictor を初期化しています")
         self.warm_up()
         _notify_progress(progress_callback, "sam2_video", 0.08, "SAM2 用の一時 frame を準備しています")
         assert self._video_predictor is not None
         import torch
 
+        # 複数 box は obj_id 1..N、単一 prompt は object_id を追跡対象とする。
+        if boxes:
+            target_object_ids = list(range(1, len(boxes) + 1))
+        else:
+            target_object_ids = [int(object_id)]
+        directions = [False, True] if bidirectional else [False]
+
         frame_masks: dict[int, np.ndarray] = {}
         source_indices = list((metadata or {}).get("metadata", {}).get("sampled_frame_indices", range(len(frames))))
         total_frames = max(len(frames), 1)
+        propagation_total = total_frames * len(directions)
         with tempfile.TemporaryDirectory(prefix="sam2_video_frames_") as temp_dir:
             temp_path = Path(temp_dir)
             for frame_index, frame in enumerate(frames):
@@ -232,40 +252,62 @@ class SAM2VideoPropagator:
             with torch.inference_mode():
                 _notify_progress(progress_callback, "sam2_video", 0.22, "SAM2 の video state を初期化しています")
                 state = self._video_predictor.init_state(video_path=str(temp_path))
-                add_kwargs: dict[str, Any] = {"inference_state": state, "frame_idx": 0, "obj_id": int(object_id)}
-                if points:
-                    add_kwargs["points"] = np.asarray(points, dtype=np.float32)
-                    add_kwargs["labels"] = np.asarray(labels or [1] * len(points), dtype=np.int32)
-                if box is not None:
-                    add_kwargs["box"] = np.asarray(box, dtype=np.float32)
-                self._video_predictor.add_new_points_or_box(**add_kwargs)
+                if boxes:
+                    for obj_id, single_box in zip(target_object_ids, boxes):
+                        self._video_predictor.add_new_points_or_box(
+                            inference_state=state,
+                            frame_idx=prompt_frame_idx,
+                            obj_id=obj_id,
+                            box=np.asarray(single_box, dtype=np.float32),
+                        )
+                else:
+                    add_kwargs: dict[str, Any] = {"inference_state": state, "frame_idx": prompt_frame_idx, "obj_id": int(object_id)}
+                    if points:
+                        add_kwargs["points"] = np.asarray(points, dtype=np.float32)
+                        add_kwargs["labels"] = np.asarray(labels or [1] * len(points), dtype=np.int32)
+                    if box is not None:
+                        add_kwargs["box"] = np.asarray(box, dtype=np.float32)
+                    self._video_predictor.add_new_points_or_box(**add_kwargs)
                 _notify_progress(progress_callback, "sam2_video", 0.25, "SAM2 mask を動画全体へ伝搬しています")
                 propagated_count = 0
-                for out_frame_idx, out_obj_ids, out_mask_logits in self._video_predictor.propagate_in_video(state):
-                    propagated_count += 1
-                    object_ids = [int(value) for value in out_obj_ids]
-                    target_index = object_ids.index(int(object_id)) if int(object_id) in object_ids else 0
-                    mask_logits = out_mask_logits[target_index]
-                    if hasattr(mask_logits, "detach"):
-                        mask_array = (mask_logits.detach().cpu().numpy() > 0.0).squeeze()
-                    else:
-                        mask_array = (np.asarray(mask_logits) > 0.0).squeeze()
-                    source_index = int(source_indices[int(out_frame_idx)]) if int(out_frame_idx) < len(source_indices) else int(out_frame_idx)
-                    frame_masks[source_index] = mask_array.astype(bool)
-                    if propagated_count == 1 or propagated_count % 10 == 0 or propagated_count == total_frames:
-                        _notify_progress(
-                            progress_callback,
-                            "sam2_video",
-                            0.25 + 0.75 * (propagated_count / total_frames),
-                            f"SAM2 mask を動画全体へ伝搬しています ({propagated_count}/{total_frames})",
-                        )
+                for reverse in directions:
+                    for out_frame_idx, out_obj_ids, out_mask_logits in self._video_predictor.propagate_in_video(state, reverse=reverse):
+                        propagated_count += 1
+                        object_ids = [int(value) for value in out_obj_ids]
+                        union_mask: np.ndarray | None = None
+                        for target_obj in target_object_ids:
+                            if target_obj not in object_ids:
+                                continue
+                            mask_logits = out_mask_logits[object_ids.index(target_obj)]
+                            if hasattr(mask_logits, "detach"):
+                                obj_mask = (mask_logits.detach().cpu().numpy() > 0.0).squeeze()
+                            else:
+                                obj_mask = (np.asarray(mask_logits) > 0.0).squeeze()
+                            obj_mask = obj_mask.astype(bool)
+                            union_mask = obj_mask if union_mask is None else (union_mask | obj_mask)
+                        if union_mask is None:
+                            continue
+                        source_index = int(source_indices[int(out_frame_idx)]) if int(out_frame_idx) < len(source_indices) else int(out_frame_idx)
+                        # forward / reverse 両 pass で重複する frame は OR 統合する。
+                        existing = frame_masks.get(source_index)
+                        frame_masks[source_index] = union_mask if existing is None else (existing | union_mask)
+                        if propagated_count == 1 or propagated_count % 10 == 0 or propagated_count == propagation_total:
+                            _notify_progress(
+                                progress_callback,
+                                "sam2_video",
+                                0.25 + 0.75 * (propagated_count / propagation_total),
+                                f"SAM2 mask を動画全体へ伝搬しています ({propagated_count}/{propagation_total})",
+                            )
         masks = build_frame_mask_sequence(
             frame_masks,
-            object_ids=[int(object_id)],
+            object_ids=list(target_object_ids),
             metadata={
                 "points": points or [],
                 "labels": labels or [],
                 "box": box,
+                "boxes": [list(single_box) for single_box in (boxes or [])],
+                "prompt_frame_idx": prompt_frame_idx,
+                "bidirectional": bool(bidirectional),
                 "source_metadata": metadata or {},
                 **self.tracker_metadata(),
             },

@@ -4,7 +4,9 @@ import numpy as np
 
 from pipelines.components.ui_helpers import (
     clamp_prompt_point,
+    copy_prompt_state,
     draw_prompt_overlay,
+    empty_prompt_state,
     extend_box_to_edge,
     normalize_box_from_points,
     select_sam2_prompt,
@@ -70,3 +72,33 @@ def test_draw_prompt_overlay_preserves_shape_and_dtype() -> None:
 
     assert overlay.shape == image.shape
     assert overlay.dtype == np.uint8
+
+
+def test_empty_prompt_state_has_boxes_list() -> None:
+    state = empty_prompt_state()
+
+    assert state["boxes"] == []
+
+
+def test_copy_prompt_state_deep_copies_boxes() -> None:
+    original = empty_prompt_state()
+    original["boxes"] = [[1, 2, 3, 4], [5, 6, 7, 8]]
+
+    copied = copy_prompt_state(original)
+    copied["boxes"].append([9, 9, 9, 9])
+    copied["boxes"][0][0] = 99
+
+    assert original["boxes"] == [[1, 2, 3, 4], [5, 6, 7, 8]]
+    assert copied["boxes"] == [[99, 2, 3, 4], [5, 6, 7, 8], [9, 9, 9, 9]]
+
+
+def test_draw_prompt_overlay_draws_multiple_boxes() -> None:
+    image = np.zeros((40, 60, 3), dtype=np.uint8)
+    state = empty_prompt_state()
+    state["boxes"] = [[2, 3, 20, 25], [30, 5, 55, 35]]
+
+    overlay = draw_prompt_overlay(image, state, None)
+
+    assert overlay.shape == image.shape
+    # 各 box の枠線が描画され、元の真っ黒画像から変化していること。
+    assert overlay.sum() > 0

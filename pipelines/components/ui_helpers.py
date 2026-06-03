@@ -23,6 +23,7 @@ def empty_prompt_state() -> dict[str, object]:
         "points": [],
         "labels": [],
         "box": None,
+        "boxes": [],
         "box_buffer": [],
         "input_mode": "point",
     }
@@ -37,6 +38,8 @@ def copy_prompt_state(prompt_state: dict | None) -> dict[str, object]:
         state["labels"] = list(state.get("labels") or [])
         state["box_buffer"] = list(state.get("box_buffer") or [])
         state["box"] = list(state["box"]) if state.get("box") is not None else None
+        # 複合対象 union 用の複数 bbox は要素までディープコピーし共有参照を避ける。
+        state["boxes"] = [list(single_box) for single_box in (state.get("boxes") or [])]
     return state
 
 
@@ -94,6 +97,13 @@ def draw_prompt_overlay(input_image: Any, prompt_state: dict | None = None, mask
         mask_bool = mask.astype(bool)
         overlay_color = np.array([30, 144, 255], dtype=np.uint8)
         image_rgb[mask_bool] = (image_rgb[mask_bool] * 0.5 + overlay_color * 0.5).astype(np.uint8)
+    # 複合対象 union 用の複数 bbox を色分け・番号付きで描画する。
+    multi_box_colors = ((255, 99, 71), (60, 179, 113), (65, 105, 225), (238, 130, 238), (255, 165, 0))
+    for box_index, single_box in enumerate(state.get("boxes") or []):
+        x_min, y_min, x_max, y_max = [int(value) for value in single_box]
+        color = multi_box_colors[box_index % len(multi_box_colors)]
+        cv2.rectangle(image_rgb, (x_min, y_min), (x_max, y_max), color, 2)
+        cv2.putText(image_rgb, str(box_index + 1), (x_min + 2, max(y_min + 14, 14)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
     if state.get("box") is not None:
         x_min, y_min, x_max, y_max = [int(value) for value in state["box"]]
         cv2.rectangle(image_rgb, (x_min, y_min), (x_max, y_max), (255, 215, 0), 3)
