@@ -32,11 +32,16 @@ def build_sam2_video_propagation_pipeline() -> Pipeline:
     return pipeline
 
 
-def build_sam2_tb_video_pipeline() -> Pipeline:
-    """動画背景除去の end-to-end Pipeline を構築する。"""
+def build_sam2_tb_video_pipeline(propagator: SAM2VideoPropagator | None = None) -> Pipeline:
+    """動画背景除去の end-to-end Pipeline を構築する。
+
+    Args:
+        propagator: 事前構築済みの SAM2VideoPropagator。tracker モデル選択を反映するために
+            registry から構築したインスタンスを注入できる。None の場合は既定 SAM2 を構築する。
+    """
     pipeline = Pipeline()
     pipeline.add_component("video_reader", VideoReader())
-    pipeline.add_component("sam2_video_propagator", SAM2VideoPropagator())
+    pipeline.add_component("sam2_video_propagator", propagator or SAM2VideoPropagator())
     pipeline.add_component("transparent_bg_video", TransparentBGVideoExtractor())
     pipeline.add_component("video_writer", VideoWriter())
     pipeline.add_component("frame_sequence_writer", FrameSequenceWriter())

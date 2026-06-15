@@ -160,6 +160,52 @@ class VideoReader:
         return {"frames": frames, "metadata": metadata}
 
 
+def _samurai_config_root(config_name: str | None) -> Path | None:
+    """SAMURAI config 利用時、configs/ を含むローカル sam2 package root を返す。
+
+    Colab 等で facebook 版 sam2 が入っていると ``configs/samurai/...`` が
+    sam2 の Hydra 検索パスに存在せず ``MissingConfigException`` になる。
+    workspace 同梱の samurai fork（``samurai/sam2/sam2``）には configs/samurai が
+    あるため、その package root を返して検索パスへ追加できるようにする。
+    非 samurai config では None を返し検索パスを変更しない（samurai/ は変更しない）。
+    """
+    if not config_name or "samurai" not in str(config_name).lower():
+        return None
+    project_root = Path(os.environ.get("PROJECT_ROOT", Path(__file__).resolve().parents[2]))
+    sam2_root = project_root / "samurai" / "sam2" / "sam2"
+    if (sam2_root / "configs" / "samurai").is_dir():
+        return sam2_root
+    return None
+
+
+def _ensure_samurai_config_searchpath(config_name: str | None) -> None:
+    """SAMURAI config をローカル sam2 package root から解決できるよう Hydra 検索パスに追加する。
+
+    既に登録済み、または samurai config でない場合は no-op。Hydra 未初期化時は sam2 を
+    import して初期化させる。解決できないときはエラーを握り潰さず、後続の build が出す
+    例外（MissingConfigException など）をそのまま伝搬させる。
+    """
+    sam2_root = _samurai_config_root(config_name)
+    if sam2_root is None:
+        return
+    from hydra.core.global_hydra import GlobalHydra
+
+    global_hydra = GlobalHydra.instance()
+    if not global_hydra.is_initialized():
+        import sam2  # noqa: F401  # import 時に initialize_config_module("sam2") が走る
+
+        global_hydra = GlobalHydra.instance()
+    if not global_hydra.is_initialized():
+        return
+    search_path = global_hydra.config_loader().get_search_path()
+    provider_uri = sam2_root.as_uri()
+    already_registered = any(
+        getattr(entry, "path", None) == provider_uri for entry in search_path.get_path()
+    )
+    if not already_registered:
+        search_path.append(provider="samurai-local", path=provider_uri)
+
+
 @component
 class SAM2VideoPropagator:
     """SAM2 video predictor で first-frame prompt から全 frame の mask を伝搬する Component。"""
@@ -188,6 +234,7 @@ class SAM2VideoPropagator:
         if self._video_predictor is not None:
             return
         require_gpu_for_heavy_inference(self.__class__.__name__, self.device)
+        _ensure_samurai_config_searchpath(self.config_name)
         from sam2.build_sam import build_sam2_video_predictor
 
         self._video_predictor = build_sam2_video_predictor(self.config_name, self.checkpoint_path, device=str(self.device))

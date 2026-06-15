@@ -346,16 +346,27 @@ def test_sam2_movie_ui_auto_loads_first_frame_and_simplifies_settings() -> None:
     """動画 UI はアップロード後の第1フレーム自動取得と詳細設定折りたたみを提供する。"""
     app_source = Path("gradio_app_sam2_transparent_BG_haystack_for_Movie.py").read_text(encoding="utf-8")
 
+    assert "## 1. フレーム取得系" in app_source
+    assert "## 2. DINO系" in app_source
+    assert "## 3. SAM系" in app_source
+    assert "## 4. 背景透過系" in app_source
     assert "extract_first_frame_outputs" in app_source
     assert "input_video.change(extract_first_frame_outputs" in app_source
-    assert 'gr.Button("第1フレームを再取得")' in app_source
+    assert 'label="プロンプト起点フレーム位置（ドラッグで Canvas 更新）"' in app_source
+    assert 'elem_id="movie-input-video"' in app_source
+    assert 'elem_id="prompt-frame-idx"' in app_source
+    assert 'elem_id="movie-frame-step"' in app_source
+    assert 'prompt_frame_idx.change(' in app_source
+    # 不安定な video シーク連動 JS と冗長ボタンは削除済み。
+    assert "build_video_seek_sync_js" not in app_source
+    assert 'elem_id="movie-video-fps"' not in app_source
+    assert 'gr.Button("表示中フレームを再取得")' not in app_source
     assert 'with gr.Accordion("Advanced: 動画処理設定", open=False)' in app_source
     assert 'prompt_mode = gr.Radio(["point", "box"], value="box"' in app_source
     assert 'max_frames = gr.Slider(1, 2000, value=30' in app_source
-    assert 'frame_step = gr.Slider(1, 10, value=1' in app_source
     assert "SAM2 Prompt Canvas" in app_source
     assert "対角 2 点" in app_source
-    assert "Text Prompt（意味解釈）→ SAM2（マスク/トラッキング）→ transparent-background" in app_source
+    assert "フレーム取得 → DINO で候補生成 → SAM で prompt / tracking → 背景透過" in app_source
     assert "パラメーター" in app_source
 
 

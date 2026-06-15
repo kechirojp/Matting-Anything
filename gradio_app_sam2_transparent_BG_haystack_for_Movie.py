@@ -41,6 +41,7 @@ from pipelines.components.ui_helpers import (
 )
 from pipelines.components.video_common import normalize_output_mode
 from pipelines.components.model_registry import build_dropdown_choices, entry_by_id
+from pipelines.components.video_model_components import SAM2VideoPropagator
 from pipelines.sam2_tb_video_pipeline import build_sam2_tb_video_pipeline, build_video_reader_pipeline
 
 
@@ -68,10 +69,15 @@ def get_reader_pipeline():
 
 
 def get_video_pipeline(tracker_model: str = "sam2_hiera_l", background_model: str = "tb_base"):
-    """動画背景除去 Pipeline を遅延構築する。"""
+    """動画背景除去 Pipeline を遅延構築する（tracker 選択を registry 経由で propagator へ反映）。"""
     key = (tracker_model, background_model)
     if key not in _PIPELINE_CACHE:
-        _PIPELINE_CACHE[key] = build_sam2_tb_video_pipeline()
+        tracker_entry = entry_by_id("tracker", tracker_model)
+        propagator = SAM2VideoPropagator(
+            checkpoint_path=tracker_entry["checkpoint_path"],
+            config_name=tracker_entry["config_name"],
+        )
+        _PIPELINE_CACHE[key] = build_sam2_tb_video_pipeline(propagator=propagator)
     return _PIPELINE_CACHE[key]
 
 
@@ -110,6 +116,9 @@ def create_prompt_canvas_placeholder():
     return canvas
 
 
+# ─────────────────────────────────────────
+# ## 1. フレーム取得系
+# ─────────────────────────────────────────
 def extract_first_frame(video_path: str | None):
     """入力動画から第 1 フレームを取り出し、prompt canvas に表示する。"""
     try:
@@ -131,10 +140,17 @@ def extract_first_frame(video_path: str | None):
 
 
 def extract_first_frame_outputs(video_path: str | None):
-    """動画アップロード時に第 1 フレームを自動で prompt canvas へ反映する。"""
+    """動画アップロード時に第 1 フレームを自動反映し、プロンプト起点スライダーを 0 に戻す。"""
+    prompt_frame_reset = gr.update(value=0)
     if not video_path:
-        return create_prompt_canvas_placeholder(), empty_prompt_state(), "動画をアップロードすると第 1 フレームを自動取得します。"
-    return extract_first_frame(video_path)
+        return (
+            create_prompt_canvas_placeholder(),
+            empty_prompt_state(),
+            "動画をアップロードすると第 1 フレームを自動取得します。",
+            prompt_frame_reset,
+        )
+    frame, state, status = extract_first_frame(video_path)
+    return frame, state, status, prompt_frame_reset
 
 
 def clear_prompt(first_frame):
@@ -144,6 +160,9 @@ def clear_prompt(first_frame):
     return preview, state, "SAM2 video prompt cleared"
 
 
+# ─────────────────────────────────────────
+# ## 2. DINO系
+# ─────────────────────────────────────────
 def detect_text_boxes_for_video(
     first_frame,
     text_prompt: str,
@@ -198,9 +217,19 @@ def _candidate_choice_label(rank: int, phrase: str, box_values: list[int]) -> st
     return f"#{rank} {phrase} [{bbox_text}]"
 
 
+def _normalize_detected_rows(detected_rows) -> list[list[Any]]:
+    """gr.Dataframe 値（pandas DataFrame / list / None）を行リストへ正規化する（ERR036）。"""
+    if detected_rows is None:
+        return []
+    # pandas DataFrame は真偽評価が曖昧なので type で分岐し .values.tolist() を使う。
+    if hasattr(detected_rows, "values") and hasattr(detected_rows, "columns"):
+        return detected_rows.values.tolist()
+    return list(detected_rows)
+
+
 def populate_candidate_choices(detected_rows):
     """検出結果 Dataframe から候補選択 CheckboxGroup の選択肢を作る（top1 を既定 ON）。"""
-    rows = list(detected_rows or [])
+    rows = _normalize_detected_rows(detected_rows)
     labels: list[str] = []
     for row in rows:
         try:
@@ -322,6 +351,9 @@ def build_video_progress_callback(progress, stage_state: dict[str, Any]):
     return _callback
 
 
+# ─────────────────────────────────────────
+# ## 3. SAM系
+# ─────────────────────────────────────────
 def run_video_background_removal(
     video_path: str | None,
     prompt_state: dict | None,
@@ -354,8 +386,14 @@ def run_video_background_removal(
         boxes = state.get("boxes") or []
         if not points and box is None and not boxes:
             raise gr.Error("SAM2 Prompt Canvas 上で point / bbox を指定するか、候補 bbox を選択してください。")
-        output_mode = normalize_output_mode(output_mode_label)
         processed_frames = _estimate_processed_frames(int(max_frames), int(frame_step))
+        # prompt_frame_idx を pipeline 起動前に fail-fast 検証（範囲外で長時間待たせない）。
+        if int(prompt_frame_idx) >= processed_frames:
+            raise gr.Error(
+                f"プロンプト起点フレーム位置 {int(prompt_frame_idx)} は処理フレーム数 {processed_frames} 以上です。"
+                f"0〜{processed_frames - 1} の範囲で指定してください。"
+            )
+        output_mode = normalize_output_mode(output_mode_label)
         progress_callback = build_video_progress_callback(progress, stage_state)
         release_text_detector()
         progress(
@@ -381,6 +419,7 @@ def run_video_background_removal(
                     "bidirectional": bool(bidirectional),
                     "progress_callback": progress_callback,
                 },
+                # ## 4. 背景透過系: transparent-background で frame ごとに matte を生成する。
                 "transparent_bg_video": {
                     "output_mode": output_mode,
                     "tb_mode": tb_mode,
@@ -451,13 +490,19 @@ with gr.Blocks(title="SAM2 + Transparent Background Haystack for Movie") as demo
 4. 必要なら **Extend Left/Right/Top/Bottom** で bbox の辺を画像端まで伸ばします。Point mode では positive/negative 点で補正します。
 5. まずは既定のクイックプレビュー（最大 30 frames）で **動画背景除去を実行** し、結果を確認してから Advanced で処理 frame 数を増やします。
 
-**処理順の考え方**: 静止画版・動画版とも本質的には `Text Prompt（意味解釈）→ SAM2（マスク/トラッキング）→ transparent-background（背景除去）` です。動画版の **SAM2 Prompt Canvas** は SAM2 への入力先で、Text Prompt はその Canvas に bbox を自動で書き込む補助機能です。
+**処理順の考え方**: 動画版の本質は `フレーム取得 → DINO で候補生成 → SAM で prompt / tracking → 背景透過` です。動画版の **SAM2 Prompt Canvas** は SAM2 への入力先で、Text Prompt はその Canvas に bbox を自動で書き込む補助機能です。
 """
     )
 
     with gr.Row():
-        input_video = gr.Video(label="Input Video", sources=["upload"])
-        prompt_canvas = gr.Image(value=create_prompt_canvas_placeholder(), label="SAM2 Prompt Canvas", type="numpy", interactive=True)
+        input_video = gr.Video(label="Input Video", sources=["upload"], elem_id="movie-input-video")
+        prompt_canvas = gr.Image(
+            value=create_prompt_canvas_placeholder(),
+            label="SAM2 Prompt Canvas",
+            type="numpy",
+            sources=[],
+            interactive=True,
+        )
 
     with gr.Row():
         load_first_frame_btn = gr.Button("第1フレームを再取得")
@@ -480,7 +525,8 @@ with gr.Blocks(title="SAM2 + Transparent Background Haystack for Movie") as demo
 
     with gr.Row():
         prompt_frame_idx = gr.Slider(
-            0, 1999, value=0, step=1, label="プロンプト起点フレーム位置",
+            0, 1999, value=0, step=1, label="プロンプト起点フレーム位置（ドラッグで Canvas 更新）",
+            elem_id="prompt-frame-idx",
             info="SAM2 プロンプトを与えるフレームの位置（サンプリング後シーケンスの 0 始まりの番号、整数）。0 で第1フレーム。最大処理フレーム数より小さい値にする。途中フレームから前後双方向に追跡したい時に上げる。目安 0。",
         )
         show_frame_btn = gr.Button("このフレームを表示")
@@ -528,6 +574,20 @@ with gr.Blocks(title="SAM2 + Transparent Background Haystack for Movie") as demo
         )
         apply_boxes_btn = gr.Button("選択した候補 bbox を複合対象として反映")
 
+    with gr.Row():
+        tracker_model = gr.Dropdown(
+            choices=build_dropdown_choices("tracker"),
+            value="sam2_hiera_l",
+            label="トラッカーモデル（Tracker Model）",
+            info="SAM2/SAMURAI のモデル。変更時はパイプラインが再初期化されます（初回のみ時間がかかります）。",
+        )
+        background_model = gr.Dropdown(
+            choices=build_dropdown_choices("background"),
+            value="tb_base",
+            label="背景除去モデル（Background Model）",
+            info="transparent-background のモード。base: 標準品質。fast: 軽量・高速だが精度低。base-nightly: 最新版。",
+        )
+
     run_btn = gr.Button("動画背景除去を実行", variant="primary")
 
     with gr.Accordion("Advanced: 動画処理設定", open=False):
@@ -549,6 +609,7 @@ with gr.Blocks(title="SAM2 + Transparent Background Haystack for Movie") as demo
                 info="先頭から処理する frame 数（frame 数、整数）。多いほど処理が長く出力も重くなる。初回クイックプレビュー 30、最終確認 300 以上が目安。",
             )
             frame_step = gr.Slider(1, 10, value=1, step=1, label="フレーム間引きステップ",
+                elem_id="movie-frame-step",
                 info="何 frame ごとに1枚処理するか（frame 間隔、整数）。1 で全 frame。2 以上は速いが追跡が粗くなる。通常 1、確認用のみ 2 以上。",
             )
         with gr.Row():
@@ -561,18 +622,6 @@ with gr.Blocks(title="SAM2 + Transparent Background Haystack for Movie") as demo
                 info="透明付き動画の保存方式。webm_vp9: VP9/WebM（軽量・推奨）。mov_png: PNG コーデックの MOV（高互換・大容量）。環境により使えない場合は自動で他方式に fallback。単位なしの選択値。",
             )
         with gr.Row():
-            tracker_model = gr.Dropdown(
-                choices=build_dropdown_choices("tracker"),
-                value="sam2_hiera_l",
-                label="トラッカーモデル（Tracker Model）",
-                info="SAM2/SAMURAI のモデル。変更時はパイプラインが再初期化されます（初回のみ時間がかかります）。",
-            )
-            background_model = gr.Dropdown(
-                choices=build_dropdown_choices("background"),
-                value="tb_base",
-                label="背景除去モデル（Background Model）",
-                info="transparent-background のモード。base: 標準品質。fast: 軽量・高速だが精度低。base-nightly: 最新版。",
-            )
             tb_jit = gr.Checkbox(
                 value=False, label="JIT",
                 info="ON: TorchScript JIT で推論を高速化（初回コンパイルに時間）。OFF: 通常実行。真偽値。",
@@ -605,7 +654,7 @@ with gr.Blocks(title="SAM2 + Transparent Background Haystack for Movie") as demo
     sequence_dirs = gr.Textbox(label="連番出力フォルダ", interactive=False)
     run_status = gr.Markdown()
 
-    input_video.change(extract_first_frame_outputs, inputs=[input_video], outputs=[prompt_canvas, prompt_state, prompt_status])
+    input_video.change(extract_first_frame_outputs, inputs=[input_video], outputs=[prompt_canvas, prompt_state, prompt_status, prompt_frame_idx])
     load_first_frame_btn.click(extract_first_frame, inputs=[input_video], outputs=[prompt_canvas, prompt_state, prompt_status])
     prompt_canvas.select(select_sam2_prompt, inputs=[prompt_canvas, prompt_mode, point_label, prompt_state], outputs=[prompt_canvas, prompt_state, prompt_status])
     clear_prompt_btn.click(clear_prompt, inputs=[prompt_canvas], outputs=[prompt_canvas, prompt_state, prompt_status])
@@ -628,6 +677,12 @@ with gr.Blocks(title="SAM2 + Transparent Background Haystack for Movie") as demo
         outputs=[prompt_canvas, prompt_state, prompt_status],
     )
     show_frame_btn.click(
+        extract_prompt_frame,
+        inputs=[input_video, prompt_frame_idx, frame_step],
+        outputs=[prompt_canvas, prompt_state, prompt_status],
+    )
+    # スライダー1本に集約: 起点フレーム位置を変えると即座に SAM2 prompt canvas を更新する。
+    prompt_frame_idx.change(
         extract_prompt_frame,
         inputs=[input_video, prompt_frame_idx, frame_step],
         outputs=[prompt_canvas, prompt_state, prompt_status],

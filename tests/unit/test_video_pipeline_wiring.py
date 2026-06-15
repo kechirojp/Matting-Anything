@@ -36,6 +36,29 @@ def test_sam2_tb_video_pipeline_builds_with_writers() -> None:
     assert "tracking_overlay" in pipeline.graph.nodes
 
 
+def test_sam2_tb_video_pipeline_accepts_injected_propagator() -> None:
+    """tracker 選択を反映できるよう、事前構築した propagator を注入できる（Gap A）。"""
+    from pipelines.components.video_model_components import SAM2VideoPropagator
+
+    propagator = SAM2VideoPropagator(
+        checkpoint_path="checkpoints/SAM2/sam2.1_hiera_large.pt",
+        config_name="configs/samurai/sam2.1_hiera_l.yaml",
+    )
+
+    pipeline = build_sam2_tb_video_pipeline(propagator=propagator)
+
+    injected = pipeline.get_component("sam2_video_propagator")
+    assert injected is propagator
+    assert injected.config_name == "configs/samurai/sam2.1_hiera_l.yaml"
+
+
+def test_sam2_tb_video_pipeline_defaults_propagator_when_none() -> None:
+    """propagator 未指定なら従来通り既定 SAM2 を構築する（後方互換）。"""
+    pipeline = build_sam2_tb_video_pipeline()
+
+    assert "sam2_video_propagator" in pipeline.graph.nodes
+
+
 def test_video_writer_warm_up_matches_haystack_no_arg_contract() -> None:
     """Haystack Pipeline warm_up calls component warm_up without runtime frame shape inputs."""
     from pipelines.components.video_model_components import VideoWriter
@@ -120,6 +143,14 @@ def test_movie_app_exposes_text_prompt_to_box_flow() -> None:
     """Movie UI should preserve semantic text-prompt object selection for compound subjects."""
     source = Path("gradio_app_sam2_transparent_BG_haystack_for_Movie.py").read_text(encoding="utf-8")
 
+    assert "## 1. フレーム取得系" in source
+    assert "## 2. DINO系" in source
+    assert "## 3. SAM系" in source
+    assert "## 4. 背景透過系" in source
+    assert 'elem_id="movie-input-video"' in source
+    assert 'elem_id="prompt-frame-idx"' in source
+    assert "build_video_seek_sync_js" not in source
+    assert 'elem_id="movie-video-fps"' not in source
     assert "Optional: Text Prompt to Box (GroundingDINO)" in source
     assert "GroundingDINOMultiBoxDetector" in source
     assert "Text Prompt から bbox を検出" in source
@@ -129,6 +160,31 @@ def test_movie_app_exposes_text_prompt_to_box_flow() -> None:
     assert "STAGE_PROGRESS_RANGES" in source
     assert "build_video_progress_callback" in source
     assert "release_text_detector" in source
+
+
+def test_extract_first_frame_outputs_resets_prompt_slider(monkeypatch) -> None:
+    """Video upload should auto-load the first frame and reset the prompt-frame slider (no fps output)."""
+    import numpy as np
+
+    import gradio_app_sam2_transparent_BG_haystack_for_Movie as app
+
+    class DummyReaderPipeline:
+        def run(self, *args, **kwargs):
+            return {
+                "video_reader": {
+                    "frames": [np.zeros((8, 10, 3), dtype=np.uint8)],
+                    "metadata": {"width": 10, "height": 8, "fps": 24.0},
+                }
+            }
+
+    monkeypatch.setattr(app, "get_reader_pipeline", lambda: DummyReaderPipeline())
+
+    preview, state, status, prompt_frame_reset = app.extract_first_frame_outputs("movie.mp4")
+
+    assert preview.shape == (8, 10, 3)
+    assert state == app.empty_prompt_state()
+    assert "第 1 フレームを取得しました" in status
+    assert prompt_frame_reset == {"value": 0, "__type__": "update"}
 
 
 def test_text_prompt_detection_copies_top_box_to_video_prompt(monkeypatch) -> None:

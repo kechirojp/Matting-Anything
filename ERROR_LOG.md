@@ -1021,3 +1021,293 @@ Settings -> Mode=base, Device=cuda, Torchscript=disabled
 - `output_mode=both` は動画と連番の二重書き出しになるため、初回確認では `video` か `sequence` の片方を推奨する。
 - Text Prompt 後に動画処理へ進む場合は、GroundingDINO/BERT cache を解放してから SAM2 / transparent-background を走らせる。
 - 高解像度・長尺処理で runtime kill が起きた場合は、最終 traceback がないこと自体を OOM の兆候として扱い、最後に出た stage ログから peak RAM 箇所を切り分ける。
+
+---
+
+### [ERR031] 動画版 SAM2 Prompt Canvas が常に空白で何も映らない
+
+| 項目 | 内容 |
+|------|------|
+| **深刻度** | High |
+| **頻度** | 動画版 UI で常に発生 |
+| **初回発生日** | 2026-06-06 |
+
+**エラー内容**:
+```
+ユーザー報告: 「sam2 prompt キャンバス何も映らない」
+```
+動画版 `gradio_app_sam2_transparent_BG_haystack_for_Movie.py` の SAM2 Prompt Canvas にプレースホルダーもフレームも表示されず、クリックで bbox / point を打てない。
+
+**原因**:
+`prompt_canvas = gr.Image(..., type="numpy", interactive=True)` に `sources=[]` が抜けていた。`sources` 未指定の `gr.Image` は既定でアップロードソース（upload/clipboard 等）を持つアップロード UI として描画され、`value=create_prompt_canvas_placeholder()` で渡したプレースホルダー画像がアップロードドロップゾーンに上書きされて表示されない。静止画版 `gradio_app_sam2_transparent_BG_haystack.py` は `sources=[]` を持っており正しく表示されていたが、動画版へのコピー時に欠落した（ERR026 / ERR021 と同根のリグレッション）。
+
+**対処法**:
+- `prompt_canvas` に `sources=[]`（アップロード無効・クリック専用）を付与。併せて `show_download_button=False`, `show_fullscreen_button=False` を付け、静止画版と挙動を揃えた。
+- アップロードは別の `Input Video`（`gr.Video(sources=["upload"])`）に分離済みなので、Prompt Canvas は表示+クリック専用で十分。
+
+**再発防止**:
+- SAM2 Prompt Canvas（静止画 / 動画とも）は `gr.Image(type="numpy", sources=[], interactive=True)` を固定パターンとする（copilot-instructions ERR021 / ERR026）。
+- UI 変更後は必ず Gradio 実起動 + Playwright でプレースホルダー表示とクリック可否を目視確認する。
+- 静止画版から動画版へ UI をコピーするときは `sources=[]` の欠落を最初にチェックする。
+
+---
+
+### [ERR032] 動画版のモデル変更プルダウンが Advanced アコーディオン内に埋もれて見えない
+
+| 項目 | 内容 |
+|------|------|
+| **深刻度** | Medium |
+| **頻度** | 動画版 UI で常に発生 |
+| **初回発生日** | 2026-06-06 |
+
+**エラー内容**:
+```
+ユーザー報告: 「モデル変更プルダウンメニューがない」「samuraiの機能チェックもしたかった」
+```
+tracker / background のモデル選択 Dropdown は実装されていたが、`Advanced: 動画処理設定`（`open=False`）アコーディオン内に置かれていたため、デフォルト折りたたみ状態では見えず「存在しない」と認識された。結果 SAMURAI への切替（`samurai_hiera_*`）も試せなかった。
+
+**原因**:
+`tracker_model` / `background_model` の `gr.Dropdown` 定義が Advanced アコーディオンの `gr.Row` 内にあり、`tb_jit` / `tb_threshold` / `crop_padding` などの詳細パラメータと同居していた。モデル選択は基本操作なのに詳細設定扱いになっていた。
+
+**対処法**:
+- `tracker_model` Dropdown を `## 3. SAM系` セクション直下（可視）へ移動。
+- `background_model` Dropdown を `## 4. 背景透過系` セクション直下・実行ボタンの前（可視）へ移動。
+- Advanced アコーディオンには `tb_jit` / `tb_threshold` / `crop_padding` のみ残した。
+- 選択肢は `build_dropdown_choices("tracker"|"background")` で生成し、`INFERENCE_TRACKER_VARIANT` による可視フィルタ（SAM2 / SAMURAI 切替）を維持。`info=` に SAMURAI 利用条件（環境変数 + samurai パッケージ）を明記。
+
+**再発防止**:
+- モデル選択など「基本操作」の UI は折りたたみアコーディオンに入れず、対応セクション（SAM系 / 背景透過系）の可視領域に置く。
+- アコーディオンは速度/品質の微調整パラメータ専用とする。
+- UI 変更後は Playwright で折りたたみ初期状態のままドロップダウンが見えることを確認する。
+
+---
+
+### [ERR033] 動画版「表示中フレームを再取得」がシーク位置を無視し常に第1フレームを取得
+
+| 項目 | 内容 |
+|------|------|
+| **深刻度** | High |
+| **頻度** | 動画版でシーク後に再取得する度に発生 |
+| **初回発生日** | 2026-06-06 |
+
+**エラー内容**:
+```
+ユーザー報告: 「表示中のフレームを再取得」と「シーク位置をSAM2に反映」「この二つが連動しない」
+```
+動画プレイヤーを任意位置へシークしてから「表示中フレームを再取得」ボタンを押しても、起点フレーム位置（`prompt_frame_idx`）が反映されず常にフレーム 0 が Prompt Canvas に出る。シーク連動の `prompt_frame_idx` と再取得ボタンが分離していた。
+
+**原因**:
+`load_first_frame_btn.click(...)` が `extract_first_frame, inputs=[input_video], outputs=[..., prompt_frame_idx]` に配線されていた。`extract_first_frame` は常にフレーム 0 を抽出し、さらに出力で `prompt_frame_idx` を 0 に上書きしていたため、シークで更新された起点フレーム位置が破棄されていた。シーク連動用の正しいハンドラ `extract_prompt_frame(input_video, prompt_frame_idx, frame_step)` は別ボタン（`show_frame_btn`）と `prompt_frame_idx.change` にのみ配線されていた。
+
+**対処法**:
+- `load_first_frame_btn.click` を `extract_prompt_frame, inputs=[input_video, prompt_frame_idx, frame_step], outputs=[prompt_canvas, prompt_state, prompt_status]` へ再配線。`prompt_frame_idx` は入力として読むだけにし、出力で上書きしない。
+- これによりシーク → `prompt_frame_idx` 自動更新（`build_video_seek_sync_js`）→ 再取得ボタン or `prompt_frame_idx.change` のいずれでも同じ起点フレームが Canvas に出るよう統一。
+- 初回アップロード時の `input_video.change(extract_first_frame_outputs, ...)` は第1フレーム自動表示の用途なので据え置き。
+
+**再発防止**:
+- 「シーク連動」と銘打つ UI 要素は、フレーム取得系の全ボタンで同一の `extract_prompt_frame(video, prompt_frame_idx, frame_step)` を共有する。
+- フレーム取得ハンドラは `prompt_frame_idx` を入力として読み、出力で上書きしない（初回自動表示を除く）。
+- UI 配線変更後は Playwright でシーク → 再取得が同じフレームを返すフローを確認する。
+
+---
+
+### [ERR034] 動画版 Pipeline が tracker 選択を無視し常に既定 SAM2 を構築
+
+| 項目 | 内容 |
+|------|------|
+| **深刻度** | High |
+| **頻度** | 動画版で tracker / SAMURAI を切替えても常に発生 |
+| **初回発生日** | 2026-06-06 |
+
+**エラー内容**:
+```
+tracker_model ドロップダウンで samurai_hiera_l を選んでも SAM2 標準が動く（切替が効かない）。
+```
+ERR032 で Dropdown を可視化しても、選択した tracker モデルが実際の推論に反映されなかった。
+
+**原因**:
+`get_video_pipeline(tracker_model, background_model)` が `(tracker_model, background_model)` でキャッシュしていたが、内部で `build_sam2_tb_video_pipeline()` を引数なしで呼び、`SAM2VideoPropagator()` を既定 config_name / checkpoint_path で構築していた。registry（`config/inference_models.toml`）の `config_name` / `checkpoint_path` が伝搬されず、SAMURAI config（`configs/samurai/...`）への切替が無効だった。
+
+**対処法**:
+- `build_sam2_tb_video_pipeline(propagator: SAM2VideoPropagator | None = None)` に変更し、注入された propagator を `add_component("sam2_video_propagator", propagator or SAM2VideoPropagator())` で使用（疎結合・依存注入）。
+- `get_video_pipeline` で `entry_by_id("tracker", tracker_model)` から `config_name` / `checkpoint_path` を解決し、`SAM2VideoPropagator(checkpoint_path=..., config_name=...)` を構築して `build_sam2_tb_video_pipeline(propagator=...)` に渡す。
+- checkpoint の相対パスは `_resolve_project_path`（`PROJECT_ROOT` 環境変数 or ファイル基準）で絶対化。
+- SAMURAI 選択時は `warm_up()` で samurai パッケージ / config が無ければ fail fast（許容挙動）。`tracker_metadata()` で `tracker_config` / `tracker_checkpoint` / `samurai_mode` を masks metadata に残す。
+
+**再発防止**:
+- UI のモデル選択は registry（TOML）→ Component 構築引数まで一気通貫で伝搬されているか確認する。Dropdown を出すだけでは推論に反映されない。
+- Pipeline ビルダーは重い Component を依存注入で受け取れる形にし（YAGNI を守りつつ差し替え可能に）、`pipeline.get_component(name) is injected` をテストで固定する。
+- tracker 切替の痕跡（config / checkpoint / samurai_mode）を必ず metadata に記録する（copilot-instructions の samurai 切替ルール）。
+
+---
+
+### [ERR035] 動画版 シーク連動 JS ブリッジが Gradio 5/Svelte で実行時に機能せず3コントロールが無反応
+
+| 項目 | 内容 |
+|------|------|
+| **深刻度** | High |
+| **頻度** | 動画版でシーク連動を使う度に常に発生（実行時） |
+| **初回発生日** | 2026-06-06 |
+
+**エラー内容**:
+```
+ユーザー報告: 「プロンプト起点フレーム位置（シーク連動）機能せず / 表示中フレーム再取得 機能せず / シーク位置をsam2に反映 機能せず」
+```
+ERR033 ではソーステキスト上の配線を修正し「シーク連動が直った」と記録したが、実行時には依然として3つのコントロール（シーク連動スライダー自動更新、「表示中フレームを再取得」ボタン、「シーク位置を SAM2 に反映」ボタン）がすべて無反応だった。ERR033 の「fixed」記述は実行時検証を伴わない誤りだった。
+
+**原因**:
+`build_video_seek_sync_js`（`gr.Blocks(js=...)` で注入）が動画要素の `seeked` / `pause` イベントを拾い、`prompt_frame_idx` スライダーの DOM `input.value` を書き換えて native `input` / `change` イベントを dispatch していた。Gradio 5（Svelte）では、コンポーネント内部 state は Svelte が管理しており、DOM へ直接 `value=` を代入し native イベントを発火させてもバックエンドの `.change` は発火しない。結果、`prompt_frame_idx` に依存する3コントロールすべてがシーク位置に追従しなかった。さらに2ボタンは同一の `extract_prompt_frame` を呼ぶ完全な冗長 UI だった。
+
+**対処法（Option A: スライダー1本へ集約）**:
+- 不安定な JS ブリッジ（`VIDEO_SEEK_SYNC_JS` 定数 / `build_video_seek_sync_js()` 関数 / `gr.Blocks(js=...)` 引数）を削除。
+- 冗長な2ボタン（`load_first_frame_btn` =「表示中フレームを再取得」/ `show_frame_btn` =「シーク位置を SAM2 に反映」）と未使用 hidden `video_fps`（`elem_id="movie-video-fps"`）、およびそれらへ供給する fps 返却値を削除。
+- ネイティブに動作する `prompt_frame_idx.change(extract_prompt_frame, ...)` 1本へ集約。スライダーをドラッグすると Gradio ネイティブの `.change` が確実に発火し Canvas が更新される。スライダー label を「プロンプト起点フレーム位置（ドラッグで Canvas 更新）」へ変更し、操作の唯一性を明示。
+- `extract_first_frame` / `extract_first_frame_outputs` を 4-tuple（fps を除外）へ、`input_video.change` の outputs から `video_fps` を除外。
+
+**再発防止**:
+- Gradio/Svelte コンポーネントへ DOM 直接書き換え + native イベント dispatch で値を流し込む JS ブリッジは実行時に機能しない前提とし、採用しない。値の連動は Gradio ネイティブのイベント（`.change` / `.select` 等）で構成する。
+- ソーステキスト一致のテストは実行時挙動を保証しない。UI 配線変更は Playwright で実起動し、実際のユーザー操作（スライダードラッグ → Canvas 更新）が反応することを確認してから「fixed」と記録する。
+- 同一ハンドラを呼ぶだけの冗長ボタンは増やさず、単一の操作元（single source of truth）へ集約する（ui-ux-pro-max: 冗長コントロール削減）。
+
+### [ERR036] 動画版 候補bbox選択肢生成が gr.Dataframe の pandas DataFrame 真偽評価で失敗
+
+| 項目 | 内容 |
+|------|------|
+| **深刻度** | High |
+| **頻度** | テキストプロンプト→検出ボタン押下の度に常に発生（実行時） |
+| **初回発生日** | 2026-06-06 |
+| **関連ファイル** | `gradio_app_sam2_transparent_BG_haystack_for_Movie.py` |
+
+**エラー内容**:
+```
+ユーザー報告: 「複合対象に使う候補 bbox を選択（union 用）テキストプロンプトを入れ 検出ボタンを押すとエラー」
+ValueError: The truth value of a DataFrame is ambiguous. Use a.empty, a.bool(), a.item(), a.any() or a.all().
+```
+`detect_text_btn.click(...).then(populate_candidate_choices, inputs=[detected_boxes], ...)` 経由で `populate_candidate_choices` が呼ばれた際に送出。後段の `apply_selected_boxes` の「少なくとも 1 つの候補 bbox を選択してください」もこの連鎖失敗（候補が空のまま）による派生だった。
+
+**原因**:
+`populate_candidate_choices` が `rows = list(detected_rows or [])` で入力を扱っていた。Gradio 5 の `gr.Dataframe`（既定 `type="pandas"`）はハンドラへ値を **pandas DataFrame** で渡すため、`detected_rows or []` の真偽評価が `ValueError: truth value of a DataFrame is ambiguous` を送出した。
+
+**対処法**:
+- `_normalize_dataframe_rows(detected_rows)` ヘルパを追加し、入力型を明示判別: `None`→`[]`、pandas DataFrame（`hasattr "values"` かつ `hasattr "columns"`）→`.values.tolist()`、その他→`list(...)`。真偽評価を一切行わない。
+- `populate_candidate_choices` を `rows = _normalize_dataframe_rows(detected_rows)` に変更。list 入力（後方互換）も従来通り処理。
+
+**再発防止**:
+- `gr.Dataframe` の値はハンドラに pandas DataFrame として渡る。`x or []` / `if rows:` 等の真偽評価は禁止。型を明示判別して `.values.tolist()` でリスト化する。
+- 回帰テスト `tests/unit/test_movie_runtime_bugs.py`（DataFrame / 空 DataFrame / list の3ケース）を追加。
+
+### [ERR037] 動画版 prompt_frame_idx 範囲外がモデル読込後（約18秒後）に発覚
+
+| 項目 | 内容 |
+|------|------|
+| **深刻度** | Medium |
+| **頻度** | フレーム数より大きい起点位置を指定する度に発生 |
+| **初回発生日** | 2026-06-06 |
+| **関連ファイル** | `gradio_app_sam2_transparent_BG_haystack_for_Movie.py` |
+
+**エラー内容**:
+```
+prompt_frame_idx が範囲外です: 75（許容 0〜29）
+```
+スライダー `prompt_frame_idx` は 0〜1999 を許容するが、実際にサンプリングされるのは `max_frames`（例: 30）枚のみ。範囲外位置を起点にすると `SAM2VideoPropagator.run` がモデル読込後（十数秒後）にようやく `ValueError` を送出し、待ち時間が無駄になっていた。
+
+**原因**:
+`run_video_background_removal` に pipeline.run 前の事前検証がなく、`prompt_frame_idx >= processed_frames` の判定が propagator 内部の伝搬段階まで遅延していた。
+
+**対処法**:
+- `processed_frames = _estimate_processed_frames(...)` 算出直後（`build_video_progress_callback` / `release_text_detector` / pipeline.run より前）に fail-fast 検証を追加:
+  `if int(prompt_frame_idx) >= processed_frames: raise gr.Error(... 起点位置 ... 処理フレーム数 ... {processed_frames - 1} 以下 ...)`。
+- `except gr.Error: raise` により汎用エラーメッセージに包まれず即時通知される。
+
+**再発防止**:
+- スライダー上限と実処理レンジが乖離する UI では、重い処理（GPU/pipeline）に入る前に範囲を fail-fast 検証する。
+- 回帰テスト `test_run_video_validates_prompt_frame_idx_before_pipeline` を追加。
+
+### [ERR038] SAMURAI tracker 選択時 SAMURAI config が installed sam2 の Hydra 検索パスになく MissingConfigException
+
+| 項目 | 内容 |
+|------|------|
+| **深刻度** | High |
+| **頻度** | Colab 等 facebook 版 sam2 環境で SAMURAI tracker を選ぶ度に発生 |
+| **初回発生日** | 2026-06-06 |
+| **関連ファイル** | `pipelines/components/video_model_components.py` |
+
+**エラー内容**:
+```
+ユーザー報告: 「sam3系のプルダウンメニュー 切り替えて 動画背景除去を実行ボタン押すとエラー スキーマがちがう？」
+hydra.errors.MissingConfigException: Cannot find primary config 'configs/samurai/sam2.1_hiera_l.yaml'
+```
+`config/inference_models.toml` の SAMURAI tracker エントリ（config_name `configs/samurai/sam2.1_hiera_*.yaml`）を選び実行すると送出。Colab で facebook 版 sam2 が入っていると、その sam2 package には `configs/samurai/` が無く Hydra 検索パスで解決できない。
+
+**原因**:
+`SAM2VideoPropagator.warm_up` は `build_sam2_video_predictor(config_name, ...)` を直接呼ぶのみで、SAMURAI fork 同梱の configs（`samurai/sam2/sam2/configs/samurai/`）を Hydra 検索パスへ登録していなかった。
+
+**対処法（samurai/ は変更しない: config/検索パスのみで対応）**:
+- `_samurai_config_root(config_name)`: config 名が "samurai" を含み、ローカル `samurai/sam2/sam2/configs/samurai` が存在する場合のみ `samurai/sam2/sam2` package root を返す（非 samurai は None）。
+- `_ensure_samurai_config_searchpath(config_name)`: samurai config のときのみ、Hydra `GlobalHydra` 検索パスへ `sam2_root.as_uri()` を重複排除して append。未初期化時は `import sam2` で初期化。解決不能時はエラーを握り潰さず `MissingConfigException` を伝搬。
+- `warm_up()` の `build_sam2_video_predictor` 直前で `_ensure_samurai_config_searchpath(self.config_name)` を呼ぶ。
+
+**再発防止**:
+- fork 同梱 config（SAMURAI）は installed sam2 の Hydra 検索パスに自動では載らない。env / 検索パス登録で解決し、`samurai/` ディレクトリ自体は変更しない。
+- URI は `Path.as_uri()` で RFC 準拠形式（Windows: `file:///J:/...`）を使い、自作 `f"file://{as_posix()}"` を避ける（重複排除比較の堅牢性）。
+- 回帰テスト `_samurai_config_root`（samurai / 非 samurai）と warm_up のヘルパ呼出契約テストを追加。
+
+
+### [ERR039] 動画/静止画の切り抜き alpha が SAM2 mask の外接矩形で「横一直線」に切れる
+
+| 項目 | 内容 |
+|------|------|
+| **深刻度** | High |
+| **頻度** | SAM2 mask が対象を囲みきれない素材で発生 |
+| **初回発生日** | 2026-06-04（調査）/ 2026-06-12（修正） |
+| **関連ファイル** | `pipelines/components/model_components.py`（`TransparentBGExtractor.run`） |
+
+**エラー内容**:
+ユーザー報告: 「画面下のマスクが横一直線でばっさり切れる。BBOX そのものをマスク範囲に使っている疑い」。グレースケール alpha で被写体の下半分が水平直線で切れる。
+
+**原因**:
+`TransparentBGExtractor.run` が SAM2 mask の **形状を使わず外接矩形**（`mask_to_bbox` + `crop_padding`）で画像をクロップして transparent-background を適用し、`full_alpha[y_min:y_max, x_min:x_max] = alpha_crop` で矩形範囲だけに貼り戻していた。矩形内・mask 形状外の領域に alpha が残るため、矩形下端＝横一直線で切れる。`SAM2GuardFilter`（mask 外 alpha 削り）は実装済みだが、動画パイプライン `sam2_tb_video_pipeline.py` には未接続だった（静止画でも mask 未接続パイプラインでは no-op）。
+
+**対処法**:
+- `TransparentBGExtractor.run` に `apply_mask_guard: bool = True` / `mask_guard_dilate: int = 21` を追加。`full_alpha` 算出後、mask があり `mask.any()` のとき `dilate_binary_mask(mask, kernel_size=mask_guard_dilate)` の guard を乗算し、mask 形状外の alpha を 0 にする（transparent-background のソフト境界は dilate 分だけ保持）。
+- extractor 内で適用するため、frame ごとに同 run を呼ぶ動画版 `TransparentBGVideoExtractor` にも自動波及。preview/rgba も guard 後の `full_alpha` から生成。
+- `build_sam2_union_tb_pipeline` は後段 `SAM2GuardFilter` を同一 mask で接続するが、二値 guard の乗算は冪等（`guard×guard=guard`）で二重適用しても結果不変（回帰テストで担保）。
+
+**再発防止**:
+- 横切れの真因は「mask 形状ではなく mask の外接矩形が最終 alpha 範囲を決める」こと。透過抽出は必ず mask 形状を最終 alpha に反映する。
+- mask が対象を囲みきれない根本（複合対象を 1 box しか使わない配線）は別タスク（複合対象 union UI 復旧）で対応。guard は「直線切れ」を「mask 形状に沿った切れ」に変えるが、未検出領域そのものは復元しない。
+- 回帰テスト `tests/unit/test_transparent_bg_mask_guard.py`（mask 形状反映 / mask 未指定の後方互換 / SAM2GuardFilter 二重適用の冪等 / guard 無効化で従来挙動）を追加。
+
+
+
+
+### [ERR040] UI ファイルが未コミットの作業ツリー変更で過去版へ巻き戻り、復元中の git stash で全作業を退避してしまう
+
+| 項目 | 内容 |
+|------|------|
+| **深刻度** | High |
+| **頻度** | 一度のみ（再発防止のため記録） |
+| **初回発生日** | 2026-06-15 |
+| **関連ファイル** | `gradio_app_sam2_transparent_BG_haystack_for_Movie.py`, `gradio_app_sam2_transparent_BG_haystack.py`, `tests/unit/test_jupytext_notebooks.py` |
+
+**エラー内容**:
+動画 UI のシーク機能・複数 bbox 反映・mask union が「約1ヶ月前の版へ巻き戻った」とユーザー報告。調査の結果、動画版・静止画版 UI と jupytext notebook が**未コミットの作業ツリー変更**で全機能版から旧版へロールバックされていた（Component 層 `model_components.py` / `video_model_components.py` / `model_registry.py` は無傷）。さらに復元作業中に `git stash`（引数なし）を実行したところ、復元途中の全作業がまとめて退避され、`git stash pop` が EOL 正規化で2回失敗（`Your local changes would be overwritten by merge`、ただし `git diff HEAD` はクリーン）した。
+
+**原因**:
+1. 巻き戻り: UI 層の全機能実装（HEAD `2702d6b` より新しい未コミット差分）が一度も commit されておらず、作業ツリーで旧版へ上書きされていた。stash / branch / reflog のいずれにも残っておらず**復元不能**。Component 層は別ファイルのため影響を受けなかった。
+2. stash 事故: `git stash` は引数なしだと**追跡中の全変更を退避**する。復元途中の作業ツリー全体が対象になった。`git stash pop` はマージを伴うため、`* text=auto` 等の EOL 正規化で内容が同一でも「上書きされる」と判定され失敗した。
+
+**対処法**:
+- 巻き戻り復元: `git checkout HEAD -- <file>` で HEAD の全機能版を復元。HEAD より新しい未コミット実装は失われているため、**RED テスト（`test_movie_app_ui_wiring` / `test_movie_runtime_bugs` / `test_video_pipeline_wiring` / `test_jupytext_notebooks`）を正本として再実装**して GREEN 化した（静止画版は HEAD が全機能版だったため checkout のみで復旧）。
+- stash 事故の安全な回収: `git stash pop`（マージ）が EOL で失敗する場合は `git checkout 'stash@{0}' -- .` を使う。これは**マージせず stash のファイル内容を作業ツリーへ展開**するため EOL 競合を回避できる。回収後に内容とテストを検証し、冗長になった stash を `git stash drop 'stash@{0}'` で削除。
+- PowerShell では `stash@{0}` の波括弧が誤解釈されるため**シングルクォート必須**。日本語ファイル名は `git -c core.quotepath=false` で文字化けを防ぐ。
+
+**再発防止**:
+- UI/配線の重要実装は**こまめに commit** する。未コミットの作業ツリーだけに依存しない（巻き戻りで復元不能になる）。
+- 復元・整理作業中に `git stash`（引数なし）を安易に実行しない。退避したい範囲を明示するか、先に commit してから操作する。
+- 巻き戻りの正本は**テスト**。RED テストが残っていれば、ソース実装が失われても再実装の指針になる（今回はこれで全機能を復元できた）。
+- UI/配線の「fixed/完了」は ERR035 に従い Playwright 実起動で実行時検証してから記録する（今回 `prompt-frame-idx` シーク・複数 bbox CheckboxGroup・処理順表示・`movie-frame-step` のレンダリングを Playwright で確認済み）。
+
+
+
+

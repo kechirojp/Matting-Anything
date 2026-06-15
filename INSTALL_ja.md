@@ -25,14 +25,22 @@ conda activate mam
 ### 2. パッケージと依存関係のインストール
 
 ```bash
-git clone https://github.com/SHI-Labs/Matting-Anything
+# ⚠ samurai サブモジュールを含むため --recurse-submodules を必ず付けること
+git clone --recurse-submodules https://github.com/SHI-Labs/Matting-Anything
 cd Matting-Anything
+
+# すでに clone 済みでサブモジュールが空の場合は以下を実行
+# git submodule update --init --recursive
 
 # 主要依存パッケージ
 pip install -r requirements.txt
 
 # Segment Anything Model (SAM)
 python -m pip install -e segment-anything
+
+# SAM2 / SAMURAI（動画マッティング・テキストプロンプト機能に必要）
+# samurai サブモジュール内の sam2 パッケージをインストール
+python -m pip install -e samurai/sam2
 
 # GroundingDINO（CUDA 対応ビルド）
 # ⚠ CUDA_HOME を必ず自分の環境に合わせて設定すること

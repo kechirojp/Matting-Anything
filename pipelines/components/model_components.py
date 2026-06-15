@@ -616,6 +616,8 @@ class TransparentBGExtractor:
         tb_threshold: float = 0.0,
         tb_output_type: str = "rgba",
         crop_padding: int = 40,
+        apply_mask_guard: bool = True,
+        mask_guard_dilate: int = 21,
     ) -> dict[str, np.ndarray]:
         image_rgb = ensure_rgb_array(image)
         image_height, image_width = image_rgb.shape[:2]
@@ -643,6 +645,14 @@ class TransparentBGExtractor:
 
         full_alpha = np.zeros((image_height, image_width), dtype=np.float32)
         full_alpha[y_min:y_max, x_min:x_max] = alpha_crop
+        mask_guard_applied = False
+        if apply_mask_guard and mask is not None and mask.any():
+            # SAM2 mask の外接矩形でクロップした結果、矩形内・mask 形状外の領域に
+            # alpha が残ると「横一直線切れ」として現れる。mask を dilate した guard で
+            # mask 形状外の alpha を 0 にし、transparent-background のソフト境界は保つ。
+            guard = dilate_binary_mask(mask, kernel_size=mask_guard_dilate).astype(np.float32)
+            full_alpha = full_alpha * guard
+            mask_guard_applied = True
         full_rgb = image_rgb.copy()
         full_rgb[y_min:y_max, x_min:x_max] = rgb_crop
         alpha_u8 = np.clip(full_alpha * 255, 0, 255).astype(np.uint8)
@@ -665,6 +675,7 @@ class TransparentBGExtractor:
                 "tb_mode": tb_mode,
                 "bbox": (int(x_min), int(y_min), int(x_max), int(y_max)),
                 "mask_used": mask is not None,
+                "mask_guard_applied": mask_guard_applied,
             },
         }
         return {"rgba": rgba, "alpha": alpha_u8, "preview": preview, "matte_result": matte_result}

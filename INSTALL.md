@@ -12,14 +12,21 @@ We use Python 3.9, PyTorch 1.13.1 (CUDA 11.7 build), torchvision 0.14.1, diffuse
 ### Install packages and other dependencies.
 
   ```bash
-  git clone https://github.com/SHI-Labs/Matting-Anything
+  # ⚠ Include --recurse-submodules to also fetch the samurai submodule
+  git clone --recurse-submodules https://github.com/SHI-Labs/Matting-Anything
   cd Matting-Anything
+
+  # If you already cloned without the flag, run:
+  # git submodule update --init --recursive
 
   # Install all dependencies
   pip install -r requirements.txt
 
   # Install segment-anything
   python -m pip install -e segment-anything
+
+  # Install SAM2 / SAMURAI (required for video matting and text-prompt features)
+  python -m pip install -e samurai/sam2
 
   # Install Grounding DINO
   export BUILD_WITH_CUDA=True

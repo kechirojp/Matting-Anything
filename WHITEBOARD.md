@@ -8,15 +8,163 @@
 
 | 項目 | 内容 |
 |------|------|
-| **作業中のタスク** | 動画版 Phase A〜E 実装（フレーム選択UI + 複数obj union + 双方向伝播）完了 |
-| **最終更新日** | 2026-06-05（動画版 Phase A〜E 完了・Playwright 確認済み） |
-| **担当者/セッション** | GitHub Copilot |
+| **作業中のタスク** | 動画/静止画 UI 巻き戻り復旧（シーク・複数bbox・mask union・設定簡素化）+ git stash 事故回収 — ✅ 完了 |
+| **最終更新日** | 2026-06-15（UI巻き戻り復旧: HEAD復元+RED再実装でGREEN、Playwright実行時検証、stash安全回収・削除） |
+---
+
+## 直近完了タスク: 動画/静止画 UI 巻き戻り復旧 + git stash 事故回収（2026-06-15, large）
+- **依頼**: ユーザー報告の動画 UI 退行3件「1: フレームのシーク機能 / 2: 文字プロンプトで複数 bbox が反映されず1つだけ / 3: mask union 統合未済」を原因説明の上で修正。「一ヶ月前ほどに巻き戻ったことは大問題」。承認タスク: (1)静止画/notebook 退行修正, (3)冗長stash削除, (4)Playwright検証。**(2)再出現した11個の.md削除は未承認のため据置**。
+- **根本原因**: 動画版・静止画版 UI と jupytext notebook が**未コミットの作業ツリー変更**で全機能版→旧版へロールバック。Component 層（`model_components.py` / `video_model_components.py` / `model_registry.py`）は無傷。HEAD `2702d6b` より新しい UI 実装は commit / stash / branch / reflog のいずれにも無く**復元不能**だった。詳細は `調査/2026-06-15_130117_動画UIファイル巻き戻り_根本原因調査.md`。
+- **復元方針（テストを正本に再実装）**:
+  - 動画版: `git checkout HEAD` で復元後、HEAD より新しい RED テスト（`test_movie_app_ui_wiring` / `test_movie_runtime_bugs` / `test_video_pipeline_wiring` / `test_jupytext_notebooks`）の要求を**再実装**（HEAD 比 +76/-22）。主な復元: `_normalize_detected_rows`（ERR036 型判別→`.values.tolist()`）, `populate_candidate_choices`（top1 既定 ON）, `run_video_background_removal`（`prompt_frame_idx >= processed_frames` で fail-fast `gr.Error`, ERR037）, `get_video_pipeline`（`entry_by_id("tracker",...)`→`SAM2VideoPropagator(checkpoint_path, config_name)`→`build_sam2_tb_video_pipeline`）, `extract_first_frame_outputs`（4戻り値・`prompt_frame_idx` リセット）, セクションコメント, `prompt_canvas sources=[]`, スライダー集約＋`.change` 配線。
+  - 動画版 jupytext 追加3点: スライダー label を `プロンプト起点フレーム位置（ドラッグで Canvas 更新）` に, `frame_step` に `elem_id="movie-frame-step"`, 処理順表示を `フレーム取得 → DINO で候補生成 → SAM で prompt / tracking → 背景透過` に更新。
+  - 静止画版: HEAD が全機能版（`background_model` Dropdown + registry）だったため `git checkout HEAD -- gradio_app_sam2_transparent_BG_haystack.py` のみで復旧。
+- **git stash 事故と回収**: 復元途中に `git stash`（引数なし）で全作業を退避。`git stash pop` が EOL 正規化で2回失敗。`git checkout 'stash@{0}' -- .`（マージ無しでファイル内容展開）で全データ回収。検証後、冗長 stash を `git stash drop 'stash@{0}'` で削除。副作用: ユーザーが整理削除した11個の.md（root直下）が HEAD 版として再出現したが、**削除は未承認（タスク2）のため touch せず据置**。
+- **テスト**: 全非 integration **145 passed, 1 skipped**（修正前 3 failed → 解消）。両アプリ smoke `--help` exit 0。
+- **Playwright 実行時検証（ERR035）**: 動画版（port 7861）で `prompt-frame-idx` シークスライダー / 複数 bbox 候補 CheckboxGroup / 処理順表示 / `movie-frame-step` / Prompt Canvas / Text Prompt accordion / tracker dropdown のレンダリングを全 OK 確認。静止画版（port 7862）で `background_model` Dropdown レンダリング OK 確認。検証スクリプト・スクショは検証後削除。
+- **レビュー**: サブエージェント Explore レビュー実施。観点1〜5（シーク配線 / 複数box配線 / mask union+registry / Hard Rules: weights_only・try/except pass・ハードコード・ERR036 / `movie-frame-step`）すべて「問題なし」。
+- **ERROR_LOG**: ERR040（UI巻き戻り＋git stash事故の根本原因・安全回収手順・再発防止）を追記。
+- **残課題（別タスク）**: 再出現した11個の.md の扱い（ユーザー承認待ち=タスク2）。複合対象 union の実素材での品質確認は動画アップロード＋モデル実行が必要なため UI レンダリング検証に留めた。
+
+
+## 直近完了タスク: マスク横一直線切れ修正（SAM2 mask 形状を最終 alpha に反映）（2026-06-12, medium）
+- **依頼**: 6/4 報告書 2.2 と調査 `調査/2026-06-04_222747_現行動画パイプライン_フロー調査_MAM比較.md` の「マスクが画面下で横一直線に切れる」不具合の最優先修正を進める。
+- **根本原因**: `TransparentBGExtractor.run`（`pipelines/components/model_components.py`）が SAM2 mask の形状を使わず外接矩形でクロップし、矩形範囲だけに alpha を貼り戻していた（矩形内・mask 外に alpha が残り横一直線切れ）。`SAM2GuardFilter` は実装済みだが動画パイプラインに未接続。
+- **実装**: `TransparentBGExtractor.run` に `apply_mask_guard: bool = True` / `mask_guard_dilate: int = 21` を追加。`full_alpha` 算出後に mask があれば `dilate_binary_mask` の guard を乗算し mask 形状外の alpha を 0 に。metadata に `mask_guard_applied` を追加。extractor 内適用のため動画版 `TransparentBGVideoExtractor`（frame ごとに同 run を呼ぶ）にも自動波及。preview/rgba も guard 後 `full_alpha` から生成。
+- **設計判断**: 静止画 `build_sam2_union_tb_pipeline` は後段 SAM2GuardFilter を同一 mask で接続するが二値 guard 乗算は冪等で二重適用しても不変。`mask_guard_dilate=21` は SAM2GuardFilter 既定値と一致。既存の `crop_padding=40` 等と同じデフォルト引数パターンに合わせ、別パイプラインの mask 未接続配線（既存 no-op）は依頼外のため変更せず。
+- **テスト**: RED→GREEN。新規 `tests/unit/test_transparent_bg_mask_guard.py` 4件（mask 形状反映 / mask 未指定後方互換 / SAM2GuardFilter 二重適用の冪等 / guard 無効化で従来挙動）。動画版 smoke `--help` exit 0。
+- **既存失敗テストについて**: 全体実行で 18 件失敗するが、すべて UI/callback 配線層（`test_movie_app_ui_wiring` / `test_video_pipeline_wiring` / `test_movie_runtime_bugs` / `test_pipeline_wiring` / `test_jupytext_notebooks`）の UI ソーステキスト assert。調査報告が指摘した「計画と実装の乖離（現行 UI ファイル巻き戻り）」による既存失敗で、今回の `model_components.py` 変更とは無関係（変更前から失敗）。
+- **レビュー**: サブエージェント Explore レビュー実施。A正確性/C動画波及/D規約/E可読性は OK。CRITICAL「二重適用テストなし」を受け冪等性テストを追加。HIGH「他パイプラインの sam2_guard mask 未接続」は既存挙動で依頼外のため据置。MEDIUM「config化」は既存デフォルト引数パターン踏襲のため過剰設計回避で据置（判断を WHITEBOARD に記録）。
+- **残課題（別タスク）**: 複合対象 union UI 復旧（1 box しか使わない配線の根本対処）、frame選択/双方向/dropdown 復旧、UI 配線テスト群 GREEN 化。guard は「直線切れ」を「mask 形状に沿った切れ」に改善するが、SAM2 が囲みきれない未検出領域そのものは復元しない。
+- **ERROR_LOG**: ERR039 を追記。
+
+
+## 直近完了タスク: copilot-instructions REMINDER の Haystack 記述増補（2026-06-05, small, コード変更なし）
+- **依頼**: REMINDER（ユーザー表記: remainder）に Haystack 記述を追加し、理由と設計意図を明確化する。
+- **反映内容**:
+  1. Haystack 採用理由（機能分割・疎結合）を明記。
+  2. 機能分割による可読性・保守性の担保を明記。
+  3. 画面解釈/トラッキング/背景透過モデルの頻繁な差し替え前提を明記。
+  4. 安定 I/O 契約を破ると配線不整合が連鎖しバグ温床化する点を明記。
+- **レビュー結果**: 変更差分のセルフレビューを実施し、既存ルールとの矛盾なし（番号繰り上げ整合を確認）。
+- **テスト省略理由**: 指示文書（.md）の更新のみで挙動変更なし。RED テスト対象なし（規約 step7 に基づき省略）。
+
+
+## 直近完了タスク: Copilot指示体系 多層化リファクタ実装（2026-06-05, medium, コード変更なし）
+- **依頼**: 資料「データサイエンティストのためのAGENTS.mdとSkills.md」に沿って、プロジェクトの指示体系を妥当な範囲で再構成し、3回レビュー後に計画書へ保存する。
+- **実装内容**:
+  1. ルート `AGENTS.md` を新設し、Hard Rules / Routing Table / Project Context / 既存agents参照 / 検証コマンドを集約。
+  2. `.github/copilot-instructions.md` を薄い常時ルールカードへ再構成（詳細は AGENTS + skills へ委譲、REMINDER 12項維持）。
+  3. `.github/instructions/workflow.instructions.md` から領域重複を削減し、実行フローとレビュー・記録更新に集中。
+  4. 新規 skill 追加: `.github/skills/gradio5-sam2-ui/SKILL.md`, `.github/skills/sam2-tracking-dino/SKILL.md`。
+  5. 新規 prompt 追加: `.github/prompts/plan-change.prompt.md`, `.github/prompts/verify-ui-playwright.prompt.md`。
+  6. 計画書保存: `計画書/2026-06-05_Copilot指示体系_多層化リファクタ計画.md`。
+- **レビュー結果**: Explore サブエージェントレビューで重大指摘なし。計画書の ERR028 割当のみ整合修正済み。
+- **テスト省略理由**: 指示文書（.md/.prompt）の更新のみで挙動変更なし。RED テスト対象なし（規約 step7 に基づき省略）。
+
+
+## 直近完了タスク: /chronicle improve — ERR035〜038 再発防止ルールを instructions へ反映（2026-06-05, medium, コード変更なし）
+- **背景**: ローカル session store はメタデータ（15 セッションの日時）のみで turns/checkpoints/files が空（reindex/force でも 0）のため、セッション本文からの friction 抽出不可。代わりに ERROR_LOG.md（ERR001〜038）を一次情報として分析。
+- **検出 friction**: 直近の新規エラーは動画版 UI/配線（ERR031〜038）に集中。最も高コストなメタ friction は「fixed/完了 判定がソーステキスト一致止まりで実行時検証されていない」（ERR033→ERR035 の誤 fixed、WHITEBOARD 6/4 調査の「完了」記録不一致）。
+- **反映した5点（ユーザー承認 A=全反映）**:
+  1. `### Gradio 5 / SAM2 UI`: UI/配線の fixed/完了 記録は Playwright 実起動での実行時検証を必須化（ERR035）。
+  2. 同: Gradio 5/Svelte で DOM 直接 value 代入＋native event dispatch の JS ブリッジは実行時に機能しない。ネイティブイベントで構成・冗長コントロール集約（ERR035）。
+  3. 同: `gr.Dataframe` の値は pandas DataFrame で渡る。真偽評価禁止・型判別して `.values.tolist()`（ERR036）。
+  4. `### モデル・評価・学習`: スライダー上限と実処理レンジ乖離 UI は重い処理前に fail-fast 範囲検証し `gr.Error`（ERR037）。
+  5. `## 1. 常時適用ルール`: SAMURAI fork 同梱 config は installed sam2 の Hydra 検索パスに自動で載らない。`Path.as_uri()` で GlobalHydra へ append、`samurai/` は変更せず `MissingConfigException` 伝搬（ERR038）。REMINDER に項目12（UI/配線 fixed は Playwright 実行時検証必須）を追加。
+- **レビュー**: サブエージェント（Explore）が観点 A〜E（ERROR_LOG 一致 / 既存ルール矛盾 / セクション名・ERR番号 / REMINDER 整合 / Markdown 構造）全合格「準拠」。CRITICAL/HIGH なし。
+- **テスト省略理由**: instructions（.md）のルール追記のみで振舞変更なし。RED テスト対象なし（規約 step7 に基づき省略）。
+
+---
+- **依頼**: ①6/4 報告書が前回 5/19 報告書からの差分（進化）を反映できていない→反映。②処理フローを ASCII アートで記載し、`report-for-leader-denshi` スキルへもその規約を反映。③改修後サブエージェントでレビュー、④WHITEBOARD/REFERENCE 更新。
+- **進化の反映（5/19→6/4）**: Gradio UI 搭載／MAM から DINO 意味理解＋プロンプト粒度向上／SAM→SAM2 差替／プルダウンで SAM2→SAMURAI 切替枠組み／意味理解モデルもプルダウン枠組み（※実際はまだ切替不可）／背景透過モデルも切替可／Haystack で機能分割・疎結合 Component パイプライン。
+- **報告書の変更**: セクション0に進化1行＋狙いを追記。セクション1進捗表に新規行（操作画面と言葉で選ぶ機能✅／追跡 SAM→SAM2✅／モデル選べる仕組み📋一部のみ稼働／マスク横切れ調査✅原因確定）。セクション2.1「5/19からの進化—全体の仕組み」を新設（ASCII フロー図①言葉→②DINO→③SAM2/SAMURAI→④transparent-background→出力＋▲プルダウン差替注記＋Haystack 基盤＋5行進化表＋部品分割効果）。2.2=不具合原因／2.3=乖離／2.4=素材限界に番号繰下げ（grep で 2.1〜2.4 整合確認済み）。
+- **スキルへの ASCII 規約反映（3ファイル）**: `SKILL.md`（書き方ルール7「処理の流れはアスキーアート図を1つ」）／`references/writing_guide.md`（目次5＋チェックリスト2項＋新節5「アスキーアートフロー図の作り方」：左→右・四角枠・矢印に渡るもの注記・始点終点明示・図下1行補足・3〜5部品・未完成は▲注記＋雛形）／`assets/report_template.md`（2.1 に ASCII 雛形プレースホルダ）。
+- **サブエージェント(Explore)スキルベースレビュー反映**: SAMURAI に説明追加「動きを予測して見失いにくい高機能版」(high)／ASCII図の背景透過モデル表記が "transp-arency"＝透明性に誤読される→枠内を「背景消し用モデル」に変え実モデル名 transparent-background を図下補足へ移動(high)／2.2 マスク初出に「マスク（切り抜きの型紙）」注釈追加(medium)。LOW 指摘（〔〕括弧／節番号参照）は据置。CRITICAL なし・準拠度高。
+- **テスト省略理由**: 報告書・スキル文書（.md）のみで挙動変更なし。RED テスト対象なし（規約 step7 に基づき省略）。
+
+---
+
+## 直近完了タスク: 電子さん向け報告書スキル作成（2026-06-04, medium, コード変更なし）
+- **依頼**: 5/19 リーダー報告書を見本に、電子さん向け報告書作成スキルを作る。
+- **電子さんの読み手特性（スキルに encode 済み）**: ①AI/CGに疎い→専門用語にやさしい言い換え＋たとえ話 ②長文は読まれない→過剰説明しない（1項目2〜4行） ③中学生偏差値50の読みやすさ ④会議で無発言→報告書単体で完結。
+- **成果物**: `.github/skills/report-for-leader-denshi/`（SKILL.md ＋ `assets/report_template.md` ＋ `references/writing_guide.md`）。
+- **テスト省略理由**: スキル文書（.md）のみで挙動変更なし。RED テスト対象なし（規約 step7 に基づき省略）。
+- **レビュー**: サブエージェント Explore で6観点（frontmatter規約／トリガー妥当性／読み手要件反映／書式一致／progressive disclosure／矛盾誤り）全て合格＝問題なし。
 
 ---
 
 ## 進行中タスクの詳細
 
+### タスク名: マスク横切れ不具合 原因調査・報告書作成（2026-06-04, large, コード変更なし）
+- **背景**: ユーザー観察「DINO の BBOX は出るが SAM2 連携・マスク統合に不備。画面下のマスクが横一直線で切れる。BBOX そのものをユニオンマスク範囲に使っている疑い。パイプラインは壊れている」。報告書3本の作成依頼。
+- **確定した根本原因（コードリードで裏付け、サブエージェント Explore がA〜E全て妥当と判定）**:
+  - **横一直線切れの主因**: `TransparentBGExtractor.run`（`pipelines/components/model_components.py` 609行付近）が SAM2 mask の **形を使わず外接矩形（`mask_to_bbox`+`crop_padding`）で画像をクロップ**し、その矩形内に transparent-background を適用、`full_alpha[y_min:y_max, x_min:x_max] = alpha_crop` で矩形範囲だけ貼り戻す。SAM2 mask が対象を囲みきれず矩形が途中で切れると **矩形下端＝横一直線で alpha が切れる**。ユーザー推測は本質的に正しい。
+  - **複合対象が取れない**: `detect_text_boxes_for_video` が DINO 候補の `boxes[0]`（最上位1個）だけを `state["box"]` にコピー。
+  - **配線欠落（事実上の機能後退）**: `run_video_background_removal` に `boxes`/`prompt_frame_idx`/`bidirectional`/`tracker_model`/`background_model`/`overlay_enabled` が無く、`get_video_pipeline` は `build_sam2_tb_video_pipeline()` を引数なしで呼ぶ。`SAM2VideoPropagator.run` は multi-box union（mask logits>0、BBOX直接ではない）/双方向に**対応済みだが UI/callback が呼んでいない**。
+  - **WHITEBOARD とコードの乖離**: 過去記録は複合対象 union・frame slider・dropdown・overlay を「完了」とするが、現行ファイルに未配線。`tests/unit/test_video_pipeline_wiring.py` が **7件失敗**（GroundingDINOMultiBoxDetector / STAGE_PROGRESS_RANGES / prompt-frame-idx / tracker_model / background_model / tracking overlay / 見出し系を要求）。
+  - **未接続部品**: `SAM2GuardFilter`（mask 外 alpha 削り）は `model_components.py` に実装済みだが `sam2_tb_video_pipeline.py` に未接続。透過抽出に組み込めば横切れを大幅改善可能。
+- **成果物**:
+  - `調査/2026-06-04_222747_MattingAnything_BBOX-マスク-トラッキング-統合フロー調査.md`（オリジナル MAM のフロー）
+  - `調査/2026-06-04_222747_現行動画パイプライン_フロー調査_MAM比較.md`（現行動画版フロー＋MAM比較＋根本原因＋推奨対応）
+  - `報告書/リーダー電子様：PBR連番画像動画・ 動画背景除去 報告書 2026/6/4.md`（テンプレ書式に準拠）
+- **レビュー**: サブエージェント Explore が A〜E をコード行番号付きで検証し全て妥当と判定。指摘（SAM2GuardFilter 未接続の明記）を2文書に反映済み。
+- **素材限界（チーム周知）**: 被写界深度ボケ・前景/背景同色は DINO/SAM2 が原理的に苦手（不具合とは別問題）。
+- **次タスク候補（未着手・別タスク）**: ①TransparentBGExtractor へ SAM2 mask AND（SAM2GuardFilter 組込）、②複合対象 union UI 復旧、③frame選択/双方向/dropdown 復旧、④test_video_pipeline_wiring 7件 GREEN化。
+
+---
+
+## 過去タスク詳細（参考）
+
 <!-- 現在取り組んでいるタスクの目的・進捗・残作業を記述 -->
+
+### タスク名: 動画版 Colab 実機ランタイムエラー 3 件修正（2026-06-06 着手, large）
+- **背景**: ユーザーが Colab（`エラーログ/エラーログ_11.md`）で動画版アプリの 3 フローのエラーを報告。(1) Text Prompt → 検出ボタン → エラー、(2) SAM系プルダウンを SAMURAI に切替 → 実行ボタン → エラー（スキーマ違い？）、(3) 背景透過系チェックポイント変更でもエラー。
+- **確定した根本原因**:
+  - **Bug A（DataFrame 真偽値曖昧）**: `populate_candidate_choices(detected_rows)` の `rows = list(detected_rows or [])`。Gradio 5 の `gr.Dataframe` は値を pandas DataFrame で渡すため `detected_rows or []` が `ValueError: The truth value of a DataFrame is ambiguous` を送出。検出ボタンの `.then(populate_candidate_choices)` が失敗 → CheckboxGroup が空 → `apply_selected_boxes` が「少なくとも 1 つの候補 bbox を選択してください」を送出（連鎖）。
+  - **Bug B（prompt_frame_idx 範囲外）**: スライダー max=1999 だが処理は `max_frames`（既定 30）frame のみサンプリング。スライダー 75・max_frames 30 で実行すると propagator が `prompt_frame_idx が範囲外です: 75（許容 0〜29）` を 18s 後に送出。`run_video_background_removal` に事前検証なし。
+  - **Bug C（SAMURAI config 未発見）**: SAMURAI tracker 選択時 `hydra.errors.MissingConfigException: Cannot find primary config 'configs/samurai/sam2.1_hiera_l.yaml'`。Colab の installed sam2 が facebook 版で `configs/samurai/` を含まないため。samurai/ 同梱の configs が Hydra 検索パス未登録。
+- **方針**: (A) `populate_candidate_choices` を pandas DataFrame / list / None 安全に正規化。(B) `run_video_background_removal` で pipeline.run 前に `prompt_frame_idx >= _estimate_processed_frames` を `gr.Error` で fail-fast（18s 待たせない）。(C) `SAM2VideoPropagator.warm_up` で samurai config 利用時にローカル `samurai/sam2/sam2`（configs/ を含む package root）を Hydra 検索パスへ append（samurai/ は変更しない）。解決不能なら元 MissingConfigException を握り潰さず伝搬。
+- **手順**: WHITEBOARD(済) → RED テスト3件 → 実装(GREEN) → pytest + smoke → Playwright(検出→候補選択→適用) → サブエージェントレビュー → ERROR_LOG(ERR036-038)/WHITEBOARD 更新。
+- **完了状況（2026-06-06）**: ✅ 全手順完了。
+  - **実装**: (A) `_normalize_dataframe_rows` ヘルパ追加し `populate_candidate_choices` を pandas DataFrame / list / None 安全化（真偽評価を排除）。(B) `run_video_background_removal` の `processed_frames` 算出直後・pipeline.run 前に `prompt_frame_idx >= processed_frames` を `gr.Error` で fail-fast。(C) `video_model_components.py` に `_samurai_config_root` / `_ensure_samurai_config_searchpath` を追加し `SAM2VideoPropagator.warm_up` の build 直前で呼出（samurai/ は不変更、Hydra 検索パスへ `as_uri()` で append、解決不能は MissingConfigException を伝搬）。
+  - **テスト**: RED→GREEN（`tests/unit/test_movie_runtime_bugs.py` 7件）。全体 `.venv\Scripts\python.exe -m pytest -m "not integration" -q` → `141 passed, 1 skipped, 3 deselected`。smoke `--help` OK。
+  - **UI 確認**: UI 要素の追加・削除なし（ハンドラ/バックエンド検証のロジック修正のみ）のため Playwright 必須対象外。
+  - **サブエージェントレビュー（Explore）**: A/B は CORRECT 判定（DataFrame 判別・行アクセス・early fail-fast の順序と except gr.Error 再 raise を確認）。C は URI 形式の改善指摘（`f"file://{as_posix()}"`→`as_uri()`）を受け修正適用、ほか samurai/ 不変更・エラー非握り潰し・冪等性を確認。
+  - **ERROR_LOG**: ERR036（gr.Dataframe 真偽値曖昧）・ERR037（prompt_frame_idx 範囲外の遅延発覚）・ERR038（SAMURAI config 検索パス未登録）を追記。
+
+### タスク名: 動画版 シーク連動UI簡素化（2026-06-06 着手, large）
+- **背景**: ユーザーから「プロンプト起点フレーム位置（シーク連動）/ 表示中フレーム再取得 / シーク位置をsam2に反映」の3つが実機で機能しないと報告（ERR033 で「修正済」としたが実機 NG）。ui-ux-pro-max での要否調査を依頼。
+- **根本原因**: `VIDEO_SEEK_SYNC_JS`（gr.Blocks(js=...)）が動画プレイヤーの seeked を拾い、生 DOM でスライダー value を書換え `input`/`change` を dispatch する方式。Gradio 5（Svelte）では DOM 直書きが内部 state に伝わらず `.change` がバックエンドに届かない既知の不安定パターン。3つとも `prompt_frame_idx` 値に依存するため連鎖して機能せず。ボタン2つ（表示中フレーム再取得 / シーク位置を SAM2 に反映）は同一ハンドラ `extract_prompt_frame` の重複。
+- **ユーザー決定**: 選択肢 A（スライダー1本へ集約・確実）を採用。video 純正シークバー→backend は Gradio で信頼性が出せないため断念。
+- **方針**: (1) `VIDEO_SEEK_SYNC_JS` / `build_video_seek_sync_js` と `gr.Blocks(js=...)` を削除。(2) 「表示中フレームを再取得」「シーク位置を SAM2 に反映」ボタンと配線を削除。(3) `prompt_frame_idx` スライダー（ラベルから「シーク連動」除去・「ドラッグで Canvas 更新」明示）の `.change(extract_prompt_frame)` を**唯一の確実な操作元**として残す。(4) JS 専用だった hidden `video_fps`（elem_id=movie-video-fps）を削除し `extract_first_frame*` の fps 出力も除去。(5) 使い方 Markdown を「シーク自動同期」→「スライダーでフレーム選択」へ修正。
+- **手順**: WHITEBOARD(済) → 既存テスト更新(RED) → 実装(GREEN) → smoke → Playwright(スライダー→Canvas 同期確認) → サブエージェントレビュー → ERROR_LOG(ERR035)/WHITEBOARD 更新。
+- **影響テスト**: `test_jupytext_notebooks.py::test_sam2_movie_ui_auto_loads_first_frame_and_simplifies_settings`、`test_video_pipeline_wiring.py::test_movie_app_exposes_text_prompt_to_box_flow`、`test_movie_app_ui_wiring.py::test_movie_redisplay_frame_button_follows_seek_position`（build_video_seek_sync_js / 表示中フレーム / movie-video-fps / seeked / currentTime / load_first_frame_btn 系 assert を新仕様へ更新）。
+- **完了状況（2026-06-06）**: ✅ 全手順完了。
+  - **実装**: `VIDEO_SEEK_SYNC_JS` / `build_video_seek_sync_js` / `gr.Blocks(js=...)` 削除。`load_first_frame_btn`（表示中フレームを再取得）・`show_frame_btn`（シーク位置を SAM2 に反映）とその `.click` 配線を削除。hidden `video_fps`（movie-video-fps）削除。`extract_first_frame` / `extract_first_frame_outputs` を 4-tuple（fps 除外）へ、`input_video.change` outputs から `video_fps` 除外。`prompt_frame_idx` スライダー label を「ドラッグで Canvas 更新」へ、`.change(extract_prompt_frame)` を唯一の操作元として維持。使い方 Markdown と双方向伝播横の補足文もスライダー基調へ修正。
+  - **テスト**: `.venv\Scripts\python.exe -m pytest -m "not integration" -q` → `134 passed, 1 skipped, 3 deselected`。`test_video_pipeline_wiring.py` の fps 期待テストを 4-tuple 新仕様（`test_extract_first_frame_outputs_resets_prompt_slider`）へ更新。smoke `--help` OK。
+  - **Playwright UI 確認**: 7862（CUDA_VISIBLE_DEVICES=-1）で起動し `tests/manual/verify_movie_slider_ui.py` で検証 — 新スライダー label「プロンプト起点フレーム位置（ドラッグで Canvas 更新）」表示、冗長ボタン2つ不在、`#prompt-frame-idx` range スライダー存在を確認（outputs/movie_slider_ui.png）。
+  - **サブエージェントレビュー（Explore）**: 問題なし。stale 参照なし、配線整合（extract_first_frame_outputs 4-tuple↔input_video.change outputs）、後方互換（Text Prompt→box / 双方向 / 複数 bbox）維持を確認。
+  - **ERROR_LOG**: ERR035（Gradio 5/Svelte の DOM ブリッジ不安定でシーク連動3コントロールが実行時無反応、ERR033 の「fixed」記述を訂正）を追記。
+
+### タスク名: 動画版 実機 4 ギャップ修正（2026-06-06 着手, large）
+- **背景**: ユーザーから3度目の不具合報告。計画書・WHITEBOARD は「完了」記載だが実機で動作しない。ERROR_LOG にも未記載だったとの指摘。精読で UI 実装と配線の 4 ギャップを特定。
+- **確定した根本原因**:
+  - **Gap A（tracker 切替が no-op / SAMURAI 試せない）**: `get_video_pipeline(tracker_model, ...)` が `build_sam2_tb_video_pipeline()` を**引数なし**で呼び、registry の config_name/checkpoint_path が propagator に伝搬しない。→ `build_sam2_tb_video_pipeline(propagator=...)` 注入対応 + `get_video_pipeline` で `entry_by_id("tracker", id)` から `SAM2VideoPropagator` を構築。
+  - **Gap B（dropdown が見えない）**: tracker/background Dropdown が閉じた `Accordion("Advanced: 動画処理設定", open=False)` 内に埋没。→ 可視セクション（## 3. SAM系 / ## 4. 背景透過系）へ移動。
+  - **Gap C（「表示中フレーム再取得」と「シーク位置反映」が非連動）**: 再取得ボタンが `extract_first_frame`（常に frame 0）を呼びシーク位置を無視。→ `extract_prompt_frame`（prompt_frame_idx 連動）へ再配線。
+  - **Gap D（prompt canvas 空白, ERR026 違反）**: 動画版 prompt_canvas に `sources=[]` 欠落。静止画版にはあり（divergence）。→ `sources=[]` + download/fullscreen 無効を付与。
+- **手順**: WHITEBOARD(済) → RED テスト → Gap D→A→B→C → GREEN+smoke → Playwright → サブエージェントレビュー → ERROR_LOG(ERR031-034)/WHITEBOARD 更新。
+- **共通処理影響**: pipeline builder 改修は後方互換（`propagator=None` で従来通り）。動画版 notebook は薄いランチャー（gradio app を import 起動）のため .ipynb 再生成不要。
+- **完了状況（2026-06-06）**: ✅ 全 4 ギャップ GREEN。
+  - Gap A/ERR034: `build_sam2_tb_video_pipeline(propagator=None)` 依存注入 + `get_video_pipeline` で `entry_by_id`→`SAM2VideoPropagator` 構築・注入（checkpoint は `_resolve_project_path` で絶対化）。
+  - Gap B/ERR032: tracker/background Dropdown を可視セクション（## 3 SAM系 / ## 4 背景透過系）へ移動。Advanced には tb_jit/tb_threshold/crop_padding のみ。
+  - Gap C/ERR033: 「表示中フレームを再取得」を `extract_prompt_frame(input_video, prompt_frame_idx, frame_step)` へ再配線（シーク連動、prompt_frame_idx は出力で上書きしない）。
+  - Gap D/ERR031: prompt_canvas に `sources=[]` + download/fullscreen 無効を付与（静止画版と一致、ERR026 解消）。
+  - **テスト**: `.venv\Scripts\python.exe -m pytest -m "not integration" -q` → `134 passed, 1 skipped, 3 deselected`。smoke `--help` OK。途中 prompt_mode 行の reformat による IndentationError と既存テスト退行を発生させたが単一行形式へ復元して解消。
+  - **Playwright UI 確認**: 7861 (CUDA_VISIBLE_DEVICES=-1) で起動し目視確認 — Prompt Canvas がプレースホルダー表示・アップロード UI なし（Gap D✓）、トラッカー Dropdown が ## 3 SAM系 に可視（Gap B✓）、背景除去 Dropdown が ## 4 背景透過系・実行ボタン前に可視（Gap B✓）、「表示中フレームを再取得」「シーク位置を SAM2 に反映」ボタン存在（Gap C✓）、Advanced 折りたたみにモデル Dropdown なし。
+  - **サブエージェントレビュー（Explore）**: APPROVE。Critical/High なし。Low 指摘（`_resolve_project_path` が registry の絶対 checkpoint_path を無検査で返す）は registry が管理者制御ファイルで外部入力でないため許容・据え置き。torch.load weights_only 違反なし、try/except: pass なし、segment-anything/samurai 直接変更なし、後方互換維持を確認。
+  - **ERROR_LOG**: ERR031（canvas空白/sources=[]欠落）・ERR032（Dropdown埋没）・ERR033（再取得ボタン非連動）・ERR034（tracker選択がpipeline非反映）を追記。
 
 ### タスク名: 動画版 Phase A〜E 実装（2026-06-05 着手, large）
 - **目的**: `2026-06-02_SAM2動画_複合対象トラッキング_フレーム選択_双方向伝播_計画.md` の Phase A〜E（§11.3 で次フェーズに先送りされていた部分）を実装する。複合対象（例 `person playing drums`）を「複数 bbox → 各 obj_id 登録 → frame ごと union → 双方向伝播」で確実に追跡する。
@@ -34,6 +182,7 @@
   - **テスト**: `127 passed, 1 skipped, 3 deselected`（union 伝播テストは torch 不在環境で `importorskip` により skip、GPU 環境で実行可）。
   - **サブエージェントレビュー（Explore）**: 重大バグなし。中程度指摘 #1（候補ラベルの bbox 抽出が phrase 内 `[]` で誤マッチ）を rsplit 方式へ修正、未使用となった `import re` を削除。#2（frame_step 整合）はコメント追記で補強、#3（候補 parse の握りつぶし）は軽微につき据え置き。
   - **Playwright UI 確認**: `gradio_app_..._for_Movie.py` を 7861 で起動、5 つの新コントロール（起点フレーム Slider / このフレームを表示 / 双方向伝播 Checkbox / 候補 bbox CheckboxGroup / 反映ボタン）の描画と info= 完備を確認。Prompt Canvas プレースホルダーの「Only first-frame prompt」表記を frame 選択対応の文言へ更新。スクショ: `outputs/movie_ui_phase_d.png`。
+  - **追補（2026-06-06）**: `gr.Video` の seek / pause / loadedmetadata を `Blocks(js=...)` で拾う seek-sync ブリッジを追加し、入力動画のシーク位置と `prompt_frame_idx` Slider を自動同期する UX に更新。画面の見出し順も `フレーム取得 → DINO → SAM → 背景透過` に整理し、`frame_step` をフレーム取得系へ移動した。
   - **共通処理影響**: `ui_helpers.py` 変更は加算的・後方互換（静止画版も同 GREEN スイートで担保）。
 
 ### タスク名: 役割別モデル差し替え（レジストリ + Gradio プルダウン）計画策定（2026-06-03 設計のみ）
