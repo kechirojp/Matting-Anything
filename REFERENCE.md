@@ -329,16 +329,21 @@ MatteResult = {
 - 純粋処理は `pipelines/components/common.py` の `build_mask_set()` / `select_candidate_masks()` / `union_masks()` / `compose_mask_preview()` を使う。
 - SAM2 は `SAM2Segmenter` から `mask_set` を返す。UI は best score の単一 mask を固定採用せず、candidate index を選んで union できる。
 - transparent-background は `image + mask -> MatteResult` の `MatteExtractor` として扱う。MAM も将来は同じ `image + mask -> MatteResult` adapter として検証する。
+- **mask dtype 契約（bool / soft 確率の両対応）**: `MatteExtractor`（`TransparentBGExtractor`）が受ける `mask` は (H,W) の **bool** または **float32 soft 確率 [0,1]** のいずれかを許容する。float の場合は前景判定（有無・bbox）を閾値 0.5 で行い、guard には soft 確率をそのまま使う（`soft_probability_guard`）。`max(probA,probB) >= 0.5 ⟺ binaryA OR binaryB` のため bool との前景領域互換は保たれる。`mask + image -> MatteResult` adapter を別実装に差し替える際は、この bool/float 両対応を満たすこと。
 
 ### 5-3. 動画版 Haystack I/O 契約
 
-動画版は `pipelines/sam2_tb_video_pipeline.py` に 3 つの builder を持つ。
+動画版は `pipelines/sam2_tb_video_pipeline.py` に 4 つの builder を持つ。
 
 | builder | 用途 |
 |---------|------|
 | `build_video_reader_pipeline()` | 動画から第 1 フレームと metadata を取得する軽量 Pipeline |
 | `build_sam2_video_propagation_pipeline()` | `VideoReader` + `SAM2VideoPropagator` の mask 伝搬確認 |
 | `build_sam2_tb_video_pipeline()` | SAM2 video propagation → transparent-background → 動画/連番出力 |
+| `build_tb_only_video_pipeline()` | SAM2/DINO なし。`VideoReader` → `TransparentBGVideoExtractor`（masks 未接続＝全画面 tb）→ 動画/連番出力。グリーンバック等の追跡不要ケース向け軽量経路 |
+
+> **tb-only 経路**: `build_tb_only_video_pipeline()` は masks ソケットを接続しないため `TransparentBGVideoExtractor` に `mask=None` が渡り、各フレームを全画面のまま salient/human matting する（crop / guard / 所有権合成 / tracking overlay なし）。動画 UI では「背景除去のみ (tb only)」タブから利用し、コールバックは `run_tb_only_background_removal`（prompt 不要、6-tuple 返却）。
+
 
 Component 境界では詳細な Python 型ヒントではなく、Haystack 接続互換性のため `list` / `dict` socket を使う。詳細仕様は以下の dict 契約で扱う。
 
@@ -354,11 +359,15 @@ VideoSource = {
 }
 
 FrameMaskSequence = {
-    "frame_masks": dict[int, np.ndarray],
-    "object_ids": list[int],  # 初版は [1] 固定
+    "frame_masks": dict[int, np.ndarray],  # 値は (H,W) bool または float32 soft 確率 [0,1]
+    "object_ids": list[int],  # 初版は [1] 固定 / 複合対象では box 分の 1..N
     "frame_indices": list[int],
     "source": str,
     "metadata": dict,
+    # 動画版 5-6: per-object logit 保持。OwnershipResolver 用に各 frame の
+    # (N,H,W) logit を同梱（任意キー）。OwnershipResolver 通過後は `ownership`
+    # （per frame (N+1,H,W)、最終チャネルが背景）も付与される。
+    "per_object_logits": dict[int, np.ndarray],  # frame_idx -> (N,H,W) logits
 }
 
 VideoMatteResult = {
@@ -390,7 +399,36 @@ SAM2 prompt の端吸着・bbox 正規化・overlay 描画は `pipelines/compone
 
 動画版 Haystack UI でも静止画版と同じく、複合対象（例: `person playing drums`, `person riding bicycle`）を意味プロンプトで選ぶ導線を維持する。`gradio_app_sam2_transparent_BG_haystack_for_Movie.py` は GroundingDINO をボタン押下時まで遅延構築し、Text Prompt 検出を実行する。検出結果は top bbox を `prompt_state["box"]` に、全候補 bbox を `prompt_state["boxes"]` にコピーする。候補は `CheckboxGroup`（`populate_candidate_choices` がラベル生成、`apply_selected_boxes` が選択 bbox を `prompt_state["boxes"]` へ反映）でユーザーが複数選び、複合対象として union できる。
 
-`SAM2VideoPropagator.run` は `boxes`（複数）/ `prompt_frame_idx`（起点フレーム）/ `bidirectional`（双方向）を受け取る。複数 bbox は obj_id 1..N として登録し、frame ごとに全 obj の mask を OR union して 1 枚へ統合するため、下流契約 `frame_masks: source_index → 1 枚` は不変（`TransparentBGVideoExtractor` / writer 改修不要）。`bidirectional=True` のとき forward / backward の 2 パスを走らせ各 frame で結果を OR 統合する。これらの新パラメータは Component run kwargs の auto-socket 経由で `pipeline.run(data={...})` から渡せるため pipeline 結線は不変。`boxes=None` のときは従来の単一 box/point・`prompt_frame_idx=0`・forward only パスを完全に維持する（後方互換）。
+`SAM2VideoPropagator.run` は `boxes`（複数）/ `prompt_frame_idx`（起点フレーム）/ `bidirectional`（双方向）を受け取る。複数 bbox は obj_id 1..N として登録し、frame ごとに全 obj の mask を **soft max union（各 obj を `stable_sigmoid` で確率化し `np.maximum`）** して 1 枚へ統合するため、下流契約 `frame_masks: source_index → 1 枚` は不変（`TransparentBGVideoExtractor` / writer 改修不要）。ただし統合結果は二値化せず **float32 soft 確率 [0,1]** で `frame_masks` に格納する（消える線=継ぎ目の根治, ERR044）。`max(prob) >= 0.5 ⟺ binary OR` のため前景領域は従来 OR と一致し、差は継ぎ目が黒線でなく中間 alpha になる点のみ。`bidirectional=True` のとき forward / backward の 2 パスを走らせ各 frame で結果を `np.maximum` 統合する。`boxes` と補正 `points` を併用する場合、点群を別 obj にまとめず `assign_points_to_boxes` で各点を最近傍 box の object prompt に同梱する（複数インスタンスで点が落ちるのを防ぐ, ERR043）。これらの新パラメータは Component run kwargs の auto-socket 経由で `pipeline.run(data={...})` から渡せるため pipeline 結線は不変。`boxes=None` のときは従来の単一 box/point・`prompt_frame_idx=0`・forward only パスを完全に維持する（後方互換）。
+
+### 5-6. 動画版 per-object logit 保持 + OwnershipResolver（画素 softmax 所有権）
+
+継ぎ目の根治をさらに進め、`SAM2VideoPropagator` は各 obj の logit を二値化・union せず **per-object logit を保持**して下流へ渡す。`propagate_in_video` の forward / reverse 2 pass は **必ず object_id をキーに整列**してマージする（中間構造 `source_index → {obj_id → (H,W)}`、欠損 obj は `-1e6` 埋め、`np.maximum` で pass 統合）。位置ベースで stack すると追跡途切れ/再出現で pass 間の obj 数が変わった際に別 obj の logit が混入するため避ける。整列後に `target_object_ids` 順で `(N,H,W)` を構築し `FrameMaskSequence["per_object_logits"]` に同梱する。overlay / 後方互換用の union soft `frame_masks` は per-object logit から `stable_sigmoid` → 画素 max で派生し、既存契約（`metadata` / `object_ids` / soft union `frame_masks`）を温存する。
+
+`OwnershipResolver`（`pipelines/components/ownership_resolver.py`）は propagator と `TransparentBGVideoExtractor` の間に挿入され、`masks` dict を受けて per-object logits に **背景 logit=0 を明示チャネルとして加えた N+1 チャネル**の温度 τ softmax で **画素ごと和=1 の所有権**を算出する。前景 soft = `clip(1 - 背景所有権, 0, 1)` を `frame_masks` に差し替え、`ownership`（per frame `(N+1,H,W)`、最終チャネルが背景）も同梱して下流へ渡す。単一 obj 画素は sigmoid 相当、重なり画素のみ softmax で所有権を分配する。`_softmax_across_objects` は `temperature <= 0` を `ValueError` で防御し、max 減算で数値安定化する。
+
+温度 τ は `config/inference_models.toml` の各 background entry に `ownership_temperature`（>0）で定義し、ハードコードしない。movie app（`gradio_app_sam2_transparent_BG_haystack_for_Movie.py`）は `bg_entry.get("ownership_temperature", 1.0)` を読み `pipeline.run` の `"ownership_resolver": {"temperature": ...}` へ配線する。配線は `sam2_video_propagator.masks → ownership_resolver.masks → transparent_bg_video.masks`。overlay は生トラッキング可視化として `sam2_video_propagator.masks` を継続使用する。
+
+#### per_object 連続アルファ合成（video_matte_mode）
+
+背景透過の経路は config `video_matte_mode` で切り替える（各 background entry に定義、ハードコード禁止）。
+
+> **既定変更（2026-06-18）**: グリーンバック実動画で union モードが細い/前ボケ対象（ドラムスティック・前ボケシンバル）を under-matte する事象を受け、全 background entry の既定を `video_matte_mode="per_object"` + `mask_feather=0` に変更。union は軽量モードとして config で明示的に選択する。
+
+- `"union"`（軽量モード）: フレームあたり tb 1 回。`OwnershipResolver` が差し替えた union soft `frame_masks` の外接矩形で 1 度だけ切り抜く軽量経路。従来挙動と後方互換。
+- `"per_object"`（**現行既定**）: フレームあたり tb N 回（対象数）。`TransparentBGVideoExtractor._run_per_object_frame` が各対象の logit を `stable_sigmoid` → soft mask として既存 `TransparentBGExtractor.run` を呼び（bbox 導出・crop・tb・full frame 配置・soft guard を再利用）、対象ごとの連続アルファ `alpha_o`（full frame）を得る。最終アルファは純粋関数 `composite_alpha_by_ownership(per_object_alphas, ownership)`（`pipelines/components/video_common.py`）で `alpha_final(p) = max_{o=0..N-1} alpha_o(p)`（**比較明 / lighten**）として合成する。**RGB は元フレームのまま、アルファのみ合成**する。
+
+> **合成方式変更（2026-06-18）**: 旧仕様の所有権加重和 `Σ_o ownership_o × alpha_o` は、対象が重なる画素で手前対象のアルファが 0（黒）のとき背後の残したい対象まで減衰して黒く潰す欠点があった。比較明 max は対象ごとアルファの最大値を採るため、どれか 1 対象でも前景なら最終アルファに残り、対象同士の重なりで黒抜けが起きない。`ownership` 引数は合成には乗じず、前景チャネル数 N と per_object_alphas 数の一致検証にのみ使用する。
+
+`composite_alpha_by_ownership` は ownership 形状 `(N+1,H,W)` と per_object_alphas 数 N の一致を検証し、入力・出力ともに `[0,1]` に clip、不一致時は `ValueError`。
+
+`run()` のフレームループは `video_matte_mode == "per_object"` かつ当該 frame の `per_object_logits`（`(N,H,W)`）と `ownership` が揃い対象数 ≥1 のときのみ per_object 経路を使い、欠如時は union 経路へフォールバックする。実行モードは matte メタデータの `video_matte_mode` に記録する。per_object は tb 呼び出し回数（frames × objects）が増えるため重いが、対象ごとに crop して salient 前景として扱うため細い/前ボケ対象の欠落を抑える。エッジの半透明（tb 連続アルファ＋sigmoid 由来ソフト）を硬化したい場合は movie app の Alpha threshold スライダで二値化する。`mask_feather` は既定 0（guard 境界の Gaussian feather オフ）。
+
+movie app は `bg_entry.get("video_matte_mode", "union")` を読み `transparent_bg_video` へ配線する。CLI `run_video_matting_headless.py` は `--matte-mode {union,per_object}`（未指定で config 既定）で上書きできる。
+
+#### ヘッドレス実行 CLI
+
+`run_video_matting_headless.py` は Gradio を起動せず end-to-end でパイプラインを実行する検証用エントリポイント。`--video`（fail-fast でパス存在検証）/ `--box` / `--point`（繰り返し可）/ `--tracker` / `--background` / `--temperature`（未指定で config の `ownership_temperature`）/ `--matte-mode`（未指定で config の `video_matte_mode`）/ `--output-mode` 等を受ける。`_parse_box("x1,y1,x2,y2")` / `_parse_point("x,y[,label]")` / `build_arg_parser`。GroundingDINO テキストプロンプトは扱わず box/point 直接指定のみ。
 
 UI では入力動画のシーク位置を起点フレームに同期する。`gr.Video` の seek / pause / loadedmetadata は `Blocks(js=...)` のブラウザ hook で検出し、`prompt_frame_idx` Slider（サンプリング後シーケンス index 0〜max_frames-1）へ反映する。`extract_prompt_frame` は raw_index = slider × frame_step で抽出し index 整合を担保する。`frame_step` はフレーム取得系に配置し、`prompt_frame_idx` は「表示中フレームを再取得」ボタンと併用できる。双方向は `gr.Checkbox` で切り替え、フレーム選択 Slider は座標手入力ではないため ERR017 に抵触しない。画面の見出し順は `フレーム取得 → DINO → SAM → 背景透過`。
 

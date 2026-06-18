@@ -73,6 +73,128 @@ def dilate_binary_mask(mask: np.ndarray, kernel_size: int = 15) -> np.ndarray:
     return cv2.dilate(mask.astype(np.uint8), kernel, iterations=1).astype(bool)
 
 
+def feather_binary_mask(mask: np.ndarray, dilate_size: int = 21, feather_radius: int = 8) -> np.ndarray:
+    """二値マスクを膨張し境界を feather した連続値 soft guard を返す。
+
+    SAM2/SAMURAI の二値 union mask をそのまま guard として乗算すると、境界が黒/白の
+    2 値エッジになる。mask 境界を中心に ``feather_radius`` ピクセルかけて 0.0↔1.0 を
+    滑らかに遷移させることで、transparent-background の gradient alpha を保ったまま
+    mask 外の漏れ alpha を soft に削る。遷移帯が mask 内側の前景 alpha にも食い込むよう、
+    膨張量は ``feather_radius`` を超えない範囲に制限する。
+
+    Args:
+        mask: 二値マスク（bool もしくは 0/1）。
+        dilate_size: guard を外側へ広げる膨張 kernel サイズ（漏れ alpha の許容マージン）。
+        feather_radius: 境界を feather する半径（0 で従来の二値 guard）。
+            推奨値は 4〜16 程度。画像対角線の半分を超える値では距離変換が飽和し
+            遷移帯が頭打ちになるため、画像サイズに対し十分小さい値を指定する。
+
+    Returns:
+        0.0..1.0 の float32 soft guard 配列（mask と同 shape）。
+    """
+    if feather_radius < 1:
+        return dilate_binary_mask(mask, kernel_size=dilate_size).astype(np.float32)
+    effective_dilate = max(1, min(dilate_size, feather_radius))
+    base = dilate_binary_mask(mask, kernel_size=effective_dilate)
+    inside_distance = cv2.distanceTransform(base.astype(np.uint8), cv2.DIST_L2, 5)
+    outside_distance = cv2.distanceTransform((~base).astype(np.uint8), cv2.DIST_L2, 5)
+    signed_distance = inside_distance - outside_distance
+    soft = np.clip(signed_distance / float(feather_radius) * 0.5 + 0.5, 0.0, 1.0)
+    return soft.astype(np.float32)
+
+
+def stable_sigmoid(x: np.ndarray) -> np.ndarray:
+    """数値的に安定なシグモイドで logit を [0,1] の float32 確率に変換する。
+
+    SAM2 の生 logit（mask_logits）は ±数十に達するため、``1/(1+exp(-x))`` を素朴に
+    計算すると ``exp`` が overflow して warning や inf を生む。正負で分岐して常に
+    ``exp`` の引数を負にすることで overflow を避ける。
+
+    Args:
+        x: 任意 shape の logit 配列。
+
+    Returns:
+        ``x`` と同 shape の float32 確率配列（値域 [0,1]）。
+    """
+    arr = np.asarray(x, dtype=np.float32)
+    positive = arr >= 0
+    result = np.empty_like(arr, dtype=np.float32)
+    result[positive] = 1.0 / (1.0 + np.exp(-arr[positive]))
+    exp_x = np.exp(arr[~positive])
+    result[~positive] = exp_x / (1.0 + exp_x)
+    return result
+
+
+def assign_points_to_boxes(
+    points: Sequence[Sequence[float]] | None,
+    boxes: Sequence[Sequence[float]] | None,
+) -> dict[int, list[int]]:
+    """各クリック点を最近傍 box の object prompt に割り当てる（修正1: 方針1）。
+
+    boxes と points を併用する際、全 point を 1 つの追加 object にまとめると SAM2 が
+    複数インスタンスを 1 mask で表現できず point が落ちる。代わりに各 point を矩形距離
+    が最小の box に割り当て、その box の ``add_new_points_or_box`` に同梱することで、
+    positive 点は最寄り box を補強し、negative 点は最寄り box 内部をくり抜ける。
+
+    Args:
+        points: クリック点 ``[[x, y], ...]``（None/空可）。
+        boxes: 検出 box ``[[x1, y1, x2, y2], ...]``（1-based の obj_id にマップ）。
+
+    Returns:
+        ``{obj_id(1..N): [point_index, ...]}`` の辞書。box が無ければ空辞書。
+        point が無くても全 obj_id を空リストで含む。
+    """
+    box_list = [list(map(float, box)) for box in (boxes or [])]
+    assignment: dict[int, list[int]] = {obj_id: [] for obj_id in range(1, len(box_list) + 1)}
+    if not box_list or not points:
+        return assignment
+
+    for point_index, point in enumerate(points):
+        px, py = float(point[0]), float(point[1])
+        best_obj_id = 1
+        best_distance = float("inf")
+        for offset, box in enumerate(box_list):
+            x1, y1, x2, y2 = box
+            dx = max(x1 - px, 0.0, px - x2)
+            dy = max(y1 - py, 0.0, py - y2)
+            distance = dx * dx + dy * dy
+            if distance < best_distance:
+                best_distance = distance
+                best_obj_id = offset + 1
+        assignment[best_obj_id].append(point_index)
+    return assignment
+
+
+def soft_probability_guard(
+    probability: np.ndarray,
+    dilate_size: int = 21,
+    feather_radius: int = 8,
+) -> np.ndarray:
+    """soft 確率 mask の継ぎ目谷を closing で埋め、末端 feather した soft guard を返す（修正2: 根治）。
+
+    SAM2 の soft union 確率をそのまま guard に使うと、複数 object の境界（継ぎ目）で
+    確率が落ち込み黒い継ぎ目線になる。grayscale の morphological closing で細い谷を
+    橋渡しし、Gaussian blur で末端を feather することで、継ぎ目を暗くせず連続な soft
+    guard を生成する。二値化は一切行わない。
+
+    Args:
+        probability: [0,1] の soft 確率 mask（float）。
+        dilate_size: closing の正方 kernel サイズ（継ぎ目谷を橋渡しする幅）。
+        feather_radius: Gaussian feather 半径（ksize = ``feather_radius*2+1``）。
+
+    Returns:
+        [0,1] の float32 soft guard 配列（``probability`` と同 shape）。
+    """
+    prob = np.clip(np.asarray(probability, dtype=np.float32), 0.0, 1.0)
+    if dilate_size >= 1:
+        kernel = np.ones((dilate_size, dilate_size), np.uint8)
+        prob = cv2.morphologyEx(prob, cv2.MORPH_CLOSE, kernel)
+    if feather_radius >= 1:
+        ksize = feather_radius * 2 + 1
+        prob = cv2.GaussianBlur(prob, (ksize, ksize), 0)
+    return np.clip(prob, 0.0, 1.0).astype(np.float32)
+
+
 def compose_alpha(image: np.ndarray, alpha: np.ndarray, background: np.ndarray | tuple[int, int, int]) -> np.ndarray:
     """RGB 画像と alpha を背景に合成する。"""
     image_rgb = ensure_rgb_array(image)
@@ -111,6 +233,8 @@ def build_mask_set(
     metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """候補 mask 群を Haystack Component 間で受け渡す MaskSet 契約 dict に変換する。"""
+    # allow passing per-object logits mapping from frame_idx to (N,H,W) arrays
+    # but this function remains focused on mask set building for candidate masks.
     mask_array = normalize_masks(masks)
     mask_count = int(mask_array.shape[0])
     score_array = np.zeros((mask_count,), dtype=np.float32) if scores is None else np.asarray(scores, dtype=np.float32)
@@ -281,7 +405,12 @@ def render_tracking_overlay_frame(
 ) -> np.ndarray:
     """1 frame に追跡 mask の半透明塗りと輪郭を重ね、追従確認用 overlay を作る。"""
     overlay = ensure_rgb_array(frame).copy()
-    mask_bool = np.asarray(mask).astype(bool)
+    mask_array = np.asarray(mask)
+    # soft 確率 mask（float）は閾値 0.5 で前景判定する。二値 mask は従来通り。
+    if np.issubdtype(mask_array.dtype, np.floating):
+        mask_bool = mask_array >= 0.5
+    else:
+        mask_bool = mask_array.astype(bool)
     if mask_bool.ndim != 2:
         raise ValueError(f"mask は (H,W) 形式である必要があります: shape={mask_bool.shape}")
     if mask_bool.shape != overlay.shape[:2]:

@@ -16,7 +16,7 @@ import numpy as np
 from haystack import component
 from PIL import Image
 
-from .common import build_mask_set, compose_alpha, dilate_binary_mask, ensure_rgb_array, mask_to_bbox
+from .common import build_mask_set, compose_alpha, dilate_binary_mask, ensure_rgb_array, feather_binary_mask, mask_to_bbox, soft_probability_guard
 
 
 CPU_FALLBACK_ENV_VAR = "MATTING_ANYTHING_ALLOW_CPU"
@@ -618,13 +618,28 @@ class TransparentBGExtractor:
         crop_padding: int = 40,
         apply_mask_guard: bool = True,
         mask_guard_dilate: int = 21,
+        mask_guard_feather: int = 0,
     ) -> dict[str, np.ndarray]:
         image_rgb = ensure_rgb_array(image)
         image_height, image_width = image_rgb.shape[:2]
         if mask is None and selected_mask is not None:
             mask = selected_mask.get("mask")
-        if mask is not None and mask.any():
-            bbox = mask_to_bbox(mask, padding=crop_padding, image_shape=image_rgb.shape)
+        # mask は二値(bool) と soft 確率(float) の両方を受け付ける。
+        # float の場合は閾値 0.5 で前景判定（bbox/有無）し、guard には soft 確率を使う。
+        mask_soft: np.ndarray | None = None
+        mask_binary: np.ndarray | None = None
+        mask_is_float = False
+        if mask is not None:
+            mask_array = np.asarray(mask)
+            mask_is_float = np.issubdtype(mask_array.dtype, np.floating)
+            if mask_is_float:
+                mask_soft = np.clip(mask_array, 0.0, 1.0).astype(np.float32)
+                mask_binary = mask_soft >= 0.5
+            else:
+                mask_binary = mask_array.astype(bool)
+        has_mask = mask_binary is not None and bool(mask_binary.any())
+        if has_mask:
+            bbox = mask_to_bbox(mask_binary, padding=crop_padding, image_shape=image_rgb.shape)
             if bbox is None:
                 bbox = (0, 0, image_width, image_height)
             x_min, y_min, x_max, y_max = bbox
@@ -646,11 +661,26 @@ class TransparentBGExtractor:
         full_alpha = np.zeros((image_height, image_width), dtype=np.float32)
         full_alpha[y_min:y_max, x_min:x_max] = alpha_crop
         mask_guard_applied = False
-        if apply_mask_guard and mask is not None and mask.any():
-            # SAM2 mask の外接矩形でクロップした結果、矩形内・mask 形状外の領域に
-            # alpha が残ると「横一直線切れ」として現れる。mask を dilate した guard で
-            # mask 形状外の alpha を 0 にし、transparent-background のソフト境界は保つ。
-            guard = dilate_binary_mask(mask, kernel_size=mask_guard_dilate).astype(np.float32)
+        if apply_mask_guard and has_mask:
+            # guard は「mask 形状の外側に漏れた alpha を 0 にするゲート」に徹する。
+            # mask 形状の dilate（拡張）で内部とそのマージンは 1.0 を保ち、tb の連続アルファ
+            # 内部を一切減衰させない。soft 確率 mask（float）でも内部の連続値を乗算しない
+            # （= 領域全体の信頼度をアルファに掛けて人物を半透明化する不具合の根治）。
+            # 境界を意図的に滑らかにしたい場合のみ mask_guard_feather>0 で soft guard を使う。
+            if mask_guard_feather > 0:
+                # オプトイン: 境界を feather した soft guard（連続値）。
+                if mask_is_float and mask_soft is not None:
+                    guard = soft_probability_guard(
+                        mask_soft, dilate_size=mask_guard_dilate, feather_radius=mask_guard_feather
+                    )
+                else:
+                    guard = feather_binary_mask(
+                        mask_binary, dilate_size=mask_guard_dilate, feather_radius=mask_guard_feather
+                    )
+            else:
+                # 既定: 形状を dilate した二値ゲート（内部 1.0・外部 0）。float mask は
+                # 0.5 閾値で得た mask_binary を使い、内部の連続値は guard に持ち込まない。
+                guard = dilate_binary_mask(mask_binary, kernel_size=mask_guard_dilate).astype(np.float32)
             full_alpha = full_alpha * guard
             mask_guard_applied = True
         full_rgb = image_rgb.copy()
@@ -676,6 +706,7 @@ class TransparentBGExtractor:
                 "bbox": (int(x_min), int(y_min), int(x_max), int(y_max)),
                 "mask_used": mask is not None,
                 "mask_guard_applied": mask_guard_applied,
+                "mask_guard_feather": mask_guard_feather,
             },
         }
         return {"rgba": rgba, "alpha": alpha_u8, "preview": preview, "matte_result": matte_result}
@@ -686,13 +717,23 @@ class SAM2GuardFilter:
     """SAM2 マスク外の alpha を削る Component。"""
 
     @component.output_types(alpha=np.ndarray)
-    def run(self, alpha: np.ndarray, mask: np.ndarray | None = None, enabled: bool = True, dilate_kernel: int = 21) -> dict[str, np.ndarray]:
+    def run(
+        self,
+        alpha: np.ndarray,
+        mask: np.ndarray | None = None,
+        enabled: bool = True,
+        dilate_kernel: int = 21,
+        feather: int = 0,
+    ) -> dict[str, np.ndarray]:
         if not enabled or mask is None:
             return {"alpha": alpha}
         alpha_float = alpha.astype(np.float32)
         if alpha_float.max() > 1.0:
             alpha_float = alpha_float / 255.0
-        guard = dilate_binary_mask(mask, kernel_size=dilate_kernel).astype(np.float32)
+        if feather > 0:
+            guard = feather_binary_mask(mask, dilate_size=dilate_kernel, feather_radius=feather)
+        else:
+            guard = dilate_binary_mask(mask, kernel_size=dilate_kernel).astype(np.float32)
         return {"alpha": np.clip(alpha_float * guard * 255, 0, 255).astype(np.uint8)}
 
 

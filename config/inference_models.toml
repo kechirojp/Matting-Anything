@@ -63,12 +63,25 @@ requires = "sam2_samurai"
 # ─────────────────────────────────────────
 # background: アルファマット / 背景除去モデル
 # ─────────────────────────────────────────
+# mask_feather: SAM2/SAMURAI 二値 union mask を guard として乗算する際の境界 feather 半径。
+#   0（現行既定）で硬エッジの二値 guard、>0 で境界を soft 化する。素早い動き/前ボケ対象の
+#   半透明エッジが人物に被るのを避けるため既定 0（エッジ処理オフ）に設定。
+# ownership_temperature: OwnershipResolver の画素 softmax 温度 τ。
+#   1.0 で標準。小さいほど所有権が鋭く（ハード寄り）、大きいほど滑らか（重なりを分配）。
+# video_matte_mode: 動画背景透過の経路。
+#   "union"（現行既定）はフレームあたり tb 1 回。union mask の外接矩形で 1 度切り抜く軽量経路。
+#   "per_object" はフレームあたり tb N 回（対象数）。対象ごとに crop tb し所有権でアルファ
+#   合成する経路。ただし多 box 選択時は tb 呼び出しが frames×objects となり重く、所有権×tbアルファ
+#   の積が零になるケース（SAM2 が背景を取る等）でマスクが黒化しうるため、既定は union。
 
 [[background]]
 id = "tb_base"
 label = "transparent-background base（高精度）"
 component = "TransparentBGExtractor"
 tb_mode = "base"
+mask_feather = 0
+ownership_temperature = 1.0
+video_matte_mode = "union"
 # 推奨: 精度重視の場合
 
 [[background]]
@@ -76,6 +89,9 @@ id = "tb_fast"
 label = "transparent-background fast（軽量）"
 component = "TransparentBGExtractor"
 tb_mode = "fast"
+mask_feather = 0
+ownership_temperature = 1.0
+video_matte_mode = "union"
 # 推奨: 速度重視の場合
 
 [[background]]
@@ -83,4 +99,7 @@ id = "tb_base_nightly"
 label = "transparent-background base-nightly（最新実験版）"
 component = "TransparentBGExtractor"
 tb_mode = "base-nightly"
+mask_feather = 0
+ownership_temperature = 1.0
+video_matte_mode = "union"
 # 実験的な最新モデル。安定性は base より低い場合があります

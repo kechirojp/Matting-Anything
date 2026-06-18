@@ -406,6 +406,7 @@ def run_transparent_bg(
     try:
         entry = entry_by_id("background", background_model_id)
         tb_mode = entry.get("tb_mode", "base")
+        mask_feather = int(entry.get("mask_feather", 0))
         mask = None
         if mask_source == "Union Mask":
             mask = SAM2_STATE.get("union_mask")
@@ -415,6 +416,9 @@ def run_transparent_bg(
             mask = SAM2_STATE.get("mask")
             if mask is None:
                 raise gr.Error("Best Candidate Mask がありません。先に SAM2 候補を生成してください。")
+        # feather>0 のときは extractor 段で soft guard を一元適用し、後段 sam2_guard の
+        # 二値 guard との二重適用（soft × 二値 = 2 値エッジ再発）を避けるため無効化する。
+        sam2_guard_enabled = mask is not None and mask_feather <= 0
         result = get_tb_pipeline(background_model_id).run(
             {
                 "image_normalizer": {"image": input_image},
@@ -425,8 +429,9 @@ def run_transparent_bg(
                     "tb_threshold": tb_threshold,
                     "tb_output_type": tb_output_type,
                     "crop_padding": int(crop_padding),
+                    "mask_guard_feather": mask_feather,
                 },
-                "sam2_guard": {"mask": mask, "enabled": mask is not None},
+                "sam2_guard": {"mask": mask, "enabled": sam2_guard_enabled},
                 "output_saver": {"enabled": True},
             },
             include_outputs_from={"transparent_bg", "sam2_guard", "output_saver"},

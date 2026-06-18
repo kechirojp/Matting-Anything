@@ -7,6 +7,7 @@ from haystack import Pipeline
 from pipelines.sam2_tb_video_pipeline import (
     build_sam2_tb_video_pipeline,
     build_sam2_video_propagation_pipeline,
+    build_tb_only_video_pipeline,
     build_video_reader_pipeline,
 )
 
@@ -59,7 +60,30 @@ def test_sam2_tb_video_pipeline_defaults_propagator_when_none() -> None:
     assert "sam2_video_propagator" in pipeline.graph.nodes
 
 
-def test_video_writer_warm_up_matches_haystack_no_arg_contract() -> None:
+def test_tb_only_video_pipeline_builds_without_sam2() -> None:
+    """tb-only 経路は SAM2/所有権/overlay を含まず video_reader→tb→writers のみ。"""
+    pipeline = build_tb_only_video_pipeline()
+
+    assert isinstance(pipeline, Pipeline)
+    assert "video_reader" in pipeline.graph.nodes
+    assert "transparent_bg_video" in pipeline.graph.nodes
+    assert "video_writer" in pipeline.graph.nodes
+    assert "frame_sequence_writer" in pipeline.graph.nodes
+    # SAM2 追跡・所有権解決・tracking overlay は tb-only 経路に存在しない。
+    assert "sam2_video_propagator" not in pipeline.graph.nodes
+    assert "ownership_resolver" not in pipeline.graph.nodes
+    assert "tracking_overlay" not in pipeline.graph.nodes
+
+
+def test_movie_app_exposes_tb_only_tab_and_callback() -> None:
+    """Movie UI は SAM2 経路と tb-only 経路をタブで分離し、専用コールバックを配線する。"""
+    source = Path("gradio_app_sam2_transparent_BG_haystack_for_Movie.py").read_text(encoding="utf-8")
+
+    assert "gr.Tabs(" in source
+    assert "build_tb_only_video_pipeline" in source
+    assert "def run_tb_only_background_removal" in source
+    assert "get_tb_only_pipeline" in source
+
     """Haystack Pipeline warm_up calls component warm_up without runtime frame shape inputs."""
     from pipelines.components.video_model_components import VideoWriter
 
@@ -328,10 +352,88 @@ def test_sam2_video_propagator_unions_objects_and_runs_two_passes() -> None:
     assert all(item["frame_idx"] == 1 for item in fake.added)
     # bidirectional → forward + reverse の 2 pass。
     assert fake.reverse_calls == [False, True]
-    # 左半分(obj1) ∪ 右半分(obj2) = 全面 True。
+    # 修正2: frame mask は soft 確率[0,1]（float）で二値ではない。
     assert masks["object_ids"] == [1, 2]
     for mask in masks["frame_masks"].values():
-        assert bool(np.all(mask))
+        assert np.issubdtype(np.asarray(mask).dtype, np.floating)
+        assert np.all((mask >= 0.0) & (mask <= 1.0))
+        # 左半分(obj1) ∪ 右半分(obj2) = 閾値 0.5 で全面前景。
+        assert bool(np.all(mask >= 0.5))
+
+
+def test_sam2_video_propagator_assigns_points_to_nearest_box(monkeypatch) -> None:
+    """修正1(方針1): boxes + points 併用時、各点を最近傍 box の object prompt に同梱する。"""
+    import contextlib
+    import sys
+    import types
+
+    import numpy as np
+
+    # run() 内の `import torch` を最小 stub で満たす（inference_mode のみ使用）。
+    torch_stub = types.ModuleType("torch")
+    torch_stub.inference_mode = lambda: contextlib.nullcontext()
+    monkeypatch.setitem(sys.modules, "torch", torch_stub)
+
+    from pipelines.components.video_model_components import SAM2VideoPropagator
+
+    captured: dict[str, list] = {"prompts": []}
+
+    class _FakePointBoxPredictor:
+        def init_state(self, video_path):
+            return {"video_path": video_path}
+
+        def add_new_points_or_box(self, inference_state, frame_idx, obj_id, box=None, points=None, labels=None):
+            captured["prompts"].append(
+                {
+                    "obj_id": int(obj_id),
+                    "has_box": box is not None,
+                    "points": None if points is None else np.asarray(points).tolist(),
+                    "labels": None if labels is None else np.asarray(labels).tolist(),
+                }
+            )
+
+        def propagate_in_video(self, state, reverse=False):
+            height, width = 4, 6
+            for frame_idx in range(2):
+                obj1 = np.full((1, height, width), -1.0, dtype=np.float32)
+                obj1[0, :, :3] = 1.0  # 左半分
+                obj2 = np.full((1, height, width), -1.0, dtype=np.float32)
+                obj2[0, :, 3:] = 1.0  # 右半分
+                yield frame_idx, [1, 2], [obj1, obj2]
+
+    propagator = SAM2VideoPropagator(device="cpu")
+    propagator._video_predictor = _FakePointBoxPredictor()
+
+    frames = [np.zeros((4, 6, 3), dtype=np.uint8) for _ in range(2)]
+    result = propagator.run(
+        frames=frames,
+        boxes=[[0, 0, 2, 3], [3, 0, 5, 3]],
+        points=[[1, 1], [4, 2]],
+        labels=[1, 0],
+        prompt_frame_idx=0,
+    )
+
+    # 点群を別 obj にせず、最近傍 box の object prompt に同梱する。
+    # 点(1,1)→box1(obj1), 点(4,2)→box2(obj2)。追加 obj(3) は作らない。
+    obj_ids = sorted({p["obj_id"] for p in captured["prompts"]})
+    assert obj_ids == [1, 2]
+    obj1_prompts = [p for p in captured["prompts"] if p["obj_id"] == 1]
+    obj2_prompts = [p for p in captured["prompts"] if p["obj_id"] == 2]
+    # box1 は box + point(1,1, label=1) を同梱。
+    assert any(p["has_box"] and p["points"] == [[1, 1]] and p["labels"] == [1] for p in obj1_prompts)
+    # box2 は box + point(4,2, label=0=negative) を同梱（SAM2 内部でくり抜き）。
+    assert any(p["has_box"] and p["points"] == [[4, 2]] and p["labels"] == [0] for p in obj2_prompts)
+
+    masks = result["masks"]
+    # metadata に points/labels が残る。
+    assert masks["metadata"]["points"] == [[1, 1], [4, 2]]
+    assert masks["metadata"]["labels"] == [1, 0]
+    # object_ids は box の 1,2 のみ（点群用の追加 obj は無い）。
+    assert masks["object_ids"] == [1, 2]
+    # union は soft 確率で、閾値 0.5 で全面前景。
+    for mask in masks["frame_masks"].values():
+        assert np.issubdtype(np.asarray(mask).dtype, np.floating)
+        assert bool(np.all(mask >= 0.5))
 
 
 def test_movie_app_exposes_frame_selection_and_union_controls() -> None:

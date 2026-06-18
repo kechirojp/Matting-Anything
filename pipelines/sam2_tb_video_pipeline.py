@@ -32,6 +32,27 @@ def build_sam2_video_propagation_pipeline() -> Pipeline:
     return pipeline
 
 
+def build_tb_only_video_pipeline() -> Pipeline:
+    """背景除去モデル(transparent-background)のみで動画を処理する軽量 Pipeline を構築する。
+
+    SAM2 追跡・所有権解決・tracking overlay を含まず、各フレームを mask 無しで全画面 tb に
+    渡す。グリーンバックや単一 salient 対象など、追跡なしで背景除去だけで足りる用途向け。
+    ``TransparentBGVideoExtractor`` は ``masks`` 未接続（None）のとき各フレームを mask=None で
+    処理し全画面を tb に渡すため、crop も guard も行わない。
+    """
+    pipeline = Pipeline()
+    pipeline.add_component("video_reader", VideoReader())
+    pipeline.add_component("transparent_bg_video", TransparentBGVideoExtractor())
+    pipeline.add_component("video_writer", VideoWriter())
+    pipeline.add_component("frame_sequence_writer", FrameSequenceWriter())
+
+    pipeline.connect("video_reader.frames", "transparent_bg_video.frames")
+    pipeline.connect("video_reader.metadata", "transparent_bg_video.metadata")
+    pipeline.connect("transparent_bg_video.matte", "video_writer.matte")
+    pipeline.connect("transparent_bg_video.matte", "frame_sequence_writer.matte")
+    return pipeline
+
+
 def build_sam2_tb_video_pipeline(propagator: SAM2VideoPropagator | None = None) -> Pipeline:
     """動画背景除去の end-to-end Pipeline を構築する。
 
@@ -42,6 +63,9 @@ def build_sam2_tb_video_pipeline(propagator: SAM2VideoPropagator | None = None) 
     pipeline = Pipeline()
     pipeline.add_component("video_reader", VideoReader())
     pipeline.add_component("sam2_video_propagator", propagator or SAM2VideoPropagator())
+    # OwnershipResolver inserted to convert per-object logits -> soft ownership maps
+    from .components.ownership_resolver import OwnershipResolver
+    pipeline.add_component("ownership_resolver", OwnershipResolver())
     pipeline.add_component("transparent_bg_video", TransparentBGVideoExtractor())
     pipeline.add_component("video_writer", VideoWriter())
     pipeline.add_component("frame_sequence_writer", FrameSequenceWriter())
@@ -51,7 +75,9 @@ def build_sam2_tb_video_pipeline(propagator: SAM2VideoPropagator | None = None) 
     pipeline.connect("video_reader.metadata", "sam2_video_propagator.metadata")
     pipeline.connect("video_reader.frames", "transparent_bg_video.frames")
     pipeline.connect("video_reader.metadata", "transparent_bg_video.metadata")
-    pipeline.connect("sam2_video_propagator.masks", "transparent_bg_video.masks")
+    # expect sam2_video_propagator to emit per-object logits under masks['per_object_logits']
+    pipeline.connect("sam2_video_propagator.masks", "ownership_resolver.masks")
+    pipeline.connect("ownership_resolver.masks", "transparent_bg_video.masks")
     pipeline.connect("transparent_bg_video.matte", "video_writer.matte")
     pipeline.connect("transparent_bg_video.matte", "frame_sequence_writer.matte")
     pipeline.connect("video_reader.frames", "tracking_overlay.frames")

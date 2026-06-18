@@ -73,7 +73,12 @@ def build_frame_mask_sequence(
     """frame index ごとの mask を FrameMaskSequence 契約 dict に変換する。"""
     normalized: dict[int, np.ndarray] = {}
     for frame_index, mask in frame_masks.items():
-        mask_array = np.asarray(mask).astype(bool)
+        mask_array = np.asarray(mask)
+        # soft 確率 mask（float）は [0,1] float32 のまま保持し、二値 mask は bool に正規化する。
+        if np.issubdtype(mask_array.dtype, np.floating):
+            mask_array = np.clip(mask_array, 0.0, 1.0).astype(np.float32)
+        else:
+            mask_array = mask_array.astype(bool)
         if mask_array.ndim != 2:
             raise ValueError(f"frame mask は (H,W) 形式である必要があります: frame={frame_index}, shape={mask_array.shape}")
         normalized[int(frame_index)] = mask_array
@@ -85,6 +90,56 @@ def build_frame_mask_sequence(
         "source": source,
         "metadata": dict(metadata or {}),
     }
+
+
+def composite_alpha_by_ownership(
+    per_object_alphas: Sequence[np.ndarray],
+    ownership: np.ndarray,
+) -> np.ndarray:
+    """対象ごと連続アルファを比較明（画素ごと max）で合成し最終アルファを得る（Phase2 ⑤）。
+
+    重ね合成の式::
+
+        alpha_final(p) = max_o alpha_o(p)   (o は前景対象 0..N-1)
+
+    所有権による加重和（Σ ownership_o × alpha_o）は、手前対象のアルファが 0（黒）の画素で
+    背後の残したい対象まで減衰させ黒く潰す欠点があった。比較明 max は対象ごとアルファの
+    最大値を採るため、どれか 1 対象でも前景なら最終アルファに残り、対象同士の重なりで
+    黒抜けが起きない。
+
+    ``ownership`` は形状検証（前景チャネル数 N と per_object_alphas の数の一致）にのみ使う。
+    合成自体は max なので所有権の重みは乗じない。
+
+    Args:
+        per_object_alphas: 長さ N の list。各要素は (H,W) float [0,1] の対象ごと連続アルファ。
+        ownership: (N+1,H,W) float。最終チャネルが背景、先頭 N チャネルが前景対象の所有権。
+            合成には使わず、チャネル数で対象数 N を検証するためだけに参照する。
+
+    Returns:
+        (H,W) float32 の最終アルファ（[0,1] に clip 済み）。
+
+    Raises:
+        ValueError: per_object_alphas の数が ownership の前景チャネル数 (N) と一致しない場合。
+    """
+    ownership_arr = np.asarray(ownership, dtype=np.float32)
+    if ownership_arr.ndim != 3:
+        raise ValueError(f"ownership は (N+1,H,W) 形式が必要です: shape={ownership_arr.shape}")
+    num_objects = ownership_arr.shape[0] - 1
+    if len(per_object_alphas) != num_objects:
+        raise ValueError(
+            f"per_object_alphas の数 ({len(per_object_alphas)}) が前景対象数 ({num_objects}) と一致しません。"
+        )
+    height, width = ownership_arr.shape[1:]
+    alpha_final = np.zeros((height, width), dtype=np.float32)
+    for obj_index in range(num_objects):
+        alpha_o = np.clip(np.asarray(per_object_alphas[obj_index], dtype=np.float32), 0.0, 1.0)
+        if alpha_o.shape != (height, width):
+            raise ValueError(
+                f"per_object_alphas[{obj_index}] の形状 {alpha_o.shape} が ownership {(height, width)} と一致しません。"
+            )
+        # 比較明（lighten）: 画素ごとに対象アルファの max を採り、黒抜けを防ぐ。
+        alpha_final = np.maximum(alpha_final, alpha_o)
+    return np.clip(alpha_final, 0.0, 1.0).astype(np.float32)
 
 
 def normalize_rgba_frame(frame: np.ndarray) -> np.ndarray:

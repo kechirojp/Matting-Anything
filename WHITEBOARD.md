@@ -8,9 +8,173 @@
 
 | 項目 | 内容 |
 |------|------|
-| **作業中のタスク** | 動画/静止画 UI 巻き戻り復旧（シーク・複数bbox・mask union・設定簡素化）+ git stash 事故回収 — ✅ 完了 |
-| **最終更新日** | 2026-06-15（UI巻き戻り復旧: HEAD復元+RED再実装でGREEN、Playwright実行時検証、stash安全回収・削除） |
+| **作業中のタスク** | 実動画（グリーンバック・ドラマー）致命バグ4件の段階的改修（計画書 `計画書/2026-06-18_動画背景除去_致命バグ4件_改修計画.md`）。**Phase 1（guard 半透明化 S2）✅ 完了**。**合成方式を比較明（max）へ変更 ✅ 完了**（per_object 黒抜け対策）。**背景除去のみ (tb only) 動画経路 ✅ 完了**（追跡不要ケース向け軽量経路）。Phase 4（point/背景）は **静的監査で反転バグを否定**し計測ツール `--diagnose` 実装済み。次は ユーザー実機計測 → Phase 2（per_object 仕上げ）→ Phase 3（双方向サンプリング）。残課題: DINO/SAM2 prompt 必須化（positive point vs 乗算 guard 調査）。 |
+| **最終更新日** | 2026-06-18（背景除去のみ tb-only 動画経路を追加。`build_tb_only_video_pipeline` + 2タブ UI + `run_tb_only_background_removal`。RED→GREEN、非 integration **188 passed**、`--help` smoke 正常、サブエージェントレビュー APPROVE。実機 GPU 検証は未実施。） |
 ---
+
+## 直近完了タスク: 背景除去のみ (tb only) 動画経路を追加（2026-06-18, high）
+- **依頼（ユーザー命令、逐語）**: 「Transparent bgオンリーの経路作っておく … 背景除去モデルのみの運用で事足りることも多分ある グリーンバックとかさ … 除去モデルのみの経路作ったほうがいいよな」。
+- **目的**: SAM2/GroundingDINO を使わず transparent-background モデルのみで動画を全画面処理する軽量経路。グリーンバック・単一 salient 対象など追跡不要なケース向け。
+- **変更点**:
+  - `pipelines/sam2_tb_video_pipeline.py`: `build_tb_only_video_pipeline()` を新設。配線は `video_reader → transparent_bg_video → (video_writer, frame_sequence_writer)`。masks ソケット未接続のため `mask=None` → 全フレーム全画面 tb（crop/guard/所有権合成/overlay なし）。既存 `build_sam2_tb_video_pipeline` は不変。
+  - `gradio_app_sam2_transparent_BG_haystack_for_Movie.py`:
+    - 新コールバック `run_tb_only_background_removal`（prompt/SAM2 入力なし、6-tuple 返却、`gr.Error` で通知）。
+    - `get_tb_only_pipeline()` lazy 初期化（global `_TB_ONLY_PIPELINE`）。
+    - UI を `with gr.Tabs():` で「SAM2 追跡 + 背景除去」「背景除去のみ (tb only)」の2タブ化。tb-only タブのコンポーネントは全て `tb_only_*` プレフィックス（SAM2 タブと衝突なし）。tb-only には crop_padding / overlay なし。
+- **テスト（RED→GREEN）**: `tests/unit/test_video_pipeline_wiring.py` に `test_tb_only_video_pipeline_builds_without_sam2`（パイプライン構造）と `test_movie_app_exposes_tb_only_tab_and_callback`（UI source 文字列）を追加。**非 integration 188 passed / 1 skipped / 3 deselected**。`--help` smoke 正常（Blocks 構築成功）。
+- **レビュー**: サブエージェント（Explore）APPROVE（Blocker なし）。crop_padding/mask_guard_feather 省略は mask=None で未使用のため機能影響なし、意図コメント付与済み。
+- **未検証メモ**: 実機での tb-only 出力品質は GPU 環境で要確認（.venv に torch/transparent-background なし）。Playwright によるタブ切替実行時検証は未実施（必要なら別途）。
+
+---
+
+## 過去タスク: 合成方式を比較明（lighten / max）に変更（2026-06-18, high）
+- **依頼（ユーザー命令、逐語）**: 「乗算じゃダメだ 手前のオブジェクトを重ねたとき マスクに黒があれば背後のオブジェクトも黒になる たとえ残しておきたい人物でも黒で塗りつぶされる 四の五の言わず比較明でやれ」→「合成方法 比較明にしなさい」。
+- **対象**: `pipelines/components/video_common.py` の `composite_alpha_by_ownership`（per_object モードの最終アルファ合成）。
+- **変更**: 旧 所有権加重和 `alpha_final = Σ_o ownership_o × alpha_o` → 比較明 `alpha_final = max_o alpha_o`（画素ごと max）。`ownership` 引数は合成に乗じず、前景チャネル数 N と per_object_alphas 数の一致検証にのみ使用。docstring 全面刷新。
+- **理由**: 加重和は対象が重なる画素で手前対象のアルファが 0（黒）のとき背後の残したい対象まで減衰し黒く潰す。max ならどれか 1 対象でも前景なら最終アルファに残り黒抜けしない。
+- **テスト（RED→GREEN）**: `tests/unit/test_per_object_composite.py` を max 仕様へ書換（`test_composite_lighten_keeps_object_even_when_other_is_zero` 等 6 件）。RED 3 失敗→実装後 GREEN。`test_video_per_object_frame.py` も pass。**非 integration 187 passed / 1 skipped / 3 deselected**。
+- **影響範囲**: per_object 経路のみ（既定 video_matte_mode）。union 経路（model_components.py L687 `full_alpha * guard`）は別機構（形状ゲート）で、本変更の対象外。ユーザーの不満は「重なる対象の黒抜け」＝per_object 合成なので対象は本関数に限定。
+- **レビュー**: サブエージェント（Explore）APPROVE。指摘は REFERENCE.md L415 の旧式（Σ加重和）記載の陳腐化のみ → **修正済み**。
+- **重要な切り分け（再掲・ハルシネーション防止）**: 比較明化は合成品質の正当な改善だが、**実機の壊れた出力（overlay 背景青／alpha 輪郭のみ）の根本原因ではない**。根本原因は「全画面 box のみ・text/point prompt なし」で SAM2 に人物位置の手掛かりが無く背景形状 mask を返したこと（prompt/入力問題、SAM2 ラッパーのバグではない／反転バグも否定済み）。実機修正には適切な prompt（DINO テキスト検出 or 人物 box）が必要。
+
+---
+
+## 過去タスク: Phase 1 — guard 半透明化（S2）修正（2026-06-18, high）
+
+- **症状（ユーザー報告 S2）**: 人体が得意なはずの transparent-background の人物アルファが半透明。トラッキング領域全体の信頼度をアルファに変えている懸念（本来は境界の信頼度であるべき）。
+- **根本原因**: `model_components.py TransparentBGExtractor.run` の `full_alpha = full_alpha * guard`。union モードで `OwnershipResolver` が frame_masks を「前景 soft = 1 − 背景所有権」という領域全体の連続確率に差し替え、その float mask が `soft_probability_guard` 経由で内部も 1.0 未満になり tb の人物アルファ内部を減衰。
+- **対処**: guard 分岐を「float/binary 型」ではなく `mask_guard_feather` の有無で分岐。既定（feather=0）は float/binary 問わず `dilate_binary_mask`（内部 1.0・外部 0 の二値ゲート、float は 0.5 閾値で二値化）。feather>0 のときのみ soft guard をオプトイン。guard は形状外ゲートに徹し内部を削らない。
+- **テスト**: `tests/unit/test_transparent_bg_mask_guard.py` に `test_float_soft_mask_guard_keeps_interior_alpha_unscaled` / `test_float_soft_mask_guard_feather_opt_in_softens_edge` を追加。非 integration 180 passed/1 skipped。レビュー APPROVE。
+- **次フェーズ未着手メモ**: Phase 2〜4 は計測優先（ハルシネーション禁止）。config 既定は Phase 2 が GREEN になるまで union を維持。
+
+---
+
+## 過去タスク（参考・前セッション、※ per_object 既定化は revert 済み）: 実動画バグ調査＋エッジ実験（mask_feather=0 / per_object 既定化）（2026-06-18, medium）
+- **依頼（ユーザー報告の実バグ）**: グリーンバックのドラマー動画で「プロンプトした箇所がマスク/合成に反映されない箇所が多い」「素早いドラムスティック・前ボケのシンバルのエッジに半透明がかかりすぎ人物に被る」「一旦エッジ処理を切るのが良くないか」「処理フローを資料(box+pos/neg point per obj_id)と照合して再確認」「ハルシネーション対策もして」。
+- **フロー再確認の結論**:
+  - point 所有権は**バグではない**。`SAM2VideoPropagator` は `assign_points_to_boxes(points, boxes)` で各 point を最近傍 box に割当て、その box の `add_new_points_or_box(box=, points=, labels=)` に統合（資料の box→同一 obj_id 要件を満たす）。
+  - 正直な制約: ある negative point が意図と別の box に幾何的に近いとそちらへ付く。ユーザーは「BBOX への所属は重なってもよい／どの BBOX 所属かという要件は無いに等しい」と明言 → point-obj_id 明示割当機構は**不要**（追加実装しない）。
+- **根本原因と是正**:
+  - (A) 欠落: union モードは大きな union bbox に対し tb を 1 回呼ぶ。tb は salient-object matting のため、SAM2 が追跡できていても細い/前ボケのスティック等を under-matte する。→ **per_object 既定化**（対象ごとに crop して tb の salient 前景として扱う）。
+  - (B) 過ソフトエッジ: tb の連続アルファは motion blur/前ボケを半透明として正しく matte する（=本質的なソフトさ）。これに `mask_feather=8` と union のソフトが加算。→ `mask_feather=0` ＋ **Alpha threshold スライダ手動調整**（ユーザーが自分で試す）で硬化。
+- **変更**:
+  - `config/inference_models.toml`: 全 background entry（tb_base/tb_fast/tb_base_nightly）の `mask_feather` 8→0、`video_matte_mode` union→per_object。コメント刷新（mask_feather=0 の意味、per_object（現行既定）、誤字「张実→忠実」修正）。
+  - `gradio_app_sam2_transparent_BG_haystack_for_Movie.py`: UI 手順テキストを per_object 既定＋union は軽量モード＋エッジ硬化は Alpha threshold へ更新。mask_feather=0 は guard 境界の Gaussian feather オフだが per_object の sigmoid 由来ソフトは残る旨を明記（ハルシネーション防止＝過大表現回避）。
+  - `run_video_matting_headless.py`: `--matte-mode` help の古い「既定 union」→「未指定時は config の video_matte_mode に従う。config 既定は per_object」。
+- **サブエージェントレビュー（Explore）指摘と対応**:
+  - HIGH（app/CLI の `.get(..., "union")` フォールバックが config 既定 per_object と矛盾）→ **据え置き判断**。全 entry が `video_matte_mode` を明示するためフォールバックは到達しないデッドパス。union はキー欠落/不正 config 時の**軽量・安全側**フォールバックとして意図的に維持。代わりに誤解を招く CLI help の「既定 union」表記を修正。
+  - HIGH（CLI help の古い「既定 union」）→ **修正済み**。
+  - MEDIUM（UI の mask_feather=0＝エッジ処理オフ が不正確）→ **修正済み**（Gaussian feather オフだが sigmoid ソフトは残ると明記、硬化は Alpha threshold）。
+  - LOW（フォールバックパスのテスト無し）→ デッドパスのため据え置き。
+- **テスト**: config 変更後 非 integration **178 passed, 1 skipped, 3 deselected**。doc 修正後 `test_jupytext_notebooks.py`+`test_headless_cli.py` **39 passed**。movie app `--help` / CLI `--help` exit 0。
+- **Playwright 実行時検証（ERR035）**: UI 変更は Markdown 手順テキストのみ（レイアウト/Canvas/イベント配線の変更なし）→ doc-only UI text のため Playwright 実行時検証は必須でない。実画質（per_object の欠落是正・Alpha threshold 硬化の効果）は GPU+動画でユーザー確認待ち。
+- **次アクション**: ユーザーが GPU 環境で per_object 既定＋Alpha threshold（≒0.5 目安）を手動調整し画質確認。Alpha threshold スライダ既定 0.0 は変更しない（手動チューニング前提）。
+---
+
+
+## 直近完了タスク: 動画アルファ処理フロー τ config化 + ヘッドレスCLI + レビュー修正（2026-06-17, medium）
+- **依頼**: Phase1 完了後の「進んでください」— τ を config 化し movie app から配線、ヘッドレス CLI 実行経路を追加、必須サブエージェントレビューと記録更新。
+- **実装**:
+  - τ config化: `config/inference_models.toml` の全 background entry（tb_base / tb_fast / tb_base_nightly）に `ownership_temperature = 1.0` を定義（τ 意味コメント付き）。ハードコード禁止に準拠。
+  - movie app 配線: `gradio_app_sam2_transparent_BG_haystack_for_Movie.py` が `bg_entry.get("ownership_temperature", 1.0)` を読み `pipeline.run` の `"ownership_resolver": {"temperature": ...}` へ渡す。
+  - ヘッドレス CLI: `run_video_matting_headless.py`（新規）— Gradio 非起動の end-to-end 検証経路。`--video`/`--box`/`--point`/`--tracker`/`--background`/`--temperature`(未指定で config)/`--output-mode` 等。`_parse_box`/`_parse_point`/`build_arg_parser`。GroundingDINO テキストは扱わず box/point 直接指定。`--video` 存在を fail-fast 検証。
+  - テスト: `tests/unit/test_headless_cli.py`（新規）— 引数解析、movie app の τ 配線 grep、全 background entry の τ 定義（>0）を検証。
+- **サブエージェントレビュー指摘と対応**:
+  - 中-1（根治）: `SAM2VideoPropagator` の forward/reverse 2pass マージが位置ベースで、pass 間で obj 数が変わると別 obj の logit が混入する潜在バグ。中間構造を `source_index → {obj_id → (H,W)}` に変更し、`target_object_ids` 順で整列して (N,H,W) を構築（欠損 obj は -1e6 埋め）。チャネル位置と obj_id を固定対応。
+  - 低-1: `OwnershipResolver.run` の未使用 `frames` 引数と docstring 不一致を削除・修正。
+  - 低-2: CLI の `--video` パス存在を `run` 冒頭で fail-fast。
+  - 中-2（overlay は生トラッキング可視化の仕様意図）/低-3/低-4 は仕様確認・任意改善として保留。
+- **テスト**: 非 integration **168 passed, 1 skipped, 3 deselected**。CLI `--help` exit 0、movie app `--help` exit 0、pipeline import OK。
+- **Playwright 実行時検証（ERR035）**: 変更は config 値・パイプライン内部パラメータ・CLI で UI レイアウト/Canvas/イベントの変更なし。movie app callback は τ 読込・配線のみ追加。実画質（τ 効果）は GPU+動画でユーザー確認が必要。
+---
+
+## 直近完了タスク: 動画アルファ処理フロー Phase2（対象ごと crop tb 合成）（2026-06-17, medium）
+- **依頼**: 「進めてください 背景除去精度が低ければ 再度 per_object で回すわ」「gradioUI にある背景除去手順がアップデートされてたらそれも変更お願いね」。ハルシネーション防止徹底。
+- **承認済み設計**: 合成式 `alpha_final(p) = Σ_{o=0..N-1} ownership_o(p) × alpha_o(p)`（RGB は元フレームのまま、アルファのみ合成）。モードは config `video_matte_mode`: `"union"`（既定・フレームあたり tb 1 回）/ `"per_object"`（オプトイン・フレームあたり tb N 回 = 忠実だが重い）。high-end GPU でも tb 呼び出し回数は減らないため既定 union。
+- **実装（RED→GREEN）**:
+  - 純粋ヘルパー: `pipelines/components/video_common.py` に `composite_alpha_by_ownership(per_object_alphas, ownership)` を追加。形状検証・[0,1] clip・長さ不一致 ValueError。GPU 非依存でテスト可能。
+  - per_object フレーム処理: `TransparentBGVideoExtractor._run_per_object_frame` を追加。各対象 logit を `stable_sigmoid` → soft mask で既存 `TransparentBGExtractor.run` を呼び（bbox 導出・crop・tb・full frame 配置・soft guard を再利用）対象ごとアルファを得て所有権合成。RGB は元フレーム保持。
+  - `run()` に引数 `video_matte_mode`（既定 "union"）追加。フレームループで logits/ownership が揃い per_object 指定時のみ per_object 経路、それ以外は従来 union 経路へフォールバック（後方互換）。matte メタデータに `video_matte_mode` 記録。
+  - config: 全 background entry に `video_matte_mode = "union"` + 意味コメント追加。
+  - 配線: movie app が `bg_entry.get("video_matte_mode", "union")` を読み `transparent_bg_video` へ渡す。CLI に `--matte-mode`（未指定で config 既定）追加。
+  - UI 手順テキスト更新: movie app の「処理順の考え方」を `フレーム取得 → DINO で候補生成 → SAM2 で対象ごとに prompt/追跡（logit 保持・2値化しない）→ 所有権解決（ピクセル softmax で重なりを各対象へ排他割当）→ 背景透過（連続アルファ）→ 所有権でアルファ合成` に刷新。union/per_object の意味も追記。
+  - テスト: `tests/unit/test_per_object_composite.py`（合成数学 5 件）、`tests/unit/test_video_per_object_frame.py`（extractor をモックし N 回呼び出し・合成一致・RGB 保持を検証）、`tests/unit/test_headless_cli.py` に `--matte-mode`・全 entry の `video_matte_mode`・movie app 配線 grep を追記、`tests/unit/test_jupytext_notebooks.py` の UI 手順 assert を更新。
+- **サブエージェントレビュー（Explore, thorough）**: 総評 APPROVE。高/中の指摘なし。低-1（`use_per_object` 判定の `np.asarray` 二重呼び出し）を `logits_array` 事前計算で修正。低-2（composite の二重 clip）は浮動小数丸め対策の防御的実装として据え置き。
+- **テスト**: 非 integration **178 passed, 1 skipped, 3 deselected**。CLI `--help` exit 0、movie app `--help` exit 0。
+- **Playwright 実行時検証（ERR035）**: UI 変更は Markdown 手順テキストのみ（レイアウト/Canvas/イベント配線の変更なし）。per_object 経路は config・パイプライン内部パラメータの追加で UI 構造に影響しない。実画質（per_object の精度向上）は GPU+動画でユーザー確認が必要。
+- **対象外/残**: パイプライン統合テスト + Playwright スモーク（GPU 実行を伴う検証）はユーザー環境での確認待ち。
+
+---
+
+## 直近完了タスク: 動画アルファ処理フロー logit保持リファクタ Phase1（2026-06-17, large）
+- **依頼**: DINO系(BBOX) → SAM2系 → 背景除去のアルファ処理フローを深く理解し、最重要点（box+補正点を同一 obj_id の1回呼び出しで結合）を確実化した上でフローをリファクタ。計画書を `計画書/` に timestamp 付きで保存。深度推定・静止画版は対象外。
+- **設計判断**:
+  - per-object logit 保持契約: `SAM2VideoPropagator.run` で `propagate_in_video` の per-object logit を `per_object_logits[frame_idx]=(N,H,W)` として収集。`np.maximum` union は廃止せず overlay/後方互換用の union soft `frame_masks`（`stable_sigmoid`→画素 max）として派生し、FrameMaskSequence に `per_object_logits` を同梱。
+  - `OwnershipResolver`（新規 Component）: `masks` を受け per-object logits に背景 logit=0 チャネルを加えた温度 τ softmax で画素ごと所有権（和=1）を算出。前景 soft = 1-背景所有権 を `frame_masks` に差し替え、`ownership` も同梱して下流へ渡す。単一 obj 画素は sigmoid 相当、重なり画素のみ softmax 分配。
+  - transparent-background は従来の soft `frame_masks`（H,W float[0,1]）を guard として受ける契約を維持（`Remover.process` はマスク入力不可のため extractor 側で guard 乗算）。
+- **実装ファイル**:
+  - `pipelines/components/ownership_resolver.py`（新規）: `_softmax_across_objects`（temperature>0 検証, axis=0 安定 softmax）, `OwnershipResolver.run(masks, frames, temperature)`。
+  - `pipelines/components/video_model_components.py`: `SAM2VideoPropagator.run` を per-object logit 収集 + union soft 派生 + `masks["per_object_logits"]` 同梱へ変更。box+点の同一 obj 結合（`assign_points_to_boxes`）は維持。
+  - `pipelines/sam2_tb_video_pipeline.py`: `OwnershipResolver` を propagator↔extractor 間に挿入、`sam2_video_propagator.masks→ownership_resolver.masks→transparent_bg_video.masks` で配線。overlay は propagator.masks を継続使用。
+  - `pipelines/components/model_components.py`: 一時導入した ownership-dict 受理ハックを撤去し、soft frame_masks 受理契約に戻す。
+  - `tests/unit/test_ownership_resolver.py`（新規）: softmax 安定性（和=1）、N+1 チャネル、前景 soft=1-背景、metadata 引継ぎを検証。
+- **テスト**: 非 integration **161 passed, 1 skipped, 3 deselected**。`test_video_pipeline_wiring.py` の既存契約（`metadata`/`object_ids`/soft union `frame_masks`）は union 派生維持で GREEN。movie app `--help` exit 0、pipeline import OK。
+- **Playwright 実行時検証（ERR035）**: 変更はバックエンド Component 層（logit 保持・所有権 softmax・配線）で UI 配線・Canvas・イベント変更なし。実画質（所有権ゲートの継ぎ目線消滅・τ の効果）は GPU+動画でユーザー確認が必要。
+- **対象外/残**: Phase2（対象ごと crop tb 合成）、τ の config 化と movie app 配線、ヘッドレス CLI 実行経路は未着手。計画書: `計画書/2026-06-17_動画アルファ処理フロー_logit保持リファクタ実装計画.md`。
+
+
+
+## 直近完了タスク: 継ぎ目線+点未反映の根治（修正1 最近傍box割当 + 修正2 soft合成）（2026-06-16, large）
+- **依頼**: `報告書\...16_old.md` と `調査\2026-06-16_背景除去マスク継ぎ目線_根本原因調査.md` を読み、§2.5「今回の修正案を実施すること」を実装。ユーザー確定スコープ: 修正1=「最近傍box割当（方針1）のみ」、修正2=「ソフト合成＋末端feather（根治）」、修正3（奥行き）は対象外。
+- **根本原因**:
+  - 点未反映: `SAM2VideoPropagator` が全 point を1つの追加 obj にまとめていた。SAM2 は複数インスタンスを1 mask で表現できず point が union から落ちる（前タスク方針A の限界）。
+  - 継ぎ目線（消える線）: 各 obj を早期に二値化（`logits>0.0`）し binary OR で union → 境界がずれた継ぎ目に黒線。さらに二値 guard を tb alpha に乗算して継ぎ目線を出力に焼き込んでいた。
+- **設計判断**:
+  - 修正1（最近傍box割当）: `assign_points_to_boxes(points, boxes)` で各点を矩形距離最小の box に割当て、その box の `add_new_points_or_box(box=..., points=..., labels=...)` に同梱。positive 点は最寄り box を補強、negative 点は box 内部をくり抜く。追加 obj を作らない。
+  - 修正2（soft合成＋末端feather, 根治）: 各 obj を二値化せず `stable_sigmoid(logits)` で確率化し `np.maximum` で union（forward/reverse も max 統合）。契約を float32[0,1] のまま `build_frame_mask_sequence`→extractor へ疎通。最終 guard は `soft_probability_guard`（grayscale closing で継ぎ目谷を橋渡し + GaussianBlur で末端 feather、二値化なし）。`max(probA,probB)>=0.5 ⟺ binaryA OR binaryB` のため閾値0.5の後方互換は保たれる。
+- **実装ファイル**:
+  - `pipelines/components/common.py`: 新規 `stable_sigmoid`（overflow 回避の数値安定 sigmoid）, `assign_points_to_boxes`（最近傍box割当, 空入力で各obj空リスト）, `soft_probability_guard`（closing+gaussian feather, [0,1] float32）。`render_tracking_overlay_frame` を float mask は `>=0.5` 閾値、bool は従来通りに分岐。
+  - `pipelines/components/video_common.py`: `build_frame_mask_sequence` を float 入力時 `clip(0,1).astype(float32)` 保持、bool 入力時は従来 bool（後方互換維持）。
+  - `pipelines/components/video_model_components.py`: `SAM2VideoPropagator.run` 修正1（`point_group_obj_id` 廃止→`assign_points_to_boxes` で box ごとに点同梱）・修正2（binary OR→`stable_sigmoid`+`np.maximum` soft union）。
+  - `pipelines/components/model_components.py`: `TransparentBGExtractor.run` を float(soft確率)/bool 両対応。float は `mask_soft=clip(0,1)`, `mask_binary=soft>=0.5`（has_mask/bbox 判定用）、guard は `soft_probability_guard`。bool は従来パス（feather>0 で `feather_binary_mask`、それ以外 `dilate_binary_mask`）。
+- **テスト**: RED→GREEN。`test_common_components.py` に5件（最近傍box割当/空入力/stable_sigmoid/soft guard中間値保持/継ぎ目谷橋渡し）、`test_video_pipeline_wiring.py` の propagator テスト2件を soft float・最近傍割当へ更新、`test_transparent_bg_mask_guard.py` に2件（float mask の soft guard・bbox 閾値0.5）。全非 integration **159 passed, 1 skipped, 3 deselected**。両アプリ smoke `--help` exit 0。
+- **レビュー**: サブエージェント Explore レビュー「PASS（軽微改善推奨）」。assign_points_to_boxes の矩形距離・空入力、soft union/guard の値域[0,1]、float/bool 分岐の完全性、build_frame_mask_sequence の bool 後方互換すべて正確と確認。`guard` 分岐は `if apply_mask_guard and has_mask:` でガードされ全パスで定義されるため NameError なし。指摘の `soft_probability_guard` 冗長 clip は防御目的で許容（負荷無視できる）。
+- **Playwright 実行時検証（ERR035）**: 本タスクの変更はバックエンド Component 層（点割当・union・guard）で、UI 配線・Canvas・イベントの変更なし。前タスクで UI 描画/Point mode 登録は検証済み。propagator/extractor は monkeypatch stub の単体テストで検証。**soft guard/feather の視覚品質（継ぎ目線の消滅・末端の自然さ）は実画像/動画のモデル実行（checkpoints+GPU）が必要なため、UI 描画＋単体テストでの検証に留める。実素材での見た目確認はユーザーの GPU 実行で要確認。**
+- **対象外**: 修正3（奥行き推定による前後関係制御）はユーザー指示により本タスク対象外（事前計測が必要）。
+- **ERROR_LOG**: ERR043（点未反映の根治: 最近傍box割当）, ERR044（継ぎ目線の根治: soft合成＋末端feather）を追記。
+
+
+
+## 直近完了タスク: 2値エッジ解消（union マスク feather + tb alpha 乗算）（タスク2, 2026-06-15, medium）
+- **依頼**: 「マスクのエッジがグラデーションと2値（ブラック/ホワイト）の2種類ある＝transparent-background と SAM2/SAMURAI mask の合成を意味する。2値エッジは避けるべき。union マスク+point 領域を tb に渡すのが良いか」。ユーザー確定方針: 「sam2/samurai の統合された二値化マスクを feather、そのマスクを transparent-background に入力」。強度は config/*.toml で制御。
+- **根本原因（ERR042）**: `TransparentBGExtractor.run` の最終 alpha = tb の連続 gradient alpha × **二値 guard**（`dilate_binary_mask`, 0/1）。二値 guard が mask 境界で tb の gradient を硬く切断し、黒/白の2値エッジを生む。guard を外すと ERR039（横一直線切れ）が再発するため除去不可。
+- **技術的制約**: `transparent_background.Remover.process` は画像のみ受け取りマスク入力（ヒント）を受け付けない。よって「feather マスクを tb に入力」を文字通り画像前処理で行うと tb の salient 検出を阻害する。代わりに **feather した union マスクを tb 出力 alpha に乗算**（＝二値 guard の feather 版）することでユーザー意図（feather で領域制限・2値縁解消）を tb 精度を落とさず実現。
+- **設計判断**: 新規 `feather_binary_mask(mask, dilate_size, feather_radius)`（`pipelines/components/common.py`）を追加。`feather_radius<1` で従来二値（後方互換）、`>=1` で `effective_dilate=max(1,min(dilate_size,feather_radius))` で軽く dilate した base 境界を中心に符号付き距離変換で ±feather_radius を 0↔1 遷移させた float32 soft guard を返す。遷移帯が mask 境界（=tb 前景 alpha 境界）に重なり中間 alpha を生むのがポイント（dilate を大きくし過ぎると遷移帯が前景外に出て中間値が消えるため effective_dilate で抑制）。
+- **実装**:
+  - `TransparentBGExtractor.run`: 引数 `mask_guard_feather:int=0` 追加。`>0` で feather guard、`==0` で従来二値。metadata に `mask_guard_feather` 記録。
+  - `SAM2GuardFilter.run`: 引数 `feather:int=0` 追加。同分岐。
+  - `TransparentBGVideoExtractor.run`: `mask_guard_feather:int=0` 追加し extractor へ伝播（動画版は extractor が最終段のため soft guard ×1 回で完結）。
+  - `config/inference_models.toml`: `[[background]]` 各 entry に `mask_feather=8`。
+  - 動画 UI（`...for_Movie.py`）: `bg_entry.get("mask_feather",0)` を `transparent_bg_video` へ渡す。
+  - 静止画 UI（`...haystack.py`）: `entry.get("mask_feather",0)` を extractor へ渡し、**feather>0 のとき `sam2_guard` を enabled=False** にして二重 guard（soft×二値で2値エッジ再発）を回避。最終 alpha/rgba/preview は extractor の feather 済み出力で整合。
+- **テスト**: RED→GREEN。`tests/unit/test_transparent_bg_mask_guard.py` に6件追加（extractor feather で境界中間値・metadata、feather=0 で二値後方互換、SAM2GuardFilter feather、helper の連続値/二値、極端 feather_radius+極小 mask の範囲保持、空 mask で全0）。全非 integration **150 passed, 1 skipped**。両アプリ smoke `--help` exit 0。
+- **レビュー**: サブエージェント Explore レビュー「承認（軽微改善推奨）」。正確性/後方互換/二重guard回避/動画整合/規約すべて良好。指摘の docstring（feather_radius 推奨値ガイドライン）と極端ケーステストを反映。distanceTransform 飽和は既定値8で安全と確認。
+- **Playwright 実行時検証（ERR035）**: 静止画版（port 7862）を起動し UI 描画（タイトル / Input Image / Prompt Canvas / Run transparent-background ボタン / model dropdown / 各 accordion）を確認、配線変更で UI 破綻なしを検証。font 404 は Gradio static の既知無害警告。**feather の視覚的品質は実画像/動画のモデル実行（checkpoints+GPU）が必要なため、UI 描画＋単体テストでの検証に留める。実素材での見た目確認はユーザーの GPU 実行で要確認。**
+- **ERROR_LOG**: ERR042 を追記。
+
+
+## 直近完了タスク: 動画 SAM2 box+point 併用で point 無視を修正（タスク1, 2026-06-15, medium）
+- **依頼**: 「文字プロンプト→BBOX→BBOX融合まで完了確認。しかし point prompt（ネガティブ/ポジティブ）の追跡ができていない。まずタスク1（point追跡）を完了させる。その後タスク2（2値エッジ/マスク合成見直し）に着手」。
+- **根本原因（ERR041）**: `SAM2VideoPropagator.run`（`pipelines/components/video_model_components.py`）の `if boxes:` 分岐が box のみ登録し points/labels を渡していなかった。`apply_selected_boxes` は `state["boxes"]` 設定時に `state["points"]` をクリアしないため box と point が共存するが、propagator が point を黙殺。UI 層（`select_sam2_prompt`）は正常で欠陥は propagator のみ。
+- **設計判断（方針A）**: box 群を obj 1..N、point 群を追加 obj N+1 として登録し全 obj を OR 統合（負点は point 群 obj 内で除外）。union ロジックは既に `target_object_ids` を走査するため追加 obj も自動 union。`else`（point のみ/単一 box）分岐は未変更で後方互換維持。
+- **実装**: `target_object_ids` に `point_group_obj_id = len(boxes)+1`（boxes と points 両方ある時）を追加。`if boxes:` 登録後に point 群を `add_new_points_or_box(obj_id=point_group_obj_id, points=..., labels=...)` で登録。
+- **テスト**: RED→GREEN。新規 `test_sam2_video_propagator_registers_point_group_with_boxes`（torch 未導入のため `monkeypatch` で `inference_mode` のみ stub 注入）。box2つ+point群1つの計3登録、point 群 obj_id=3・labels=[1,0]、metadata の points/labels 保持、排他領域 OR で union 全面 True を検証。全非 integration **146 passed, 1 skipped**。動画版 smoke `--help` exit 0。
+- **レビュー**: サブエージェント Explore レビュー実施。正確性/後方互換/union guard/Hard Rules/テスト品質すべて「APPROVED」。指摘の nit「union 検証が all-1s で弱い」を受け、各 obj を排他領域（左/中/右 1/3）に分割し point 群 obj が穴を埋めて全面 True になることまで検証するよう強化。
+- **Playwright 実行時検証（ERR035）**: 動画版（port 7861）で Point mode 切替→positive/negative ラジオ表示、positive 点登録（`Point selected: (319,209), label=positive`）、negative 点登録（`label=negative`）を確認。propagator 修正はバックエンドで単体テスト検証済み（実伝搬は GPU/動画が必要なため UI 登録経路の検証に留める）。
+- **既知の無害警告**: Canvas select 時に Gradio が `Too many arguments provided for the endpoint` を出すが point 登録は正常動作。本タスクのバックエンド変更とは無関係の既存警告。
+- **ERROR_LOG**: ERR041 を追記。
+- **残課題（タスク2）**: マスクエッジの2種類（グラデーション + 2値ブラック/ホワイト）問題。transparent-background と SAM2/SAMURAI mask の合成が2値エッジを生む仮説。union マスク+point prompt 領域のみを transparent-background へ渡す案を調査・実装予定。ERR039 の mask guard と関連。
+
 
 ## 直近完了タスク: 動画/静止画 UI 巻き戻り復旧 + git stash 事故回収（2026-06-15, large）
 - **依頼**: ユーザー報告の動画 UI 退行3件「1: フレームのシーク機能 / 2: 文字プロンプトで複数 bbox が反映されず1つだけ / 3: mask union 統合未済」を原因説明の上で修正。「一ヶ月前ほどに巻き戻ったことは大問題」。承認タスク: (1)静止画/notebook 退行修正, (3)冗長stash削除, (4)Playwright検証。**(2)再出現した11個の.md削除は未承認のため据置**。

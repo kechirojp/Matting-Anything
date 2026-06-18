@@ -366,7 +366,8 @@ def test_sam2_movie_ui_auto_loads_first_frame_and_simplifies_settings() -> None:
     assert 'max_frames = gr.Slider(1, 2000, value=30' in app_source
     assert "SAM2 Prompt Canvas" in app_source
     assert "対角 2 点" in app_source
-    assert "フレーム取得 → DINO で候補生成 → SAM で prompt / tracking → 背景透過" in app_source
+    assert "フレーム取得 → DINO で候補生成 → SAM2 で対象ごとに prompt / 追跡" in app_source
+    assert "所有権でアルファ合成" in app_source
     assert "パラメーター" in app_source
 
 

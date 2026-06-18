@@ -22,6 +22,72 @@ from pipelines.components.common import (
     select_candidate_masks,
     union_masks,
 )
+from pipelines.components.common import (
+    assign_points_to_boxes,
+    soft_probability_guard,
+    stable_sigmoid,
+)
+
+
+def test_assign_points_to_boxes_assigns_each_point_to_nearest_box() -> None:
+    """修正1: 各点を box 内包/最近傍で obj_id 1..N に割り当てる。"""
+    boxes = [[0, 0, 2, 3], [3, 0, 5, 3]]
+    points = [[1, 1], [4, 2], [10, 1]]
+
+    assignment = assign_points_to_boxes(points, boxes)
+
+    # box1(obj_id=1) に点(1,1)、box2(obj_id=2) に点(4,2) と遠方の(10,1)（最近傍=box2）。
+    assert assignment[1] == [0]
+    assert assignment[2] == [1, 2]
+
+
+def test_assign_points_to_boxes_empty_points_returns_empty_lists() -> None:
+    """点が無い場合は各 box に空リストを返す。"""
+    boxes = [[0, 0, 2, 3], [3, 0, 5, 3]]
+
+    assignment = assign_points_to_boxes([], boxes)
+
+    assert assignment == {1: [], 2: []}
+
+
+def test_stable_sigmoid_maps_logits_to_probability() -> None:
+    """修正2: logit→確率[0,1]。logit=0 で 0.5、大値で 1 に漸近。"""
+    logits = np.array([[-100.0, 0.0, 100.0]], dtype=np.float32)
+
+    prob = stable_sigmoid(logits)
+
+    assert prob.shape == logits.shape
+    assert prob[0, 0] < 1e-3
+    assert abs(prob[0, 1] - 0.5) < 1e-6
+    assert prob[0, 2] > 1.0 - 1e-3
+    assert np.all((prob >= 0.0) & (prob <= 1.0))
+
+
+def test_soft_probability_guard_keeps_intermediate_values_no_hard_binary() -> None:
+    """修正2: 確率マスクから中間値を持つ soft guard を生成し、二値にしない。"""
+    prob = np.zeros((40, 40), dtype=np.float32)
+    prob[10:30, 10:30] = 1.0  # 中央ブロックのみ確信
+
+    guard = soft_probability_guard(prob, dilate_size=5, feather_radius=4)
+
+    assert guard.dtype == np.float32
+    assert np.all((guard >= 0.0) & (guard <= 1.0))
+    # 内部はほぼ 1、外部は 0、境界に中間値が存在（feather）。
+    assert guard[20, 20] > 0.9
+    assert guard[0, 0] < 0.1
+    intermediate = guard[(guard > 0.05) & (guard < 0.95)]
+    assert intermediate.size > 0
+
+
+def test_soft_probability_guard_bridges_thin_seam_valley() -> None:
+    """修正2: 複数マスク統合の継ぎ目（細い谷）を closing で soft に埋める。"""
+    prob = np.ones((20, 21), dtype=np.float32)
+    prob[:, 10] = 0.0  # 縦に 1px の継ぎ目谷
+
+    guard = soft_probability_guard(prob, dilate_size=5, feather_radius=2)
+
+    # 継ぎ目谷は黒線（0）のまま残さず、中央も不透明側に持ち上げられる。
+    assert guard[10, 10] > 0.5
 
 
 def test_ensure_rgb_array_uses_image_editor_background_and_drops_alpha() -> None:

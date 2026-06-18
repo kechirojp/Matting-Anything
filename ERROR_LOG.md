@@ -32,6 +32,32 @@
 
 ## エラー一覧
 
+### [ERR-VID-GUARD] 動画背景除去：人物マスクが半透明化する（guard が内部を削る）【Phase1 修正済】
+
+| 項目 | 内容 |
+|------|------|
+| **深刻度** | High |
+| **頻度** | union モードで頻発 |
+| **初回発生日** | 2026-06-18 |
+
+**エラー内容**:
+人体が得意なはずの transparent-background の人物アルファが半透明になる。トラッキング領域全体の信頼度がアルファに反映されているように見える。
+
+**原因**:
+`TransparentBGExtractor.run`（pipelines/components/model_components.py）の `full_alpha = full_alpha * guard`。union モードで `OwnershipResolver` が frame_masks を「前景 soft = 1 − 背景所有権」という**領域全体の連続確率**に差し替え、その float mask が guard 生成時に `soft_probability_guard` を経由して**領域内部も 1.0 未満**になり、tb の人物アルファ内部に乗算されて半透明化。guard は本来「形状外の漏れ alpha を 0 にするゲート」であるべきで、内部の信頼度を掛けるのは設計誤り。
+
+**対処法**:
+guard 分岐を「mask が float か binary か」ではなく **`mask_guard_feather` の有無**で分岐。
+- `mask_guard_feather > 0`：soft guard（オプトイン。float→`soft_probability_guard`／binary→`feather_binary_mask`）。
+- `mask_guard_feather <= 0`（既定）：float/binary を問わず **`dilate_binary_mask`（内部 1.0・外部 0 の二値ゲート）**。float は 0.5 閾値で二値化。
+
+これで guard は形状外ゲートに徹し、tb の連続アルファ内部を一切減衰させない。
+
+**備考**:
+- テスト追加: `tests/unit/test_transparent_bg_mask_guard.py`（`test_float_soft_mask_guard_keeps_interior_alpha_unscaled` / `test_float_soft_mask_guard_feather_opt_in_softens_edge`）。
+- 検証: 非 integration 全体 180 passed / 1 skipped。サブエージェントレビュー APPROVE。
+- 教訓: guard は「拡張(dilate)／形状外ゲート」のみ。内部を乗算で削るのは禁止。根本原因はコード計測で確定してから対処する。
+
 ### [ERR001] Gradio 5 で `block = block.queue()` が None を返す
 
 | 項目 | 内容 |
@@ -1308,6 +1334,118 @@ hydra.errors.MissingConfigException: Cannot find primary config 'configs/samurai
 - 巻き戻りの正本は**テスト**。RED テストが残っていれば、ソース実装が失われても再実装の指針になる（今回はこれで全機能を復元できた）。
 - UI/配線の「fixed/完了」は ERR035 に従い Playwright 実起動で実行時検証してから記録する（今回 `prompt-frame-idx` シーク・複数 bbox CheckboxGroup・処理順表示・`movie-frame-step` のレンダリングを Playwright で確認済み）。
 
+---
+
+### [ERR041] 動画 SAM2 追跡で box と point prompt を併用すると point（positive/negative）が無視される
+
+| 項目 | 内容 |
+|------|------|
+| **深刻度** | High |
+| **頻度** | box 群と point 群を同時指定した時に常発 |
+| **初回発生日** | 2026-06-15 |
+| **関連ファイル** | `pipelines/components/video_model_components.py`, `gradio_app_sam2_transparent_BG_haystack_for_Movie.py`, `tests/unit/test_video_pipeline_wiring.py` |
+
+**エラー内容**:
+文字プロンプト → bbox 候補 → bbox union までは追跡できるが、その後 Point mode で positive/negative の補正点を追加しても **point が追跡に反映されない**。UI 上の Prompt Status には点が登録され（`Point selected: ..., label=positive/negative`）、`state["points"]/["labels"]` にも保持されるのに、伝搬結果の mask へ寄与しない。
+
+**原因**:
+`SAM2VideoPropagator.run`（`pipelines/components/video_model_components.py`）の登録分岐が `if boxes:` の時に **box のみを `add_new_points_or_box(box=...)` で登録し、points/labels を一切渡していなかった**。`apply_selected_boxes`（テキスト/候補フロー）は `state["boxes"]` を設定する際に `state["points"]` をクリアしないため box と point が共存するが、propagator 側が box 分岐に入ると point が黙って捨てられていた。UI 層（`select_sam2_prompt`）は正常で、欠陥は propagator のみ。
+
+**対処法（方針A: box 群と point 群をそれぞれ追跡対象 obj として登録し全て OR 統合）**:
+- `target_object_ids` 構築時、`boxes` と `points` が両方あれば point 群用に `point_group_obj_id = len(boxes) + 1` を割り当てて `target_object_ids` に追加する。
+- `if boxes:` 登録ブロックで各 box を obj 1..N として登録した後、`point_group_obj_id` があれば `add_new_points_or_box(obj_id=point_group_obj_id, points=..., labels=...)` で point 群（positive=前景／negative=除外）を追加 obj として登録する。
+- union ロジックは既に `target_object_ids` を走査して OR 統合するため、追加した point 群 obj も自動で union される。
+- `else`（point のみ／単一 box／object_id）分岐は**未変更**で後方互換を維持。
+
+**再発防止**:
+- Component 境界の I/O 契約（points/labels/box/boxes を全て受理し漏れなく登録）を崩さない。一方の prompt 種別だけを処理する分岐は片方を黙殺しやすい。
+- TDD: boxes+points 併用時に point 群が obj N+1 として登録され union されることを検証する RED テスト（`test_sam2_video_propagator_registers_point_group_with_boxes`）を先に追加してから修正。torch 未導入環境では `monkeypatch` で `torch.inference_mode` のみの最小 stub を注入し、union が排他領域の OR で全面 True になることまで検証する。
+- UI 実行時検証（ERR035）: Point mode で positive/negative ラジオ表示、両 label の点登録（Prompt Status 反映）を Playwright で確認済み。
 
 
+
+
+### [ERR042] transparent-background の gradient alpha と SAM2/SAMURAI 二値 mask の合成で黒/白の2値エッジが出る
+
+| 項目 | 内容 |
+|------|------|
+| **深刻度** | Medium |
+| **頻度** | mask guard を適用する全切り抜きで境界に発生 |
+| **初回発生日** | 2026-06-15 |
+| **関連ファイル** | `pipelines/components/common.py`, `pipelines/components/model_components.py`, `pipelines/components/video_model_components.py`, `config/inference_models.toml`, `gradio_app_sam2_transparent_BG_haystack.py`, `gradio_app_sam2_transparent_BG_haystack_for_Movie.py`, `tests/unit/test_transparent_bg_mask_guard.py` |
+
+**エラー内容**:
+切り抜き結果のマスクエッジに2種類が混在する。(1) transparent-background が生成する自然なグラデーション境界と、(2) 黒/白の硬い2値境界。後者は出力が transparent-background と SAM2/SAMURAI mask の**合成**であることを示し、見た目の品質を損なう。
+
+**原因**:
+`TransparentBGExtractor.run` の最終 alpha = tb の連続 gradient alpha × **二値 guard**（`dilate_binary_mask` は bool→0/1 を返す）。ERR039（横一直線切れ）対策で導入した guard が二値のため、mask 境界で tb の gradient を硬く切断し2値エッジを生む。guard を単純除去すると ERR039 が再発するため除去不可。
+
+**技術的制約**:
+`transparent_background.Remover.process` は画像のみを受け取り、マスクをヒント入力として受け付けない。よって「feather したマスクを tb に入力」を画像前処理（マスク外を中立化）で行うと、tb の salient object 検出がマスク切断線を物体輪郭と誤認し劣化する。
+
+**対処法（union マスクを feather して tb 出力 alpha に乗算 = 二値 guard の feather 版）**:
+- 新規 `feather_binary_mask(mask, dilate_size=21, feather_radius=8)`（`pipelines/components/common.py`）を追加。`feather_radius<1` で従来二値（後方互換）。`>=1` で `effective_dilate = max(1, min(dilate_size, feather_radius))` で軽く dilate した base 境界を中心に符号付き距離変換（`cv2.distanceTransform`）で ±feather_radius を 0↔1 に滑らかに遷移させた float32 soft guard を返す。
+- **要点**: 遷移帯が mask 境界（= tb 前景 alpha 境界）に重なる必要がある。`dilate_size` を大きく取り過ぎると遷移帯が前景の外側に出て中間 alpha が生まれず2値のままになるため、`effective_dilate` を `feather_radius` 以下に抑える。
+- `TransparentBGExtractor.run` に `mask_guard_feather:int=0`、`SAM2GuardFilter.run` に `feather:int=0`、`TransparentBGVideoExtractor.run` に `mask_guard_feather:int=0` を追加し、`>0` で feather guard に分岐。
+- 強度は `config/inference_models.toml` の `[[background]]` の `mask_feather`（既定8）で制御し、UI から `bg_entry.get("mask_feather",0)` 経由で渡す（ハードコード回避）。
+- 静止画パイプラインは extractor と後段 SAM2GuardFilter が同一 mask で二重 guard になる。feather>0 のとき soft × soft / soft × 二値が2値エッジを再発させるため、**静止画 UI で feather>0 時は `sam2_guard` を enabled=False** にして extractor 段に soft guard を一元化する。動画版は extractor が最終段のため二重適用なし。
+
+**再発防止**:
+- mask を guard として乗算する箇所は、二値だと gradient を硬く切る。境界をぼかす必要がある場合は `feather_binary_mask` を使い、`feather_radius` は画像対角線の半分を超えない（推奨4〜16）値にする（過大だと距離変換が飽和し遷移帯が頭打ち）。
+- guard の二重適用に注意。soft guard を2回乗算すると遷移帯が再び急峻化する。最終 alpha を出す段に guard を一元化する。
+- TDD: feather guard が境界に中間 alpha を生み（2値でない）、feather=0 で従来二値を維持することを検証する RED テストを先に追加。極端な feather_radius・極小 mask・空 mask の範囲保持も検証。
+- UI 実行時検証（ERR035）: 配線変更後に静止画版を起動し UI 描画が壊れないことを Playwright で確認。feather の視覚的品質は checkpoints+GPU の実モデル実行が必要なため、単体テスト＋UI 描画検証に留め、実素材での見た目はユーザー GPU 実行で要確認。
+
+### [ERR043] 動画 SAM2 で box+point 併用時、point 群を1つの追加 obj にまとめると複数インスタンスで point が落ちる
+
+| 項目 | 内容 |
+|------|------|
+| **深刻度** | Medium |
+| **頻度** | box が2つ以上 + 補正 point を使う追跡で発生 |
+| **初回発生日** | 2026-06-16 |
+| **関連ファイル** | `pipelines/components/common.py`, `pipelines/components/video_model_components.py`, `tests/unit/test_common_components.py`, `tests/unit/test_video_pipeline_wiring.py` |
+
+**エラー内容**:
+ERR041 の方針A（全 point を末尾の追加 obj としてまとめて登録）では、複数 box（複数インスタンス）に対する補正 point が反映されないことがある。SAM2 は1つの obj_id に1インスタンスの mask しか割り当てられないため、複数インスタンスにまたがる point 群を1 obj にまとめると、最も強い1インスタンス分しか残らず他の point が union から落ちる。
+
+**原因**:
+`SAM2VideoPropagator.run` が `point_group_obj_id = len(boxes)+1` で全 point を1つの追加 obj に登録していた。positive 点で別 box を補強したくても、その obj が表現できるインスタンスは1つだけなので補強先が定まらず、negative 点も「どの box の内部をくり抜くか」が曖昧になる。
+
+**対処法（修正1: 最近傍 box 割当 = 方針1）**:
+- 新規 `assign_points_to_boxes(points, boxes) -> dict[obj_id, list[point_index]]`（`pipelines/components/common.py`）を追加。各 point を矩形距離（点が box 内なら0、外なら最寄り辺までの L2 二乗）が最小の box（obj_id 1..N）に割り当てる。box が無ければ空辞書、point が無くても全 obj_id を空リストで含む。
+- `SAM2VideoPropagator.run` の `if boxes:` 分岐で `point_group_obj_id` を廃止。各 box を `add_new_points_or_box(box=single_box, points=割当点, labels=割当ラベル)` で登録し、割り当てられた point を**その box の object prompt に同梱**する。positive 点は最寄り box を補強、negative 点は box 内部をくり抜く。追加 obj は作らない。
+- `else`（point のみ / 単一 box）分岐は未変更で後方互換維持。
+
+**再発防止**:
+- SAM2 video の複数インスタンス追跡では「1 obj = 1 インスタンス」を厳守。複数インスタンスにまたがる point を1 obj にまとめない。点は所属インスタンス（最寄り box）の prompt に同梱する。
+- TDD: 最近傍割当（box1 が point(1,1,label=1)、box2 が point(4,2,label=0) を受け取り、追加 obj を作らず object_ids が box 分の 1,2 のみ）を検証する RED テストを先に追加。
+
+### [ERR044] 動画 union の早期二値化 + binary OR + 二値 guard が継ぎ目（消える線）を出力に焼き込む
+
+| 項目 | 内容 |
+|------|------|
+| **深刻度** | High |
+| **頻度** | 複数 obj を union する全動画切り抜きで境界（継ぎ目）に発生 |
+| **初回発生日** | 2026-06-16 |
+| **関連ファイル** | `pipelines/components/common.py`, `pipelines/components/video_common.py`, `pipelines/components/video_model_components.py`, `pipelines/components/model_components.py`, `tests/unit/test_common_components.py`, `tests/unit/test_video_pipeline_wiring.py`, `tests/unit/test_transparent_bg_mask_guard.py` |
+
+**エラー内容**:
+複数 obj（複数 box）を union した動画切り抜きで、物体輪郭に沿った細い黒線（消える線）が出る。ERR042 の末端 feather だけでは消えきらない、union 境界由来の継ぎ目。
+
+**原因**:
+`SAM2VideoPropagator.run` が各 obj を早期に二値化（`logits>0.0`）し binary OR で union していた。隣接 obj の mask 境界がわずかにずれていると、OR の結果に細い谷（どちらの obj にも属さない継ぎ目）が残り、それが二値 guard を介して tb alpha に黒線として焼き込まれる。二値化を最終段まで遅延しないことが根本原因。
+
+**対処法（修正2: soft 合成＋末端 feather = 根治）**:
+- 新規 `stable_sigmoid(x)`（overflow 回避の数値安定 sigmoid, float32[0,1]）と `soft_probability_guard(prob, dilate_size=21, feather_radius=8)`（grayscale `cv2.morphologyEx(MORPH_CLOSE)` で継ぎ目谷を橋渡し → `cv2.GaussianBlur` で末端 feather、二値化なし、[0,1] float32）を `pipelines/components/common.py` に追加。
+- `SAM2VideoPropagator.run`: 各 obj を二値化せず `stable_sigmoid(logits)` で確率化し `np.maximum` で union（forward/reverse の重複 frame も max 統合）。継ぎ目の谷は二値の「穴」ではなく確率の連続値になる。
+- 契約を float32[0,1] のまま疎通。`build_frame_mask_sequence`（`video_common.py`）は float 入力を `clip(0,1).astype(float32)` 保持、bool 入力は従来 bool（後方互換）。`render_tracking_overlay_frame` は float mask を `>=0.5` 閾値、bool は従来通り。
+- `TransparentBGExtractor.run`（`model_components.py`）を float(soft確率)/bool 両対応。float は `mask_soft=clip(0,1)`・`mask_binary=soft>=0.5`（has_mask/bbox 判定用）で、guard は `soft_probability_guard`（closing で継ぎ目谷を埋め、feather で末端をぼかす）。bool は従来パス。
+- **後方互換**: `max(probA,probB)>=0.5 ⟺ binaryA OR binaryB` のため、閾値0.5判定の前景領域は従来 OR と一致。差は継ぎ目が黒線でなく中間 alpha になる点のみ。
+
+**再発防止**:
+- mask の二値化は**最終段まで遅延**する。中間表現（union、契約、guard）は soft 確率[0,1]（float32）で持ち、継ぎ目を二値の穴にしない。
+- 複数 obj の union は binary OR ではなく確率の `np.maximum`。logit→確率は `stable_sigmoid` で overflow を避ける。
+- 継ぎ目谷は closing（`MORPH_CLOSE`）で橋渡しし、末端は gaussian feather する。`soft_probability_guard` を使い、二値 guard を soft 確率 mask に乗算しない。
+- TDD: soft union が float[0,1] を保ち閾値0.5で全面被覆すること、soft guard が中間値を保持し継ぎ目谷を橋渡しすること、extractor が float mask で中間 alpha を出し bbox は閾値0.5で決まることを RED テストで先に検証。
+- 視覚品質（継ぎ目線の消滅・末端の自然さ）は checkpoints+GPU の実モデル実行が必要。単体テスト＋UI 描画検証に留め、実素材はユーザー GPU 実行で要確認。
 

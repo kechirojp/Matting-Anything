@@ -14,11 +14,18 @@ import cv2
 import numpy as np
 from haystack import component
 
-from .common import ensure_rgb_array, render_tracking_overlay_frame
+from .common import (
+    assign_points_to_boxes,
+    compose_alpha,
+    ensure_rgb_array,
+    render_tracking_overlay_frame,
+    stable_sigmoid,
+)
 from .model_components import TransparentBGExtractor, default_device, require_gpu_for_heavy_inference
 from .video_common import (
     build_frame_mask_sequence,
     build_video_source,
+    composite_alpha_by_ownership,
     frame_cache_bytes,
     normalize_output_mode,
     normalize_rgba_frame,
@@ -274,13 +281,20 @@ class SAM2VideoPropagator:
         import torch
 
         # 複数 box は obj_id 1..N、単一 prompt は object_id を追跡対象とする。
+        # 修正1(方針1): box 群と point 群を併用する場合、各 point を最近傍 box の
+        # object prompt に同梱する（point 群を別 obj にまとめると SAM2 が複数インスタンスを
+        # 1 mask で表現できず point が落ちるため）。
+        points_by_obj: dict[int, list[int]] = {}
         if boxes:
             target_object_ids = list(range(1, len(boxes) + 1))
+            points_by_obj = assign_points_to_boxes(points, boxes)
         else:
             target_object_ids = [int(object_id)]
         directions = [False, True] if bidirectional else [False]
 
-        frame_masks: dict[int, np.ndarray] = {}
+        # Collect per-object logits per-frame, keyed by object_id for pass-merge safety:
+        # {frame_index: {obj_id: np.ndarray (H,W)}}
+        per_object_logits_by_id: dict[int, dict[int, np.ndarray]] = {}
         source_indices = list((metadata or {}).get("metadata", {}).get("sampled_frame_indices", range(len(frames))))
         total_frames = max(len(frames), 1)
         propagation_total = total_frames * len(directions)
@@ -300,15 +314,23 @@ class SAM2VideoPropagator:
                 _notify_progress(progress_callback, "sam2_video", 0.22, "SAM2 の video state を初期化しています")
                 state = self._video_predictor.init_state(video_path=str(temp_path))
                 if boxes:
-                    for obj_id, single_box in zip(target_object_ids, boxes):
-                        self._video_predictor.add_new_points_or_box(
-                            inference_state=state,
-                            frame_idx=prompt_frame_idx,
-                            obj_id=obj_id,
-                            box=np.asarray(single_box, dtype=np.float32),
-                        )
+                    for obj_id, single_box in zip(range(1, len(boxes) + 1), boxes):
+                        add_kwargs: dict[str, Any] = {
+                            "inference_state": state,
+                            "frame_idx": prompt_frame_idx,
+                            "obj_id": obj_id,
+                            "box": np.asarray(single_box, dtype=np.float32),
+                        }
+                        # 修正1: この box に割り当てられた補正 point（positive/negative）を同梱する。
+                        assigned_indices = points_by_obj.get(obj_id, [])
+                        if assigned_indices and points:
+                            assigned_points = [points[i] for i in assigned_indices]
+                            assigned_labels = [(labels or [1] * len(points))[i] for i in assigned_indices]
+                            add_kwargs["points"] = np.asarray(assigned_points, dtype=np.float32)
+                            add_kwargs["labels"] = np.asarray(assigned_labels, dtype=np.int32)
+                        self._video_predictor.add_new_points_or_box(**add_kwargs)
                 else:
-                    add_kwargs: dict[str, Any] = {"inference_state": state, "frame_idx": prompt_frame_idx, "obj_id": int(object_id)}
+                    add_kwargs = {"inference_state": state, "frame_idx": prompt_frame_idx, "obj_id": int(object_id)}
                     if points:
                         add_kwargs["points"] = np.asarray(points, dtype=np.float32)
                         add_kwargs["labels"] = np.asarray(labels or [1] * len(points), dtype=np.int32)
@@ -321,23 +343,31 @@ class SAM2VideoPropagator:
                     for out_frame_idx, out_obj_ids, out_mask_logits in self._video_predictor.propagate_in_video(state, reverse=reverse):
                         propagated_count += 1
                         object_ids = [int(value) for value in out_obj_ids]
-                        union_mask: np.ndarray | None = None
+                        # 修正2(根治): 各 obj を二値化せず sigmoid 確率で union（max）し、
+                        # 継ぎ目を黒線にせず soft 確率 mask として保持する。
+                        # 修正3: forward/reverse の 2 pass を object_id をキーに整列してマージする。
+                        # 位置ベースで stack すると追跡途切れ/再出現で obj 数が pass 間で変わった際に
+                        # 別 obj の logit が混入するため、必ず id で対応付ける。
+                        source_index = int(source_indices[int(out_frame_idx)]) if int(out_frame_idx) < len(source_indices) else int(out_frame_idx)
+                        obj_logits_by_id = per_object_logits_by_id.setdefault(source_index, {})
+                        gathered_any = False
                         for target_obj in target_object_ids:
                             if target_obj not in object_ids:
                                 continue
                             mask_logits = out_mask_logits[object_ids.index(target_obj)]
                             if hasattr(mask_logits, "detach"):
-                                obj_mask = (mask_logits.detach().cpu().numpy() > 0.0).squeeze()
+                                logits_array = mask_logits.detach().cpu().numpy()
                             else:
-                                obj_mask = (np.asarray(mask_logits) > 0.0).squeeze()
-                            obj_mask = obj_mask.astype(bool)
-                            union_mask = obj_mask if union_mask is None else (union_mask | obj_mask)
-                        if union_mask is None:
+                                logits_array = np.asarray(mask_logits)
+                            logits_2d = np.asarray(logits_array).squeeze()
+                            existing = obj_logits_by_id.get(target_obj)
+                            if existing is None:
+                                obj_logits_by_id[target_obj] = logits_2d
+                            else:
+                                obj_logits_by_id[target_obj] = np.maximum(existing, logits_2d)
+                            gathered_any = True
+                        if not gathered_any:
                             continue
-                        source_index = int(source_indices[int(out_frame_idx)]) if int(out_frame_idx) < len(source_indices) else int(out_frame_idx)
-                        # forward / reverse 両 pass で重複する frame は OR 統合する。
-                        existing = frame_masks.get(source_index)
-                        frame_masks[source_index] = union_mask if existing is None else (existing | union_mask)
                         if propagated_count == 1 or propagated_count % 10 == 0 or propagated_count == propagation_total:
                             _notify_progress(
                                 progress_callback,
@@ -345,8 +375,26 @@ class SAM2VideoPropagator:
                                 0.25 + 0.75 * (propagated_count / propagation_total),
                                 f"SAM2 mask を動画全体へ伝搬しています ({propagated_count}/{propagation_total})",
                             )
+        # id ベースで集めた logit を target_object_ids 順に (N,H,W) へ整列する。
+        # ある pass で欠損した obj は -1e6（≒確率0）で埋め、チャネル位置と obj_id を固定対応させる。
+        per_object_logits: dict[int, np.ndarray] = {}
+        for frame_index, obj_logits_by_id in per_object_logits_by_id.items():
+            reference = next(iter(obj_logits_by_id.values()))
+            ordered: list[np.ndarray] = []
+            for target_obj in target_object_ids:
+                logits_2d = obj_logits_by_id.get(target_obj)
+                if logits_2d is None:
+                    logits_2d = np.full(reference.shape, -1e6, dtype=np.float32)
+                ordered.append(np.asarray(logits_2d, dtype=np.float32))
+            per_object_logits[int(frame_index)] = np.stack(ordered, axis=0)
+        # overlay / 後方互換用に per-object logit から union soft mask を派生する。
+        # 各 object を sigmoid 確率化し画素ごと max を取って (H,W) soft mask とする。
+        union_frame_masks: dict[int, np.ndarray] = {}
+        for frame_index, stacked in per_object_logits.items():
+            probs = stable_sigmoid(np.asarray(stacked, dtype=np.float32))
+            union_frame_masks[int(frame_index)] = np.max(probs, axis=0).astype(np.float32)
         masks = build_frame_mask_sequence(
-            frame_masks,
+            union_frame_masks,
             object_ids=list(target_object_ids),
             metadata={
                 "points": points or [],
@@ -359,6 +407,8 @@ class SAM2VideoPropagator:
                 **self.tracker_metadata(),
             },
         )
+        # Phase1 契約: OwnershipResolver 用に per-object logit を埋め込んで下流へ渡す。
+        masks["per_object_logits"] = per_object_logits
         if self.device == "cuda":
             torch.cuda.empty_cache()
         return {"masks": masks}
@@ -377,6 +427,67 @@ class TransparentBGVideoExtractor:
         self.extractor = TransparentBGExtractor(project_root=project_root, device=device)
         self.output_dir = _resolve_output_dir(output_dir)
 
+    def _run_per_object_frame(
+        self,
+        frame: np.ndarray,
+        logits: np.ndarray,
+        ownership: np.ndarray,
+        *,
+        tb_mode: str,
+        tb_jit: bool,
+        tb_threshold: float,
+        tb_output_type: str,
+        crop_padding: int,
+        mask_guard_feather: int,
+    ) -> dict[str, np.ndarray]:
+        """per_object モード: 対象ごとに crop tb を実行し、所有権でアルファ合成する（Phase2 ④⑤）。
+
+        各対象の logit を sigmoid した soft mask で `TransparentBGExtractor` を呼び、
+        bbox 導出・crop・tb・full frame 配置・soft guard を再利用して対象ごとの連続アルファを得る。
+        得た N 枚のアルファを所有権 (先頭 N チャネル) で重み付け合成し、最終アルファを得る。
+        RGB は元フレームのまま（アルファのみ合成する）。
+
+        Args:
+            frame: 元フレーム (H,W,3)。
+            logits: 対象ごとの SAM2 logit (N,H,W)。
+            ownership: 所有権 (N+1,H,W)。先頭 N が前景、最終が背景。
+            tb_mode/tb_jit/tb_threshold/crop_padding/mask_guard_feather: tb 推論パラメータ。
+            tb_output_type: preview の背景合成種別（green/white/blur/それ以外は rgba）。
+
+        Returns:
+            ``{"rgba": (H,W,4) uint8, "alpha": (H,W) uint8, "preview": (H,W,*) uint8}``。
+        """
+        image_rgb = ensure_rgb_array(frame)
+        logits_array = np.asarray(logits, dtype=np.float32)
+        num_objects = logits_array.shape[0]
+        per_object_alphas: list[np.ndarray] = []
+        for obj_index in range(num_objects):
+            soft_mask = stable_sigmoid(logits_array[obj_index])
+            result = self.extractor.run(
+                image=image_rgb,
+                mask=soft_mask,
+                tb_mode=tb_mode,
+                tb_jit=tb_jit,
+                tb_threshold=tb_threshold,
+                tb_output_type="rgba",
+                crop_padding=int(crop_padding),
+                mask_guard_feather=int(mask_guard_feather),
+            )
+            alpha_o = np.asarray(result["alpha"], dtype=np.float32) / 255.0
+            per_object_alphas.append(alpha_o)
+        alpha_final = composite_alpha_by_ownership(per_object_alphas, ownership)
+        alpha_u8 = np.clip(alpha_final * 255.0, 0, 255).astype(np.uint8)
+        rgba = np.dstack([image_rgb, alpha_u8])
+        if tb_output_type == "green":
+            preview = compose_alpha(image_rgb, alpha_final, (0, 255, 0))
+        elif tb_output_type == "white":
+            preview = compose_alpha(image_rgb, alpha_final, (255, 255, 255))
+        elif tb_output_type == "blur":
+            preview = compose_alpha(image_rgb, alpha_final, cv2.GaussianBlur(image_rgb, (51, 51), 0))
+        else:
+            preview = rgba
+        return {"rgba": rgba, "alpha": alpha_u8, "preview": preview}
+
     @component.output_types(matte=dict)
     def run(
         self,
@@ -389,14 +500,26 @@ class TransparentBGVideoExtractor:
         tb_threshold: float = 0.0,
         tb_output_type: str = "rgba",
         crop_padding: int = 40,
+        mask_guard_feather: int = 0,
         rgba_codec: str = "webm_vp9",
+        video_matte_mode: str = "union",
         progress_callback: ProgressCallback | None = None,
     ) -> dict[str, dict[str, Any]]:
-        """frame ごとに `TransparentBGExtractor` を呼び、出力を RAM に溜めず保存する。"""
+        """frame ごとに `TransparentBGExtractor` を呼び、出力を RAM に溜めず保存する。
+
+        ``video_matte_mode`` で背景透過の経路を切り替える:
+        - ``"union"`` (既定): フレームあたり tb 1 回。union mask の外接矩形で 1 度だけ切り抜く軽量経路。
+        - ``"per_object"``: フレームあたり tb N 回。対象ごとに crop tb して所有権でアルファ合成する忠実経路。
+        """
         if not frames:
             raise ValueError("frames が空です。")
         normalized_mode = normalize_output_mode(output_mode)
+        matte_mode = str(video_matte_mode).strip().lower()
+        if matte_mode not in {"union", "per_object"}:
+            raise ValueError(f"video_matte_mode は 'union' か 'per_object' のいずれかです: {video_matte_mode!r}")
         frame_masks = (masks or {}).get("frame_masks", {})
+        per_object_logits = (masks or {}).get("per_object_logits", {})
+        ownership_by_frame = (masks or {}).get("ownership", {})
         source_indices = list((metadata or {}).get("metadata", {}).get("sampled_frame_indices", range(len(frames))))
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         output_root = self.output_dir / timestamp
@@ -419,16 +542,40 @@ class TransparentBGVideoExtractor:
         try:
             for local_index, frame in enumerate(frames):
                 source_index = int(source_indices[local_index]) if local_index < len(source_indices) else local_index
-                mask = frame_masks.get(source_index)
-                result = self.extractor.run(
-                    image=frame,
-                    mask=mask,
-                    tb_mode=tb_mode,
-                    tb_jit=tb_jit,
-                    tb_threshold=tb_threshold,
-                    tb_output_type=tb_output_type,
-                    crop_padding=int(crop_padding),
+                logits = per_object_logits.get(source_index)
+                ownership = ownership_by_frame.get(source_index)
+                logits_array = np.asarray(logits) if logits is not None else None
+                use_per_object = (
+                    matte_mode == "per_object"
+                    and logits_array is not None
+                    and ownership is not None
+                    and logits_array.ndim == 3
+                    and logits_array.shape[0] >= 1
                 )
+                if use_per_object:
+                    result = self._run_per_object_frame(
+                        frame,
+                        logits_array,
+                        np.asarray(ownership),
+                        tb_mode=tb_mode,
+                        tb_jit=tb_jit,
+                        tb_threshold=tb_threshold,
+                        tb_output_type=tb_output_type,
+                        crop_padding=int(crop_padding),
+                        mask_guard_feather=int(mask_guard_feather),
+                    )
+                else:
+                    mask = frame_masks.get(source_index)
+                    result = self.extractor.run(
+                        image=frame,
+                        mask=mask,
+                        tb_mode=tb_mode,
+                        tb_jit=tb_jit,
+                        tb_threshold=tb_threshold,
+                        tb_output_type=tb_output_type,
+                        crop_padding=int(crop_padding),
+                        mask_guard_feather=int(mask_guard_feather),
+                    )
                 rgba_frame = normalize_rgba_frame(result["rgba"])
                 alpha_frame = np.asarray(result["alpha"]).astype(np.uint8, copy=False)
                 preview_frame = ensure_rgb_array(result["preview"])
@@ -488,6 +635,7 @@ class TransparentBGVideoExtractor:
                 "tb_mode": tb_mode,
                 "tb_output_type": tb_output_type,
                 "crop_padding": int(crop_padding),
+                "video_matte_mode": matte_mode,
                 "streamed_outputs": True,
                 "codec_fallback": codec_fallback,
                 "used_rgba_codec": used_rgba_codec,
