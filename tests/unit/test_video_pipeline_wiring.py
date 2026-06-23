@@ -84,6 +84,22 @@ def test_movie_app_exposes_tb_only_tab_and_callback() -> None:
     assert "def run_tb_only_background_removal" in source
     assert "get_tb_only_pipeline" in source
 
+
+def test_movie_app_exposes_manual_mask_guard_controls() -> None:
+    """改善3: mask guard 手動調整の checkbox/feather/dilate を UI と run 配線へ公開する（既定 OFF）。"""
+    source = Path("gradio_app_sam2_transparent_BG_haystack_for_Movie.py").read_text(encoding="utf-8")
+
+    assert 'label="Mask guard を手動調整"' in source
+    assert 'label="Mask guard feather"' in source
+    assert 'label="Mask guard dilate"' in source
+    # 既定 OFF（checkbox value=False）と既定値が後方互換であること。
+    assert "mask_guard_enabled = gr.Checkbox(" in source
+    # run 配線に 3 コンポーネントが含まれること。
+    assert "mask_guard_enabled, mask_guard_feather, mask_guard_dilate" in source
+    # pipeline 入力に mask_guard_dilate を渡すこと。
+    assert '"mask_guard_dilate": mask_guard_dilate' in source
+
+
     """Haystack Pipeline warm_up calls component warm_up without runtime frame shape inputs."""
     from pipelines.components.video_model_components import VideoWriter
 
@@ -298,7 +314,7 @@ class _FakeMultiObjVideoPredictor:
         self.added: list[dict] = []
         self.reverse_calls: list[bool] = []
 
-    def init_state(self, video_path):  # noqa: D401 - fake
+    def init_state(self, video_path, **kwargs):  # noqa: D401 - fake
         return {"video_path": video_path}
 
     def add_new_points_or_box(self, inference_state, frame_idx, obj_id, box=None, points=None, labels=None):
@@ -379,7 +395,7 @@ def test_sam2_video_propagator_assigns_points_to_nearest_box(monkeypatch) -> Non
     captured: dict[str, list] = {"prompts": []}
 
     class _FakePointBoxPredictor:
-        def init_state(self, video_path):
+        def init_state(self, video_path, **kwargs):
             return {"video_path": video_path}
 
         def add_new_points_or_box(self, inference_state, frame_idx, obj_id, box=None, points=None, labels=None):
@@ -469,6 +485,50 @@ def test_sam2_video_propagator_reports_plain_sam2_tracker_metadata(monkeypatch) 
     assert SAM2VideoPropagator().tracker_metadata()["samurai_mode"] is False
 
 
+def _install_fake_sam2(monkeypatch, tmp_path, *, with_samurai_configs: bool):
+    """sys.modules['sam2'] を ``__file__`` 付き fake module に差し替える。"""
+    import sys
+    import types
+
+    pkg_dir = tmp_path / "sam2"
+    (pkg_dir / "configs").mkdir(parents=True, exist_ok=True)
+    if with_samurai_configs:
+        (pkg_dir / "configs" / "samurai").mkdir(parents=True, exist_ok=True)
+    fake = types.ModuleType("sam2")
+    fake.__file__ = str(pkg_dir / "__init__.py")
+    monkeypatch.setitem(sys.modules, "sam2", fake)
+
+
+def test_require_samurai_capable_sam2_raises_for_facebook_sam2(monkeypatch, tmp_path) -> None:
+    """SAMURAI config なのに installed sam2 が fork でない場合は明確に fail-fast する。"""
+    import pytest
+
+    from pipelines.components.video_model_components import _require_samurai_capable_sam2
+
+    _install_fake_sam2(monkeypatch, tmp_path, with_samurai_configs=False)
+
+    with pytest.raises(RuntimeError, match="SAMURAI"):
+        _require_samurai_capable_sam2("configs/samurai/sam2.1_hiera_l.yaml")
+
+
+def test_require_samurai_capable_sam2_passes_for_samurai_fork(monkeypatch, tmp_path) -> None:
+    """installed sam2 が configs/samurai を含む fork なら no-op で通す。"""
+    from pipelines.components.video_model_components import _require_samurai_capable_sam2
+
+    _install_fake_sam2(monkeypatch, tmp_path, with_samurai_configs=True)
+
+    assert _require_samurai_capable_sam2("configs/samurai/sam2.1_hiera_l.yaml") is None
+
+
+def test_require_samurai_capable_sam2_noop_for_standard_config(monkeypatch, tmp_path) -> None:
+    """非 samurai config では sam2 を import せず no-op（facebook sam2 でも通る）。"""
+    from pipelines.components.video_model_components import _require_samurai_capable_sam2
+
+    _install_fake_sam2(monkeypatch, tmp_path, with_samurai_configs=False)
+
+    assert _require_samurai_capable_sam2("configs/sam2.1/sam2.1_hiera_l.yaml") is None
+
+
 def test_movie_app_exposes_tracking_overlay_ui() -> None:
     """追跡が正しく追従しているか確認できる Tracking Overlay UI を提供する。"""
     source = Path("gradio_app_sam2_transparent_BG_haystack_for_Movie.py").read_text(encoding="utf-8")
@@ -504,3 +564,305 @@ def test_movie_app_exposes_background_model_dropdown() -> None:
     source = Path("gradio_app_sam2_transparent_BG_haystack_for_Movie.py").read_text(encoding="utf-8")
 
     assert "background_model" in source
+
+
+# ---------------------------------------------------------------------------
+# ERR049: Colab T4 で SAMURAI 動画伝搬が GPU メモリ枯渇で stall する対策
+#         （config 駆動で SAMURAI tracker のみ CPU offload を有効化）
+# ---------------------------------------------------------------------------
+
+
+def test_sam2_video_propagator_defaults_disable_cpu_offload() -> None:
+    """デフォルト（標準 SAM2 経路）では CPU offload を無効にし、既存挙動を維持する。"""
+    from pipelines.components.video_model_components import SAM2VideoPropagator
+
+    propagator = SAM2VideoPropagator(device="cpu")
+
+    assert propagator.offload_video_to_cpu is False
+    assert propagator.offload_state_to_cpu is False
+
+
+def test_sam2_video_propagator_passes_offload_flags_to_init_state(monkeypatch) -> None:
+    """ERR049: offload を有効化した propagator は init_state に offload kwargs を渡す。"""
+    import contextlib
+    import sys
+    import types
+
+    import numpy as np
+
+    # run() 内の `import torch` を最小 stub で満たす（inference_mode のみ使用）。
+    torch_stub = types.ModuleType("torch")
+    torch_stub.inference_mode = lambda: contextlib.nullcontext()
+    monkeypatch.setitem(sys.modules, "torch", torch_stub)
+
+    from pipelines.components.video_model_components import SAM2VideoPropagator
+
+    captured: dict[str, object] = {}
+
+    class _OffloadCapturingPredictor:
+        def init_state(self, video_path, offload_video_to_cpu=False, offload_state_to_cpu=False, **kwargs):
+            captured["offload_video_to_cpu"] = offload_video_to_cpu
+            captured["offload_state_to_cpu"] = offload_state_to_cpu
+            return {"video_path": video_path}
+
+        def add_new_points_or_box(self, inference_state, frame_idx, obj_id, box=None, points=None, labels=None):
+            pass
+
+        def propagate_in_video(self, state, reverse=False):
+            height, width = 4, 6
+            mask = np.full((1, height, width), 1.0, dtype=np.float32)
+            yield 0, [1], [mask]
+
+    propagator = SAM2VideoPropagator(
+        device="cpu",
+        offload_video_to_cpu=True,
+        offload_state_to_cpu=True,
+    )
+    propagator._video_predictor = _OffloadCapturingPredictor()
+
+    frames = [np.zeros((4, 6, 3), dtype=np.uint8)]
+    propagator.run(frames=frames, boxes=[[0, 0, 2, 3]], prompt_frame_idx=0)
+
+    assert captured["offload_video_to_cpu"] is True
+    assert captured["offload_state_to_cpu"] is True
+
+
+def test_samurai_registry_entries_enable_cpu_offload() -> None:
+    """ERR049: SAMURAI tracker entry のみ CPU offload を config 駆動で有効化する。"""
+    from pipelines.components.model_registry import entries_for
+
+    tracker_entries = {entry["id"]: entry for entry in entries_for("tracker")}
+
+    # SAMURAI entry は offload を有効化（GPU メモリ枯渇 stall 対策）。
+    for samurai_id in ("samurai_hiera_l", "samurai_hiera_b_plus"):
+        assert samurai_id in tracker_entries, f"SAMURAI entry '{samurai_id}' が registry に無い"
+        entry = tracker_entries[samurai_id]
+        assert entry.get("offload_video_to_cpu") is True
+        assert entry.get("offload_state_to_cpu") is True
+
+    # 標準 SAM2 entry は offload を有効化しない（動作実績のある経路を変えない）。
+    for sam2_id in ("sam2_hiera_l", "sam2_hiera_b_plus"):
+        if sam2_id in tracker_entries:
+            entry = tracker_entries[sam2_id]
+            assert entry.get("offload_video_to_cpu", False) is False
+            assert entry.get("offload_state_to_cpu", False) is False
+
+
+def test_movie_app_reads_offload_flags_from_tracker_registry() -> None:
+    """ERR049: get_video_pipeline が tracker entry の offload 設定を propagator へ伝える。"""
+    source = Path("gradio_app_sam2_transparent_BG_haystack_for_Movie.py").read_text(encoding="utf-8")
+
+    assert 'tracker_entry.get("offload_video_to_cpu"' in source
+    assert 'tracker_entry.get("offload_state_to_cpu"' in source
+
+
+# ── ERR050: SAMURAI forward-only / autocast / 双方向自動 OFF / 推奨設定明記 ──────────
+
+
+def test_sam2_video_propagator_default_autocast_is_float16() -> None:
+    """ERR050: autocast_dtype の既定は SAMURAI 本家と同じ float16。"""
+    from pipelines.components.video_model_components import SAM2VideoPropagator
+
+    propagator = SAM2VideoPropagator(device="cpu")
+    assert propagator.autocast_dtype == "float16"
+
+
+def test_autocast_context_is_nullcontext_on_cpu() -> None:
+    """ERR050: CPU では autocast を適用せず既存挙動（nullcontext）を保つ。"""
+    import contextlib
+    import types
+
+    from pipelines.components.video_model_components import SAM2VideoPropagator
+
+    torch_stub = types.ModuleType("torch")
+    torch_stub.float16 = "float16"
+    torch_stub.bfloat16 = "bfloat16"
+    torch_stub.autocast = lambda *a, **k: pytest.fail("CPU で autocast を呼んではならない")
+
+    propagator = SAM2VideoPropagator(device="cpu", autocast_dtype="float16")
+    ctx = propagator._autocast_context(torch_stub)
+    assert isinstance(ctx, contextlib.nullcontext)
+
+
+def test_autocast_context_disabled_when_dtype_none_on_cuda() -> None:
+    """ERR050: autocast_dtype を 'none' にすると cuda でも autocast を無効化できる。"""
+    import contextlib
+    import types
+
+    from pipelines.components.video_model_components import SAM2VideoPropagator
+
+    torch_stub = types.ModuleType("torch")
+    torch_stub.float16 = "float16"
+    torch_stub.autocast = lambda *a, **k: pytest.fail("none 指定時は autocast を呼んではならない")
+
+    propagator = SAM2VideoPropagator(device="cuda", autocast_dtype="none")
+    ctx = propagator._autocast_context(torch_stub)
+    assert isinstance(ctx, contextlib.nullcontext)
+
+
+def test_autocast_context_uses_torch_autocast_on_cuda() -> None:
+    """ERR050: cuda かつ float16 指定で torch.autocast('cuda', dtype=float16) を返す。"""
+    import types
+
+    from pipelines.components.video_model_components import SAM2VideoPropagator
+
+    captured: dict[str, object] = {}
+
+    class _Marker:
+        pass
+
+    marker = _Marker()
+
+    def _autocast(device_type, dtype=None):
+        captured["device_type"] = device_type
+        captured["dtype"] = dtype
+        return marker
+
+    torch_stub = types.ModuleType("torch")
+    torch_stub.float16 = "float16"
+    torch_stub.bfloat16 = "bfloat16"
+    torch_stub.autocast = _autocast
+
+    propagator = SAM2VideoPropagator(device="cuda", autocast_dtype="float16")
+    ctx = propagator._autocast_context(torch_stub)
+
+    assert ctx is marker
+    assert captured["device_type"] == "cuda"
+    assert captured["dtype"] == "float16"
+
+
+def test_tracker_registry_declares_autocast_and_bidirectional_flags() -> None:
+    """ERR050: registry が autocast_dtype と supports_bidirectional を config 駆動で持つ。"""
+    from pipelines.components.model_registry import entries_for
+
+    tracker_entries = {entry["id"]: entry for entry in entries_for("tracker")}
+
+    # SAMURAI は forward-only（双方向非対応）かつ fp16 autocast。
+    for samurai_id in ("samurai_hiera_l", "samurai_hiera_b_plus"):
+        assert samurai_id in tracker_entries
+        entry = tracker_entries[samurai_id]
+        assert entry.get("supports_bidirectional") is False
+        assert entry.get("autocast_dtype") == "float16"
+
+    # 標準 SAM2 は双方向対応、かつ autocast は無効（実績のある float32 挙動を維持）。
+    for sam2_id in ("sam2_hiera_l", "sam2_hiera_b_plus"):
+        if sam2_id in tracker_entries:
+            entry = tracker_entries[sam2_id]
+            assert entry.get("supports_bidirectional") is True
+            assert entry.get("autocast_dtype") == "none"
+
+
+def test_movie_app_wires_autocast_dtype_from_tracker_registry() -> None:
+    """ERR050: get_video_pipeline が tracker entry の autocast_dtype を propagator へ伝える。"""
+    source = Path("gradio_app_sam2_transparent_BG_haystack_for_Movie.py").read_text(encoding="utf-8")
+    assert 'autocast_dtype=tracker_entry.get("autocast_dtype"' in source
+
+
+def test_movie_app_auto_disables_bidirectional_for_samurai() -> None:
+    """ERR050: SAMURAI 選択時は双方向伝播を OFF+無効化し、標準 SAM2 では有効化する。"""
+    import importlib
+
+    module = importlib.import_module("gradio_app_sam2_transparent_BG_haystack_for_Movie")
+    handler = module.update_bidirectional_for_tracker
+
+    samurai_update = handler("samurai_hiera_l")
+    # gr.update は dict 互換。value=False かつ interactive=False を確認。
+    assert samurai_update["interactive"] is False
+    assert samurai_update.get("value") is False
+
+    sam2_update = handler("sam2_hiera_l")
+    assert sam2_update["interactive"] is True
+
+
+def test_movie_app_wires_tracker_change_to_bidirectional() -> None:
+    """ERR050: tracker_model.change が双方向 checkbox を出力に持つよう配線されている。"""
+    source = Path("gradio_app_sam2_transparent_BG_haystack_for_Movie.py").read_text(encoding="utf-8")
+    assert "tracker_model.change(update_bidirectional_for_tracker" in source
+    assert "outputs=[bidirectional]" in source
+
+
+def test_samurai_recommended_settings_documented_in_app_and_notebook() -> None:
+    """ERR050: SAMURAI 推奨設定が Gradio 冒頭と notebook 正本(.py) に明記されている。"""
+    app_source = Path("gradio_app_sam2_transparent_BG_haystack_for_Movie.py").read_text(encoding="utf-8")
+    notebook_source = Path("Sam2_Transparent_Background_Haystack_for_Movie.py").read_text(encoding="utf-8")
+
+    for source in (app_source, notebook_source):
+        assert "SAMURAI トラッカー推奨設定" in source
+        assert "forward-only" in source
+
+
+def test_sam2_video_propagator_rejects_multi_object_when_single_object_only() -> None:
+    """ERR051: single_object_only な tracker(SAMURAI) に複数 box を渡すと伝搬前に明確に raise。
+
+    SAMURAI fork の `_forward_sam_heads` は B=1 前提（`ious[0][best_iou_inds]`）で、複数 obj だと
+    'Boolean value of Tensor with more than one value is ambiguous' になる。samurai/ は変更できない
+    ため、伝搬前に config 駆動でガードし actionable に止める。
+    """
+    import numpy as np
+    import pytest
+
+    from pipelines.components.video_model_components import SAM2VideoPropagator
+
+    propagator = SAM2VideoPropagator(device="cpu", single_object_only=True)
+    frames = [np.zeros((4, 6, 3), dtype=np.uint8) for _ in range(2)]
+    with pytest.raises(ValueError) as excinfo:
+        propagator.run(frames=frames, boxes=[[0, 0, 2, 3], [3, 0, 5, 3]], prompt_frame_idx=0)
+    assert "単一オブジェクト" in str(excinfo.value)
+    # warm_up（モデル build）に到達せず fail-fast している。
+    assert propagator._video_predictor is None
+
+
+def test_sam2_video_propagator_allows_single_object_when_single_object_only(monkeypatch) -> None:
+    """ERR051: single_object_only でも単一 box なら正常に伝搬する（後方互換）。"""
+    import contextlib
+    import sys
+    import types
+
+    import numpy as np
+
+    torch_stub = types.ModuleType("torch")
+    torch_stub.inference_mode = lambda: contextlib.nullcontext()
+    monkeypatch.setitem(sys.modules, "torch", torch_stub)
+
+    from pipelines.components.video_model_components import SAM2VideoPropagator
+
+    class _FakeSingleObjPredictor:
+        def init_state(self, video_path, **kwargs):
+            return {"video_path": video_path}
+
+        def add_new_points_or_box(self, inference_state, frame_idx, obj_id, box=None, points=None, labels=None):
+            pass
+
+        def propagate_in_video(self, state, reverse=False):
+            for frame_idx in range(2):
+                mask = np.full((1, 4, 6), 1.0, dtype=np.float32)
+                yield frame_idx, [1], [mask]
+
+    propagator = SAM2VideoPropagator(device="cpu", single_object_only=True)
+    propagator._video_predictor = _FakeSingleObjPredictor()
+    frames = [np.zeros((4, 6, 3), dtype=np.uint8) for _ in range(2)]
+    result = propagator.run(frames=frames, box=[0, 0, 5, 3], prompt_frame_idx=0)
+    assert result["masks"]["object_ids"] == [1]
+
+
+def test_tracker_registry_declares_single_object_only_for_samurai() -> None:
+    """ERR051: SAMURAI は single_object_only=True、標準 SAM2 は False（config 駆動）。"""
+    from pipelines.components.model_registry import entries_for
+
+    tracker_entries = {entry["id"]: entry for entry in entries_for("tracker")}
+
+    for samurai_id in ("samurai_hiera_l", "samurai_hiera_b_plus"):
+        assert samurai_id in tracker_entries
+        assert tracker_entries[samurai_id].get("single_object_only") is True
+
+    for sam2_id in ("sam2_hiera_l", "sam2_hiera_b_plus"):
+        if sam2_id in tracker_entries:
+            assert tracker_entries[sam2_id].get("single_object_only") is False
+
+
+def test_movie_app_wires_single_object_only_from_tracker_registry() -> None:
+    """ERR051: get_video_pipeline が tracker entry の single_object_only を propagator へ伝える。"""
+    source = Path("gradio_app_sam2_transparent_BG_haystack_for_Movie.py").read_text(encoding="utf-8")
+    assert 'single_object_only=bool(tracker_entry.get("single_object_only"' in source
+
+

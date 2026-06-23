@@ -15,6 +15,9 @@ from .common import ensure_rgb_array
 EDGE_SNAP_PIXELS = 16
 EDGE_SIDES = ("left", "right", "top", "bottom")
 _CURRENT_OVERLAY_MASK_PROVIDER: Callable[[], np.ndarray | None] | None = None
+POINT_CHOICE_PREFIX = "pt#"
+BOX_CHOICE_MANUAL = "box:manual"
+BOX_CHOICE_UNION_PREFIX = "box:u#"
 
 
 def empty_prompt_state() -> dict[str, object]:
@@ -40,6 +43,96 @@ def copy_prompt_state(prompt_state: dict | None) -> dict[str, object]:
         state["box"] = list(state["box"]) if state.get("box") is not None else None
         # 複合対象 union 用の複数 bbox は要素までディープコピーし共有参照を避ける。
         state["boxes"] = [list(single_box) for single_box in (state.get("boxes") or [])]
+    return state
+
+
+def build_prompt_selection_choices(prompt_state: dict | None) -> dict[str, list[str]]:
+    """現在の prompt state から point / bbox 個別削除用の選択肢を作る。"""
+    state = copy_prompt_state(prompt_state)
+    points = state.get("points") or []
+    labels = state.get("labels") or []
+    point_choices: list[str] = []
+    for index, point in enumerate(points):
+        x_value, y_value = int(point[0]), int(point[1])
+        label_value = int(labels[index]) if index < len(labels) else 1
+        label_text = "positive" if label_value == 1 else "negative"
+        point_choices.append(f"{POINT_CHOICE_PREFIX}{index + 1} {label_text} ({x_value},{y_value})")
+
+    box_choices: list[str] = []
+    if state.get("box") is not None:
+        x1, y1, x2, y2 = [int(value) for value in state["box"]]
+        box_choices.append(f"{BOX_CHOICE_MANUAL} [{x1},{y1},{x2},{y2}]")
+    for index, single_box in enumerate(state.get("boxes") or []):
+        x1, y1, x2, y2 = [int(value) for value in single_box]
+        box_choices.append(f"{BOX_CHOICE_UNION_PREFIX}{index + 1} [{x1},{y1},{x2},{y2}]")
+    return {"point_choices": point_choices, "box_choices": box_choices}
+
+
+def remove_selected_points(prompt_state: dict | None, selected_labels: list[str] | None) -> dict[str, object]:
+    """選択された point prompt（positive/negative）だけを state から削除する。"""
+    state = copy_prompt_state(prompt_state)
+    labels = list(selected_labels or [])
+    if not labels:
+        return state
+    remove_indices: set[int] = set()
+    for label in labels:
+        text = str(label)
+        if not text.startswith(POINT_CHOICE_PREFIX):
+            continue
+        suffix = text[len(POINT_CHOICE_PREFIX):]
+        index_text = suffix.split(" ", 1)[0]
+        try:
+            remove_indices.add(max(int(index_text) - 1, 0))
+        except ValueError:
+            continue
+
+    if not remove_indices:
+        return state
+    points = state.get("points") or []
+    label_values = state.get("labels") or []
+    kept_points: list[Any] = []
+    kept_labels: list[int] = []
+    for index, point in enumerate(points):
+        if index in remove_indices:
+            continue
+        kept_points.append(point)
+        kept_labels.append(int(label_values[index]) if index < len(label_values) else 1)
+    state["points"] = kept_points
+    state["labels"] = kept_labels
+    return state
+
+
+def remove_selected_boxes(prompt_state: dict | None, selected_labels: list[str] | None) -> dict[str, object]:
+    """選択された bbox（manual / union）だけを state から削除する。"""
+    state = copy_prompt_state(prompt_state)
+    labels = list(selected_labels or [])
+    if not labels:
+        return state
+
+    remove_manual = any(str(label).startswith(BOX_CHOICE_MANUAL) for label in labels)
+    remove_union_indices: set[int] = set()
+    for label in labels:
+        text = str(label)
+        if not text.startswith(BOX_CHOICE_UNION_PREFIX):
+            continue
+        suffix = text[len(BOX_CHOICE_UNION_PREFIX):]
+        index_text = suffix.split(" ", 1)[0]
+        try:
+            remove_union_indices.add(max(int(index_text) - 1, 0))
+        except ValueError:
+            continue
+
+    if remove_manual:
+        state["box"] = None
+        state["box_buffer"] = []
+
+    if remove_union_indices:
+        kept_boxes = [
+            list(single_box)
+            for index, single_box in enumerate(state.get("boxes") or [])
+            if index not in remove_union_indices
+        ]
+        state["boxes"] = kept_boxes
     return state
 
 

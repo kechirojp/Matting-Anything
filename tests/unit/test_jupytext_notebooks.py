@@ -98,6 +98,13 @@ def test_sam2_movie_notebook_has_colab_device_diagnostics() -> None:
     assert "from sam2.build_sam import build_sam2_video_predictor" in movie_source
 
 
+def test_sam2_movie_notebook_installs_loguru_for_samurai_fork() -> None:
+    """SAMURAI fork の sam2_base.py が import する loguru を明示インストールする（ERR046）。"""
+    movie_source = Path("Sam2_Transparent_Background_Haystack_for_Movie.py").read_text(encoding="utf-8")
+
+    assert "pip install loguru" in movie_source
+
+
 def test_sam2_haystack_app_patches_gradio_bool_schema_issue() -> None:
     from gradio_app_sam2_transparent_BG_haystack import _patched_json_schema_to_python_type
 

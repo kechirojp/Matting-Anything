@@ -13,13 +13,21 @@
 # ---
 
 # %% [markdown]
-# # SAM2 + transparent-background Haystack Movie Pipeline
+# # SAM2 + BEN2 Route A（ブラー誘導 → 再α化）Haystack Movie Pipeline
 #
 # このノートブックは **Jupytext の `.py` を正本** として管理します。`.ipynb` は次のコマンドで生成します。
 #
 # ```powershell
-# .venv\Scripts\python.exe -m jupytext --to ipynb Sam2_Transparent_Background_Haystack_for_Movie.py
+# .venv\Scripts\python.exe -m jupytext --to ipynb Sam2_BEN2_RouteA_for_Movie.py
 # ```
+#
+# ## ルートA案（ブラー誘導 → BEN2 再α化）とは
+#
+# SAM2 が出す下地マスク **M** を少し膨張させてゲート **G** を作り、**G の外側だけを強くブラー**した
+# 誘導フレーム **I'** を **BEN2**（前景マッティングモデル）に渡して、α を高品質に作り直す方式です
+# （仕様書: `計画書/2026-06-22_動画αマット_ルートA案_ブラー誘導_仕様書.md`）。背景がボケて「ここが前景」と
+# 誘導されるため、髪や手足の細部のα品質が上がりやすくなります。背景透過モデルを transparent-background から
+# **BEN2** に差し替えたのが本ノートブックの主眼です。
 #
 # ## ⚠️ SAMURAI トラッカー推奨設定（必読）
 #
@@ -35,37 +43,31 @@
 # | **autocast** | fp16（config で自動 ON） | 伝搬を mixed precision で回し VRAM を削減・高速化（SAMURAI 本家と同じ） |
 # | **最大処理フレーム数** | まず 30 でプレビュー | 初回から大量フレームにすると stall リスクが上がる |
 #
-# これらの値はすべて `config/inference_models.toml` の tracker entry 駆動です。tracker を `samurai_hiera_l` /
-# `samurai_hiera_b_plus` に切り替えるだけで上記設定が反映され、UI 側は registry を見て双方向 UI を自動制御します。
+# これらの値はすべて `config/inference_models.toml` の tracker entry 駆動です。ルートAの膨張量・ブラー強度などの
+# チューニング値は `config/route_a.toml` 駆動で、UI の Advanced から微調整できます。
 #
-# 実装本体は [gradio_app_sam2_transparent_BG_haystack_for_Movie.py](./gradio_app_sam2_transparent_BG_haystack_for_Movie.py) と
+# 実装本体は [gradio_app_sam2_ben2_route_a_for_Movie.py](./gradio_app_sam2_ben2_route_a_for_Movie.py) と
 # [pipelines/](./pipelines/) に集約しています。
 #
 # ## UI の使い方
 #
-# 1. **Cell 1〜2.5** を順に実行し、CUDA / SAM2 / GroundingDINO checkpoint 診断が OK であることを確認します。
+# 1. **Cell 1〜2.5** を順に実行し、CUDA / SAM2 / BEN2 / GroundingDINO checkpoint 診断が OK であることを確認します。
 # 2. **Cell 3** を実行し、Colab では `Running on public URL: https://...gradio.live` を開きます。
 # 3. Gradio の **Input Video** に動画をアップロードします。右側の **SAM2 Prompt Canvas** に第 1 フレームが表示されます。
 # 4. 複合対象を意味で選びたい場合は **Optional: Text Prompt to Box (GroundingDINO)** を開き、
 #    `person playing drums` や `person riding bicycle` のように入力して bbox 候補を作ります。
-# 5. **SAM2 Prompt Canvas** 上で bbox を確認・補正します。手動 bbox は対象を囲む四角形の **対角 2 点**
-#    （例: 左上→右下、または右下→左上）をクリックする操作です。
-# 6. まず既定値の **最大 30 frames / frame_step=1** でクイックプレビューし、問題なければ Advanced で
-#    最大処理フレーム数を増やして最終出力します。transparent-background の出力は処理中に書き出され、
-#    RGBA/alpha/preview frame 全体を RAM に保持しない設計です。
+# 5. **SAM2 Prompt Canvas** 上で bbox を確認・補正します。手動 bbox は対象を囲む四角形の **対角 2 点** をクリックします。
+# 6. 誤って入れた prompt は **Prompt 編集（個別削除）** で、選択した bbox / point（positive・negative）だけ削除できます。
+# 7. ちらつきが残る場合は、標準 SAM2 で **双方向伝播 ON**、難しい素材では **matte_mode=per_object** を試してください。
+# 7.5. SAM2 マスクが最後まで追跡できているなら、**SAM2マスクでα底上げ（合成）** を `screen`（自然に底上げ）か
+#      `lighten / 比較明`（確実に塗る）にすると、安定した SAM2 マスクを α の床にして BEN2 のちらつきを直接補えます。
+#      前景ブラー・背景同系色・高速な被写体（例: ドラムスティック）で BEN2 の α が揺れる動画に有効です（既定は `none`=無効）。
+# 8. まず既定値（最大 30 frames・union）で **ルートA実行** し、結果を確認してから Advanced で
+#    膨張量・ブラー強度を微調整します。BEN2 の出力は処理中に書き出され、frame 全体を RAM に保持しない設計です。
 #
 # **フローの意味**:
-# 静止画版・動画版とも本質的な順序は
-# `Text Prompt（画像意味解釈） → SAM2（マスク/トラッキング） → transparent-background（背景除去）` です。
-# 動画版の SAM2 Prompt Canvas は SAM2 への入力先で、Text Prompt はそこへ bbox を自動で書き込む補助機能です。
-#
-# **今回の目的:**
-# - 動画をアップロードする
-# - 必要に応じて Text Prompt / GroundingDINO で複合対象の bbox 候補を作る
-# - 第 1 フレーム上で SAM2 point / box prompt を指定する
-# - SAM2 video predictor で mask を動画全体へ伝搬する
-# - transparent-background を frame ごとに適用する
-# - 出力を動画形式 / PNG 連番形式 / 両方から選ぶ
+# `Text Prompt（画像意味解釈） → SAM2（マスク/トラッキング） → ルートA（下地マスク膨張→背景ブラー→BEN2 再α化）→ 出力` です。
+# SAM2 Prompt Canvas は SAM2 への入力先で、Text Prompt はそこへ bbox を自動で書き込む補助機能です。
 
 # %%
 # ============================================================
@@ -77,7 +79,9 @@ import sys
 
 !{sys.executable} -m pip install gradio==5.9.1
 !{sys.executable} -m pip install haystack-ai==2.29.0
-!{sys.executable} -m pip install transparent-background
+# BEN2（PramaLLC, MIT ライセンス・base は商用可）を背景透過モデルとして導入する。
+# 重みは Cell 2.5 / 初回推論時に Hugging Face `PramaLLC/BEN2` から自動取得される（追加 wget 不要）。
+!{sys.executable} -m pip install git+https://github.com/PramaLLC/BEN2.git
 !{sys.executable} -m pip install pymatting
 # sam2 は SAMURAI fork（同梱 samurai/sam2）を Cell 2 で Drive マウント後に
 # 非 editable + --no-build-isolation で導入する（ERR045）。
@@ -139,10 +143,10 @@ if str(PROJECT_ROOT) not in sys.path:
 
 CKPT_ROOT = PROJECT_ROOT / "checkpoints"
 SAM2_CKPT_DIR = CKPT_ROOT / "SAM2"
-TB_CKPT_DIR = CKPT_ROOT / "transparent_BG"
+BEN2_CKPT_DIR = CKPT_ROOT / "BEN2"
 INPUT_DIR = PROJECT_ROOT / "inputs"
 OUTPUT_DIR = PROJECT_ROOT / "outputs"
-for directory in (SAM2_CKPT_DIR, TB_CKPT_DIR, INPUT_DIR, OUTPUT_DIR):
+for directory in (SAM2_CKPT_DIR, BEN2_CKPT_DIR, INPUT_DIR, OUTPUT_DIR):
     directory.mkdir(parents=True, exist_ok=True)
 
 SAM2_CKPT_PATH = SAM2_CKPT_DIR / "sam2.1_hiera_large.pt"
@@ -170,10 +174,13 @@ fetch_if_missing(
     "https://github.com/IDEA-Research/GroundingDINO/releases/download/v0.1.0-alpha/groundingdino_swint_ogc.pth",
 )
 
+# BEN2 の重みは Hugging Face `PramaLLC/BEN2` から `BEN_Base.from_pretrained(...)` 経由で
+# 自動ダウンロード・キャッシュされる（config/route_a.toml の [alpha].ben2_checkpoint_path が
+# 空のとき from_pretrained を使う）。ローカル .pth を使う場合は config に絶対パスを設定する。
 print(f"PROJECT_ROOT = {PROJECT_ROOT}")
 print(f"SAM2_CKPT_PATH = {SAM2_CKPT_PATH}")
 print(f"GROUNDING_DINO_CKPT_PATH = {GROUNDING_DINO_CKPT_PATH}")
-print(f"TB_CKPT_DIR = {TB_CKPT_DIR}")
+print(f"BEN2_CKPT_DIR = {BEN2_CKPT_DIR} (HF キャッシュ利用時は空のままで可)")
 print(f"OUTPUT_DIR = {OUTPUT_DIR}")
 
 # SAM2 は SAMURAI fork（同梱 samurai/sam2）を installed package として導入する。
@@ -244,6 +251,19 @@ except ModuleNotFoundError as exc:
         "その後、この診断セルと Gradio 起動セルを再実行してください。"
     ) from exc
 
+# BEN2 package が import 可能かを確認する（重み取得は初回推論時に遅延実行されるため、
+# ここでは import 可否のみ fail-loud に検証する）。
+try:
+    from ben2 import BEN_Base  # noqa: F401
+
+    print("ben2 import = OK")
+except ModuleNotFoundError as exc:
+    raise RuntimeError(
+        "BEN2 package import failed before launching Gradio. "
+        "Cell 1 の `pip install git+https://github.com/PramaLLC/BEN2.git` が成功したことを確認し、"
+        "ランタイムを再起動してから install cell から再実行してください。"
+    ) from exc
+
 exists = SAM2_CKPT_PATH.exists()
 size_mb = SAM2_CKPT_PATH.stat().st_size / (1024 * 1024) if exists and SAM2_CKPT_PATH.is_file() else None
 is_drive_path = "/drive/" in str(SAM2_CKPT_PATH).replace("\\", "/").lower()
@@ -259,7 +279,7 @@ print(
     f"path={GROUNDING_DINO_CKPT_PATH}, exists={grounding_exists}, size_mb={grounding_size_mb}"
 )
 print(
-    "GPU policy: SAM2 video tracking and GroundingDINO text detection require CUDA by default. "
+    "GPU policy: SAM2 video tracking, BEN2 matting and GroundingDINO text detection require CUDA by default. "
     "Set MATTING_ANYTHING_ALLOW_CPU=1 only for emergency CPU fallback."
 )
 CPU_FALLBACK_ALLOWED = os.environ.get("MATTING_ANYTHING_ALLOW_CPU", "").strip().lower() in {"1", "true", "yes", "on"}
@@ -280,9 +300,9 @@ if not CUDA_AVAILABLE and not CPU_FALLBACK_ALLOWED:
 
 # %%
 # ============================================================
-# Cell 3: 動画版 Haystack Gradio アプリ起動
+# Cell 3: ルートA動画版 Haystack Gradio アプリ起動
 # ============================================================
-APP_PATH = PROJECT_ROOT / "gradio_app_sam2_transparent_BG_haystack_for_Movie.py"
+APP_PATH = PROJECT_ROOT / "gradio_app_sam2_ben2_route_a_for_Movie.py"
 assert APP_PATH.exists(), f"アプリが見つかりません: {APP_PATH}"
 
 os.environ["PROJECT_ROOT"] = str(PROJECT_ROOT)

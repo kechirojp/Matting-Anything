@@ -34,6 +34,13 @@ config_name = "configs/sam2.1/sam2.1_hiera_l.yaml"
 checkpoint_path = "checkpoints/SAM2/sam2.1_hiera_large.pt"
 requires = "sam2_facebook"
 # INFERENCE_TRACKER_VARIANT=sam2_facebook の環境でのみ表示
+# 標準 SAM2 経路は実績のある float32 挙動を維持するため autocast は無効（none）。
+# 高速化したい場合は float16 に変更可（ERR050）。
+autocast_dtype = "none"
+# 標準 SAM2 は双方向伝搬可。
+supports_bidirectional = true
+# 標準 SAM2 は複数オブジェクト同時追跡可（ERR051）。
+single_object_only = false
 
 [[tracker]]
 id = "sam2_hiera_b_plus"
@@ -42,6 +49,10 @@ component = "SAM2VideoPropagator"
 config_name = "configs/sam2.1/sam2.1_hiera_b+.yaml"
 checkpoint_path = "checkpoints/SAM2/sam2.1_hiera_base_plus.pt"
 requires = "sam2_facebook"
+# 標準 SAM2 経路は既存挙動維持のため autocast 無効（none）。
+autocast_dtype = "none"
+supports_bidirectional = true
+single_object_only = false
 
 [[tracker]]
 id = "samurai_hiera_l"
@@ -51,6 +62,22 @@ config_name = "configs/samurai/sam2.1_hiera_l.yaml"
 checkpoint_path = "checkpoints/SAM2/sam2.1_hiera_large.pt"
 requires = "sam2_samurai"
 # INFERENCE_TRACKER_VARIANT=sam2_samurai の環境でのみ表示
+# SAMURAI は motion-aware memory で GPU 常駐メモリが大きく、双方向伝搬では 2 pass 分の
+# per-frame memory が積み上がるため、Colab T4(16GB)等では伝搬の最初の重い frame で
+# GPU メモリ枯渇 stall（stdout が propagate 1/N で凍結）になりやすい（ERR049）。
+# SAM2 標準の CPU offload を有効化して常駐 VRAM を抑え、stall を回避する。
+offload_video_to_cpu = true
+offload_state_to_cpu = true
+# 伝搬を fp16 autocast で回しさらに VRAM を抑える（ERR050、SAMURAI 本家と同じ）。
+autocast_dtype = "float16"
+# SAMURAI は Kalman filter の motion model を使うため forward-only 設計。逆方向伝搬は
+# 速度ベクトルが反転し追跡が崩れ、per-frame memory も 2 倍になるため非推奨（ERR050）。
+# UI はこのフラグを見て SAMURAI 選択時に双方向伝搬を自動 OFF/無効化する。
+supports_bidirectional = false
+# SAMURAI は Kalman filter による単一オブジェクト追跡専用。fork の _forward_sam_heads が B=1 前提の
+# ため、複数 obj を渡すと 'Boolean value of Tensor with more than one value is ambiguous' で
+# 伝搬が落ちる（ERR051）。propagator はこのフラグで複数 obj を伝搬前に明示に拒否する。
+single_object_only = true
 
 [[tracker]]
 id = "samurai_hiera_b_plus"
@@ -59,6 +86,12 @@ component = "SAM2VideoPropagator"
 config_name = "configs/samurai/sam2.1_hiera_b+.yaml"
 checkpoint_path = "checkpoints/SAM2/sam2.1_hiera_base_plus.pt"
 requires = "sam2_samurai"
+# SAMURAI のメモリ枯渇 stall 対策（ERR049）。samurai_hiera_l と同じく CPU offload を有効化。
+offload_video_to_cpu = true
+offload_state_to_cpu = true
+autocast_dtype = "float16"
+supports_bidirectional = false
+single_object_only = true
 
 # ─────────────────────────────────────────
 # background: アルファマット / 背景除去モデル

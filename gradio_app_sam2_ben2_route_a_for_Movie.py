@@ -1,4 +1,13 @@
-"""Haystack Pipeline 版 SAM2 + transparent-background 動画背景除去デモ。"""
+"""Haystack Pipeline 版 SAM2 + BEN2（ルートA: ブラー誘導 → 再α化）動画αマットデモ。
+
+既存の ``gradio_app_sam2_transparent_BG_haystack_for_Movie`` と同型の UI / イベント配線を保ちつつ、
+背景除去段を BEN2（ルートA）に差し替えた版。追跡（SAM2/SAMURAI）・所有権解決・tracking overlay・
+GroundingDINO テキスト→bbox・複合対象 union はそのまま再利用する。
+
+ルートA案: SAM2 下地マスク M を膨張してゲート G を作り、G 外を強くブラーした誘導フレーム I' を
+BEN2 に渡して α を再生成する（仕様書 2026-06-22 ルートA案）。膨張量・ブラー強度・羽根幅などの
+チューニング値は ``config/route_a.toml`` 既定値を UI 初期値として読み込み、画面から微調整できる。
+"""
 
 from __future__ import annotations
 
@@ -31,38 +40,91 @@ except (ImportError, AttributeError) as exc:
 
 import gradio as gr
 
+from pipelines.components.ben2_components import BEN2RouteAVideoExtractor
 from pipelines.components.model_components import GroundingDINOMultiBoxDetector
+from pipelines.components.model_registry import build_dropdown_choices, entry_by_id
+from pipelines.components.route_a_common import load_route_a_config
 from pipelines.components.ui_helpers import (
+    build_prompt_selection_choices,
     copy_prompt_state,
     draw_prompt_overlay,
     empty_prompt_state,
     extend_box_to_edge,
+    remove_selected_boxes,
+    remove_selected_points,
     select_sam2_prompt,
 )
+from pipelines.components.common import assign_points_to_boxes
 from pipelines.components.video_common import normalize_output_mode
-from pipelines.components.model_registry import build_dropdown_choices, entry_by_id
 from pipelines.components.video_model_components import SAM2VideoPropagator
-from pipelines.sam2_tb_video_pipeline import (
-    build_sam2_tb_video_pipeline,
-    build_tb_only_video_pipeline,
-    build_video_reader_pipeline,
+from pipelines.route_a_video_pipeline import (
+    build_ben2_route_a_only_video_pipeline,
+    build_sam2_ben2_route_a_pipeline,
 )
+from pipelines.sam2_tb_video_pipeline import build_video_reader_pipeline
 
 
 READER_PIPELINE = None
-_PIPELINE_CACHE: dict[tuple[str, str], Any] = {}
-_TB_ONLY_PIPELINE: Any = None
+_PIPELINE_CACHE: dict[str, Any] = {}
+_ROUTE_A_ONLY_PIPELINE: Any = None
 TEXT_DETECTOR = None
 PROMPT_CANVAS_PLACEHOLDER_SIZE = (420, 640)
 OUTPUT_MODE_CHOICES = ["動画 (video)", "連番静止画 (sequence)", "両方 (both)"]
+MATTE_MODE_CHOICES = ["union（高速・1回/frame）", "per_object（忠実・対象数×/frame）"]
+MASK_FLOOR_MODE_CHOICES = [
+    "none（無効）",
+    "screen（底上げ・自然）",
+    "lighten / 比較明（確実に塗る）",
+]
 STAGE_PROGRESS_RANGES = {
     "video_reader": (0.05, 0.15),
     "sam2_video": (0.15, 0.55),
-    "transparent_bg": (0.55, 0.88),
+    "ben2_route_a": (0.55, 0.88),
     "video_writer": (0.88, 0.96),
     "frame_sequence_writer": (0.88, 0.96),
     "tracking_overlay": (0.88, 0.96),
 }
+_ROUTE_A_DEFAULTS = load_route_a_config()
+
+
+def _blur_defaults() -> dict[str, Any]:
+    """config/route_a.toml の blur_guide 既定値を UI 初期値として返す。"""
+    return dict(_ROUTE_A_DEFAULTS.get("blur_guide", {}))
+
+
+def _composite_defaults() -> dict[str, Any]:
+    """config/route_a.toml の composite 既定値を UI 初期値として返す。"""
+    return dict(_ROUTE_A_DEFAULTS.get("composite", {}))
+
+
+def _alpha_defaults() -> dict[str, Any]:
+    """config/route_a.toml の alpha 既定値を UI 初期値として返す。"""
+    return dict(_ROUTE_A_DEFAULTS.get("alpha", {}))
+
+
+def _normalize_matte_mode(matte_mode_label: str) -> str:
+    """UI ラベルを matte_mode（'union' / 'per_object'）へ正規化する。"""
+    return "per_object" if str(matte_mode_label).startswith("per_object") else "union"
+
+
+def _normalize_mask_floor_mode(mask_floor_label: str) -> str:
+    """UI ラベルを mask_floor_mode（'none' / 'screen' / 'lighten'）へ正規化する。"""
+    text = str(mask_floor_label).strip().lower()
+    if text.startswith("screen"):
+        return "screen"
+    if text.startswith("lighten") or "比較明" in str(mask_floor_label):
+        return "lighten"
+    return "none"
+
+
+def _mask_floor_label_from_value(value: str) -> str:
+    """config 値（none/screen/lighten）を UI ラベルへ対応付ける。"""
+    text = str(value).strip().lower()
+    if text == "screen":
+        return MASK_FLOOR_MODE_CHOICES[1]
+    if text in {"lighten", "max"}:
+        return MASK_FLOOR_MODE_CHOICES[2]
+    return MASK_FLOOR_MODE_CHOICES[0]
 
 
 def get_reader_pipeline():
@@ -73,10 +135,9 @@ def get_reader_pipeline():
     return READER_PIPELINE
 
 
-def get_video_pipeline(tracker_model: str = "sam2_hiera_l", background_model: str = "tb_base"):
-    """動画背景除去 Pipeline を遅延構築する（tracker 選択を registry 経由で propagator へ反映）。"""
-    key = (tracker_model, background_model)
-    if key not in _PIPELINE_CACHE:
+def get_route_a_pipeline(tracker_model: str = "sam2_hiera_l"):
+    """ルートA動画αマット Pipeline を遅延構築する（tracker 選択を registry 経由で反映）。"""
+    if tracker_model not in _PIPELINE_CACHE:
         tracker_entry = entry_by_id("tracker", tracker_model)
         propagator = SAM2VideoPropagator(
             checkpoint_path=tracker_entry["checkpoint_path"],
@@ -86,20 +147,16 @@ def get_video_pipeline(tracker_model: str = "sam2_hiera_l", background_model: st
             autocast_dtype=tracker_entry.get("autocast_dtype", "none"),
             single_object_only=bool(tracker_entry.get("single_object_only", False)),
         )
-        _PIPELINE_CACHE[key] = build_sam2_tb_video_pipeline(propagator=propagator)
-    return _PIPELINE_CACHE[key]
+        _PIPELINE_CACHE[tracker_model] = build_sam2_ben2_route_a_pipeline(propagator=propagator)
+    return _PIPELINE_CACHE[tracker_model]
 
 
-def get_tb_only_pipeline():
-    """背景除去モデルのみの動画 Pipeline を遅延構築する（SAM2 追跡なし）。
-
-    tb のモード（base/fast 等）は run 時の ``tb_mode`` で切り替わるため、Pipeline は背景モデルに
-    依存せず単一インスタンスを再利用する。
-    """
-    global _TB_ONLY_PIPELINE
-    if _TB_ONLY_PIPELINE is None:
-        _TB_ONLY_PIPELINE = build_tb_only_video_pipeline()
-    return _TB_ONLY_PIPELINE
+def get_route_a_only_pipeline():
+    """SAM2 追跡なしで BEN2（ルートA）のみ動画処理する Pipeline を遅延構築する。"""
+    global _ROUTE_A_ONLY_PIPELINE
+    if _ROUTE_A_ONLY_PIPELINE is None:
+        _ROUTE_A_ONLY_PIPELINE = build_ben2_route_a_only_video_pipeline()
+    return _ROUTE_A_ONLY_PIPELINE
 
 
 def get_text_detector():
@@ -221,7 +278,6 @@ def detect_text_boxes_for_video(
             box_values = [int(round(float(value))) for value in box.tolist()]
             candidate_boxes.append(box_values)
             rows.append([index + 1, phrase, f"{confidence:.3f}", ", ".join(str(value) for value in box_values)])
-        # 複合対象 union 用に全候補 bbox を保持する（apply_selected_boxes で部分採用される）。
         state["boxes"] = candidate_boxes
         preview = draw_prompt_overlay(first_frame, state)
         status = f"GroundingDINO detected {len(rows)} candidate(s). Top bbox copied to SAM2 prompt: {state['box']}"
@@ -242,7 +298,6 @@ def _normalize_detected_rows(detected_rows) -> list[list[Any]]:
     """gr.Dataframe 値（pandas DataFrame / list / None）を行リストへ正規化する（ERR036）。"""
     if detected_rows is None:
         return []
-    # pandas DataFrame は真偽評価が曖昧なので type で分岐し .values.tolist() を使う。
     if hasattr(detected_rows, "values") and hasattr(detected_rows, "columns"):
         return detected_rows.values.tolist()
     return list(detected_rows)
@@ -274,8 +329,6 @@ def apply_selected_boxes(first_frame, prompt_state: dict | None, selected_labels
             raise gr.Error("少なくとも 1 つの候補 bbox を選択してください。")
         selected_boxes: list[list[int]] = []
         for label in labels:
-            # ラベル末尾の "[x1,y1,x2,y2]" を抽出する。phrase 内に "[]" を含んでも
-            # 最後の括弧群が bbox なので rsplit で確実に取り出す。
             tail = str(label).rsplit("[", 1)
             if len(tail) != 2:
                 continue
@@ -290,7 +343,6 @@ def apply_selected_boxes(first_frame, prompt_state: dict | None, selected_labels
             raise gr.Error("選択した候補から bbox を解釈できませんでした。")
         state = copy_prompt_state(prompt_state)
         state["boxes"] = selected_boxes
-        # 複合対象 union を使う場合は単一 box を解除して描画と伝搬の二重指定を避ける。
         state["box"] = None
         state["box_buffer"] = []
         preview = draw_prompt_overlay(first_frame, state)
@@ -307,9 +359,6 @@ def extract_prompt_frame(video_path: str | None, prompt_frame_idx: int, frame_st
     try:
         if not video_path:
             raise gr.Error("先に動画をアップロードしてください。")
-        # sampled_index: VideoReader が frame_step でサンプリングした後の frames list 上の位置。
-        # 元動画の frame 番号 ≈ sampled_index * frame_step。propagator の prompt_frame_idx も
-        # 同じ frames list index として渡すため両者が一致する。
         sampled_index = max(int(prompt_frame_idx), 0)
         result = get_reader_pipeline().run(
             {"video_reader": {"video_path": video_path, "max_frames": sampled_index + 1, "frame_step": int(frame_step)}},
@@ -360,19 +409,7 @@ def _estimate_processed_frames(max_frames: int, frame_step: int) -> int:
 
 
 def _effective_read_frames(max_frames: int, prompt_frame_idx: int) -> int:
-    """prompt フレームを必ず読み込み窓に含むよう、実効的な読み込み frame 数を返す。
-
-    任意フレームを起点に実行できるよう、`max_frames` を「最低限処理する frame 数」と扱い、
-    `prompt_frame_idx` がそれを超える場合は prompt フレームを含むよう窓を引き上げる。
-    これにより SAM2VideoPropagator の範囲外エラーを起こさず任意フレームで実行できる。
-
-    Args:
-        max_frames: UI 指定の最大処理 frame 数（先頭から処理する目安）。
-        prompt_frame_idx: サンプリング後シーケンスにおける prompt フレームの 0 始まり番号。
-
-    Returns:
-        prompt フレームを必ず含む実効的な読み込み frame 数。
-    """
+    """prompt フレームを必ず読み込み窓に含むよう、実効的な読み込み frame 数を返す。"""
     return max(1, int(max_frames), int(prompt_frame_idx) + 1)
 
 
@@ -390,9 +427,9 @@ def build_video_progress_callback(progress, stage_state: dict[str, Any]):
 
 
 # ─────────────────────────────────────────
-# ## 3. SAM系
+# ## 3. ルートA実行系
 # ─────────────────────────────────────────
-def run_video_background_removal(
+def run_route_a_background_removal(
     video_path: str | None,
     prompt_state: dict | None,
     prompt_frame_idx: int,
@@ -402,18 +439,19 @@ def run_video_background_removal(
     output_mode_label: str,
     rgba_codec: str,
     tracker_model: str,
-    background_model: str,
-    tb_jit: bool,
-    tb_threshold: float,
-    tb_output_type: str,
-    crop_padding: int,
-    mask_guard_enabled: bool,
-    mask_guard_feather_ui: int,
-    mask_guard_dilate_ui: int,
+    matte_mode_label: str,
+    dilation_px: int,
+    blur_kernel: int,
+    blur_sigma: float,
+    feather_px: int,
+    refine_foreground: bool,
+    gate_alpha: bool,
+    mask_floor_mode_label: str,
+    output_type: str,
     overlay_enabled: bool,
     progress=gr.Progress(),
 ):
-    """動画背景除去 Pipeline を実行し、動画または PNG 連番を出力する。"""
+    """ルートA動画αマット Pipeline を実行し、動画または PNG 連番を出力する。"""
     stage_state: dict[str, Any] = {"name": "startup", "description": "Pipeline を起動しています"}
     timings: dict[str, float] = {}
     total_start = time.perf_counter()
@@ -427,30 +465,55 @@ def run_video_background_removal(
         boxes = state.get("boxes") or []
         if not points and box is None and not boxes:
             raise gr.Error("SAM2 Prompt Canvas 上で point / bbox を指定するか、候補 bbox を選択してください。")
-        # 任意フレームを起点に実行できるよう、読み込み窓を prompt フレームまで自動拡張する。
-        # （範囲外バリデーションは廃止。max_frames より後ろの prompt でもその frame まで読み込む。）
         effective_max_frames = _effective_read_frames(int(max_frames), int(prompt_frame_idx))
         processed_frames = _estimate_processed_frames(effective_max_frames, int(frame_step))
         output_mode = normalize_output_mode(output_mode_label)
+        matte_mode = _normalize_matte_mode(matte_mode_label)
+        mask_floor_mode = _normalize_mask_floor_mode(mask_floor_mode_label)
+        positive_count = sum(1 for value in labels if int(value) == 1)
+        negative_count = sum(1 for value in labels if int(value) == 0)
+        prompt_debug_lines = [
+            f"prompt: points={len(points)} (pos={positive_count}, neg={negative_count}), manual_box={'yes' if box is not None else 'no'}, union_boxes={len(boxes)}"
+        ]
+        if boxes and points:
+            assignment = assign_points_to_boxes(points, boxes)
+            mapping_text = ", ".join(f"obj{obj_id}:{len(indexes)}" for obj_id, indexes in sorted(assignment.items()))
+            prompt_debug_lines.append(f"point assignment: {mapping_text}")
+        if points and not bool(bidirectional):
+            try:
+                tracker_entry = entry_by_id("tracker", tracker_model)
+                if bool(tracker_entry.get("supports_bidirectional", True)):
+                    prompt_debug_lines.append("flicker hint: 標準 SAM2 では『双方向伝播=ON』がちらつき抑制に有効です。")
+            except KeyError:
+                pass
+        if points and matte_mode == "union":
+            prompt_debug_lines.append("flicker hint: 複雑シーンでは『per_object』の方が mask ちらつきを抑えやすいです。")
+        # ルートAでは SAM2 マスク（=point の反映先）は『背景ブラーのゲート G』を作るためだけに使われ、
+        # gate_alpha=OFF の場合は最終 α を BEN2 が単独で決める（BEN2 はマスク入力ポートを持たない＝仕様 A-2）。
+        # そのため point を打っても最終 α / ちらつきは直接変わらず『伝わっていない』ように見える。
+        # point を最終 α に効かせるには gate_alpha=ON（α をゲート G 内に限定）を案内する。
+        if points and not bool(gate_alpha):
+            prompt_debug_lines.append(
+                "flicker hint: ルートAでは point/SAM2 マスクは現在『背景ブラーの範囲』にのみ使われ、"
+                "最終 α は BEN2 が単独生成します（BEN2 はマスク入力なし）。"
+                "ちらつき箇所を point で直接抑えるには『ゲートでαを制限（gate_alpha）』を ON にしてください。"
+            )
+            prompt_debug_lines.append(
+                "確認方法: Tracking Overlay は point を反映した SAM2 マスクを描きます。"
+                "point 追加で overlay マスクが変われば SAM2 へは伝わっており、ちらつきは BEN2 側要因です。"
+            )
+        if mask_floor_mode == "none":
+            prompt_debug_lines.append(
+                "flicker hint: SAM2 が最後まで追跡できているなら『SAM2マスクでα底上げ（合成）』を "
+                "screen か lighten/比較明 にすると、安定マスクを α の床にして BEN2 のちらつきを直接補えます。"
+            )
         progress_callback = build_video_progress_callback(progress, stage_state)
         release_text_detector()
         progress(
             0.03,
-            desc=f"Pipeline を起動しています。初回はモデル読込を含みます（最大 {processed_frames} frames）",
+            desc=f"Pipeline を起動しています。初回はモデル読込（BEN2 含む）を伴います（最大 {processed_frames} frames）",
         )
-        bg_entry = entry_by_id("background", background_model)
-        tb_mode = bg_entry.get("tb_mode", "base")
-        mask_feather = int(bg_entry.get("mask_feather", 0))
-        # mask guard 手動調整（既定 OFF）。OFF のときは config 既定 feather と extractor 既定 dilate(21) を使い既存挙動を維持する。
-        if bool(mask_guard_enabled):
-            mask_guard_feather = int(mask_guard_feather_ui)
-            mask_guard_dilate = int(mask_guard_dilate_ui)
-        else:
-            mask_guard_feather = mask_feather
-            mask_guard_dilate = 21
-        ownership_temperature = float(bg_entry.get("ownership_temperature", 1.0))
-        video_matte_mode = str(bg_entry.get("video_matte_mode", "union"))
-        result = get_video_pipeline(tracker_model, background_model).run(
+        result = get_route_a_pipeline(tracker_model).run(
             {
                 "video_reader": {
                     "video_path": video_path,
@@ -467,21 +530,21 @@ def run_video_background_removal(
                     "bidirectional": bool(bidirectional),
                     "progress_callback": progress_callback,
                 },
-                # ## 3.5 所有権解決: per-object logit から画素 softmax で前景 soft ゲートを算出する。
                 "ownership_resolver": {
-                    "temperature": ownership_temperature,
+                    "temperature": 1.0,
                 },
-                # ## 4. 背景透過系: transparent-background で frame ごとに matte を生成する。
-                "transparent_bg_video": {
+                # ## 4. ルートA背景透過: 下地マスク膨張 → 背景ブラー → BEN2 再α化。
+                "ben2_route_a_video": {
                     "output_mode": output_mode,
-                    "tb_mode": tb_mode,
-                    "tb_jit": bool(tb_jit),
-                    "tb_threshold": float(tb_threshold),
-                    "tb_output_type": tb_output_type,
-                    "crop_padding": int(crop_padding),
-                    "mask_guard_feather": mask_guard_feather,
-                    "mask_guard_dilate": mask_guard_dilate,
-                    "video_matte_mode": video_matte_mode,
+                    "matte_mode": matte_mode,
+                    "dilation_px": int(dilation_px),
+                    "blur_kernel": int(blur_kernel),
+                    "blur_sigma": float(blur_sigma),
+                    "feather_px": int(feather_px),
+                    "refine_foreground": bool(refine_foreground),
+                    "gate_alpha": bool(gate_alpha),
+                    "mask_floor_mode": mask_floor_mode,
+                    "output_type": output_type,
                     "rgba_codec": rgba_codec,
                     "progress_callback": progress_callback,
                 },
@@ -492,16 +555,16 @@ def run_video_background_removal(
             include_outputs_from={"video_writer", "frame_sequence_writer", "tracking_overlay"},
         )
         progress(0.95, desc="出力を整理しています")
-        base = {}
         video_result = result.get("video_writer", {}).get("matte")
         sequence_result = result.get("frame_sequence_writer", {}).get("matte")
-        merged = _merge_matte_results(base, video_result, sequence_result)
+        merged = _merge_matte_results({}, video_result, sequence_result)
         overlay_result = result.get("tracking_overlay", {}).get("overlay", {})
         overlay_video_path = overlay_result.get("overlay_video_path")
         sequence_files = _sequence_preview_files(merged)
         sequence_dirs = [merged.get(key) for key in ("rgba_sequence_dir", "alpha_sequence_dir", "preview_sequence_dir") if merged.get(key)]
         fallback = merged.get("metadata", {}).get("codec_fallback", [])
-        status = f"完了: output_mode={output_mode}, frames={merged.get('frame_count')}"
+        status = f"完了: output_mode={output_mode}, matte_mode={matte_mode}, frames={merged.get('frame_count')}"
+        status += "\n" + "\n".join(prompt_debug_lines)
         if fallback:
             status += f"\ncodec fallback: {fallback}"
         timings["total"] = time.perf_counter() - total_start
@@ -520,25 +583,23 @@ def run_video_background_removal(
     except Exception as exc:
         stage = stage_state.get("description") or stage_state.get("name") or "unknown"
         elapsed = time.perf_counter() - total_start
-        raise gr.Error(f"動画処理に失敗しました（stage={stage}, elapsed={elapsed:.1f}s）: {exc}") from exc
+        raise gr.Error(f"ルートA動画処理に失敗しました（stage={stage}, elapsed={elapsed:.1f}s）: {exc}") from exc
 
 
-def run_tb_only_background_removal(
+def run_route_a_only_background_removal(
     video_path: str | None,
     max_frames: int,
     frame_step: int,
     output_mode_label: str,
     rgba_codec: str,
-    background_model: str,
-    tb_jit: bool,
-    tb_threshold: float,
-    tb_output_type: str,
+    refine_foreground: bool,
+    output_type: str,
     progress=gr.Progress(),
 ):
-    """背景除去モデルのみで動画を処理する（SAM2 追跡なし・全画面 tb・prompt 不要）。
+    """SAM2 追跡なしで BEN2（ルートA）のみ動画を処理する（prompt 不要・全画面 BEN2）。
 
-    グリーンバックや単一 salient 対象など、追跡なしで背景除去だけで足りる用途向けの軽量経路。
-    各フレームを mask 無しで全画面 transparent-background に渡すため prompt 入力は不要。
+    単一 salient 対象など追跡が不要な用途向けの軽量経路。マスク未供給のため誘導ブラーは行わず、
+    各フレームをそのまま BEN2 に渡して α を生成する。
     """
     stage_state: dict[str, Any] = {"name": "startup", "description": "Pipeline を起動しています"}
     timings: dict[str, float] = {}
@@ -552,11 +613,9 @@ def run_tb_only_background_removal(
         release_text_detector()
         progress(
             0.03,
-            desc=f"Pipeline を起動しています。初回はモデル読込を含みます（最大 {processed_frames} frames）",
+            desc=f"Pipeline を起動しています。初回はモデル読込（BEN2 含む）を伴います（最大 {processed_frames} frames）",
         )
-        bg_entry = entry_by_id("background", background_model)
-        tb_mode = bg_entry.get("tb_mode", "base")
-        result = get_tb_only_pipeline().run(
+        result = get_route_a_only_pipeline().run(
             {
                 "video_reader": {
                     "video_path": video_path,
@@ -564,13 +623,11 @@ def run_tb_only_background_removal(
                     "frame_step": int(frame_step),
                     "progress_callback": progress_callback,
                 },
-                # 背景透過系: mask 未接続なので各フレームを全画面 tb に渡す（crop/guard なし）。
-                "transparent_bg_video": {
+                "ben2_route_a_video": {
                     "output_mode": output_mode,
-                    "tb_mode": tb_mode,
-                    "tb_jit": bool(tb_jit),
-                    "tb_threshold": float(tb_threshold),
-                    "tb_output_type": tb_output_type,
+                    "matte_mode": "union",
+                    "refine_foreground": bool(refine_foreground),
+                    "output_type": output_type,
                     "rgba_codec": rgba_codec,
                     "progress_callback": progress_callback,
                 },
@@ -604,7 +661,7 @@ def run_tb_only_background_removal(
     except Exception as exc:
         stage = stage_state.get("description") or stage_state.get("name") or "unknown"
         elapsed = time.perf_counter() - total_start
-        raise gr.Error(f"背景除去のみ処理に失敗しました（stage={stage}, elapsed={elapsed:.1f}s）: {exc}") from exc
+        raise gr.Error(f"BEN2 のみ処理に失敗しました（stage={stage}, elapsed={elapsed:.1f}s）: {exc}") from exc
 
 
 def update_codec_visibility(output_mode_label: str):
@@ -618,17 +675,51 @@ def update_point_label_visibility(prompt_mode: str):
     return gr.update(visible=prompt_mode == "point")
 
 
-def update_bidirectional_for_tracker(tracker_id: str):
-    """tracker registry の supports_bidirectional に従い双方向伝播 UI を切り替える。
+def refresh_prompt_selection_widgets(prompt_state: dict | None):
+    """prompt_state から point / bbox 個別削除 UI の選択肢を再生成する。"""
+    choices = build_prompt_selection_choices(prompt_state)
+    return (
+        gr.update(choices=choices["point_choices"], value=[]),
+        gr.update(choices=choices["box_choices"], value=[]),
+    )
 
-    SAMURAI など forward-only（Kalman filter）の tracker を選んだ場合は、双方向伝播を
-    自動で OFF にし、操作できないように無効化する（ERR050）。standard SAM2 では有効化する。
-    config 駆動なので tracker を追加してもこの関数は変更不要。
-    """
+
+def _render_prompt_preview(first_frame, state: dict | None):
+    """現在 state を prompt canvas に描画して返す。"""
+    preview_base = first_frame if first_frame is not None else create_prompt_canvas_placeholder()
+    return draw_prompt_overlay(preview_base, state)
+
+
+def remove_selected_prompt_points(first_frame, prompt_state: dict | None, selected_point_labels):
+    """選択された point prompt（positive / negative）を削除する。"""
+    selected = list(selected_point_labels or [])
+    if not selected:
+        raise gr.Error("削除する point prompt を選択してください。")
+    state = remove_selected_points(prompt_state, selected)
+    preview = _render_prompt_preview(first_frame, state)
+    point_choices, box_choices = refresh_prompt_selection_widgets(state)
+    status = f"選択 point を {len(selected)} 件削除しました。残り {len(state.get('points') or [])} 件。"
+    return preview, state, status, point_choices, box_choices
+
+
+def remove_selected_prompt_boxes(first_frame, prompt_state: dict | None, selected_box_labels):
+    """選択された bbox（manual / union）を削除する。"""
+    selected = list(selected_box_labels or [])
+    if not selected:
+        raise gr.Error("削除する bbox を選択してください。")
+    state = remove_selected_boxes(prompt_state, selected)
+    preview = _render_prompt_preview(first_frame, state)
+    point_choices, box_choices = refresh_prompt_selection_widgets(state)
+    manual = "あり" if state.get("box") is not None else "なし"
+    status = f"選択 bbox を {len(selected)} 件削除しました。manual={manual}, union={len(state.get('boxes') or [])} 件。"
+    return preview, state, status, point_choices, box_choices
+
+
+def update_bidirectional_for_tracker(tracker_id: str):
+    """tracker registry の supports_bidirectional に従い双方向伝播 UI を切り替える（ERR050）。"""
     try:
         entry = entry_by_id("tracker", tracker_id) if tracker_id else None
     except KeyError:
-        # 未知 id は安全側（操作可能）に倒す。エラーは握り潰さず interactive=True を明示。
         return gr.update(interactive=True)
     supports = bool(entry.get("supports_bidirectional", True)) if entry else True
     if supports:
@@ -636,41 +727,45 @@ def update_bidirectional_for_tracker(tracker_id: str):
     return gr.update(value=False, interactive=False)
 
 
-with gr.Blocks(title="SAM2 + Transparent Background Haystack for Movie") as demo:
-    gr.Markdown("# SAM2 + Transparent Background Haystack for Movie")
+_BLUR_DEFAULTS = _blur_defaults()
+_COMPOSITE_DEFAULTS = _composite_defaults()
+_ALPHA_DEFAULTS = _alpha_defaults()
+
+with gr.Blocks(title="SAM2 + BEN2 Route A (ブラー誘導) for Movie") as demo:
+    gr.Markdown("# SAM2 + BEN2 Route A（ブラー誘導 → 再α化）for Movie")
     gr.Markdown(
         """
-> ## ⚠️ SAMURAI トラッカー推奨設定（必読）
-> SAMURAI（motion-aware）は Kalman filter による **forward-only（前方向のみ）** 設計です。Colab T4 等の
-> 小 VRAM 環境ではメモリ枯渇で伝搬が `propagate 1/N` のまま凍結する stall が起きやすいため、以下を守ってください（ERR049 / ERR050）。
+> ## ルートA案（ブラー誘導 → BEN2 再α化）とは
+> SAM2 が出す下地マスク **M** を少し膨張させてゲート **G** を作り、**G の外側だけを強くブラー**した
+> 誘導フレーム **I'** を **BEN2**（前景マッティングモデル）に渡して、α を高品質に作り直す方式です。
+> 背景がボケて「ここが前景」と誘導されるため、髪や手足の細部のα品質が上がりやすくなります。
 >
-> | 項目 | 推奨 | 理由 |
+> | パラメーター | 役割 | 目安 |
 > |---|---|---|
-> | **対象オブジェクト数** | **1 個のみ**（複数は標準 SAM2 へ） | SAMURAI は Kalman filter による単一対象追跡専用。複数 box を渡すと fork が `Boolean value of Tensor ... ambiguous` で伝搬失敗（ERR051） |
-> | **双方向伝播** | **OFF**（SAMURAI 選択時は自動で OFF・無効化） | 逆方向は Kalman の速度ベクトルが反転し追跡が崩れ、per-frame memory も 2 倍 |
-> | **プロンプト起点フレーム** | **0（先頭）** | forward-only のため先頭起点が安定。末尾起点は逆走 stall を誘発 |
-> | **CPU offload** | 有効（config で自動 ON） | 常駐 VRAM を抑え stall を回避（`offload_video_to_cpu` / `offload_state_to_cpu`） |
-> | **autocast** | fp16（config で自動 ON） | 伝搬を mixed precision で回し VRAM を削減・高速化（SAMURAI 本家と同じ） |
-> | **最大処理フレーム数** | まず 30 でプレビュー | 初回から大量フレームにすると stall リスクが上がる |
+> | **下地マスク膨張(px)** | G を M からどれだけ広げるか。大きいほど前景候補を広く残す。 | 16〜32 |
+> | **背景ブラーカーネル(px)** | G 外をどれだけ強くぼかすか（奇数）。大きいほど誘導が強い。 | 31〜61 |
+> | **羽根幅(px)** | G 境界の馴染ませ幅。大きいほど境界が滑らか。 | 8〜16 |
+> | **境界精緻化** | BEN2 の髪エッジ後処理。ON で精度↑/時間↑。 | 必要時のみ ON |
+> | **合成モード** | union: frameあたりBEN2 1回（高速）。per_object: 対象数×回（忠実）。 | まず union |
+> | **SAM2マスクでα底上げ（合成）** | SAM2 の安定マスクを α の「床」に合成し、BEN2 の取りこぼし（ちらつき）を補う。難しい動画向け。 | ちらつき時に screen / 比較明 |
 >
-> これらの値はすべて `config/inference_models.toml` の tracker entry 駆動です。UI 側は registry を見て双方向 UI を自動制御します。
+> 既定値は `config/route_a.toml` から読み込んでいます。微調整は Advanced から行えます。
 """
     )
     gr.Markdown(
         """
 ### 使い方（クイックプレビュー推奨）
-1. **Input Video** に動画をアップロードします。アップロード後、右側の **SAM2 Prompt Canvas** に動画の第 1 フレームが自動表示されます。
-2. 複合対象を意味で選びたい場合は **Optional: Text Prompt to Box** を開き、`person playing drums` や `person riding bicycle` のように入力して bbox 候補を作ります。
-3. **SAM2 Prompt Canvas** 上で対象を確認します。手動 bbox の場合は、対象を囲む四角形の **対角 2 点**（例: 左上→右下、または右下→左上）をクリックします。
-4. 必要なら **Extend Left/Right/Top/Bottom** で bbox の辺を画像端まで伸ばします。Point mode では positive/negative 点で補正します。
-5. まずは既定のクイックプレビュー（最大 30 frames）で **動画背景除去を実行** し、結果を確認してから Advanced で処理 frame 数を増やします。
+1. **Input Video** に動画をアップロードします。アップロード後、右側の **SAM2 Prompt Canvas** に第 1 フレームが自動表示されます。
+2. 複合対象を意味で選びたい場合は **Optional: Text Prompt to Box** を開き、`person playing drums` のように入力して bbox 候補を作ります。
+3. **SAM2 Prompt Canvas** 上で対象を確認します。手動 bbox は対象を囲む **対角 2 点** をクリックします。
+4. まずは既定値（最大 30 frames・union）で **ルートA実行** し、結果を確認してから Advanced で膨張量・ブラー強度を微調整します。
 
-**処理順の考え方**: 動画版の本質は `フレーム取得 → DINO で候補生成 → SAM2 で対象ごとに prompt / 追跡（logit 保持・2値化しない）→ 所有権解決（ピクセル softmax で重なりを各対象へ排他割当）→ 背景透過（連続アルファ）→ 所有権でアルファ合成` です。背景透過は既定で union モード（union mask の外接矩形で 1 回だけ切り抜く軽量モード）で動きます。config の `video_matte_mode = "per_object"` に変えると対象ごとに切り抜いて合成しますが、多 box 選択時は tb 呼び出しが対象数×フレームとなり重くなります。エッジの半透明を硬くしたい場合は **Alpha threshold** スライダを上げて tb の連続アルファを二値化します。動画版の **SAM2 Prompt Canvas** は SAM2 への入力先で、Text Prompt はその Canvas に bbox を自動で書き込む補助機能です。
+**処理順**: `フレーム取得 → DINO で候補生成 → SAM2 で追跡（logit 保持）→ 所有権解決 → ルートA（下地マスク膨張→背景ブラー→BEN2 再α化）→ 出力`。
 """
     )
 
     with gr.Tabs():
-        with gr.Tab("SAM2 追跡 + 背景除去"):
+        with gr.Tab("SAM2 追跡 + ルートA"):
             with gr.Row():
                 input_video = gr.Video(label="Input Video", sources=["upload"], elem_id="movie-input-video")
                 prompt_canvas = gr.Image(
@@ -704,16 +799,34 @@ with gr.Blocks(title="SAM2 + Transparent Background Haystack for Movie") as demo
                 prompt_frame_idx = gr.Slider(
                     0, 1999, value=0, step=1, label="プロンプト起点フレーム位置（ドラッグで Canvas 更新）",
                     elem_id="prompt-frame-idx",
-                    info="SAM2 プロンプトを与えるフレームの位置（サンプリング後シーケンスの 0 始まりの番号、整数）。0 で第1フレーム。最大処理フレーム数を超える値でも、その frame まで自動で読み込んで実行する（範囲外エラーなし。その分だけ読み込み時間が増える）。途中フレームから前後双方向に追跡したい時に上げる。SAMURAI は forward-only なので 0（先頭）推奨。目安 0。",
+                    info="SAM2 プロンプトを与えるフレームの位置（サンプリング後シーケンスの 0 始まりの番号、整数）。0 で第1フレーム。最大処理フレーム数を超える値でも、その frame まで自動で読み込んで実行する。SAMURAI は forward-only なので 0（先頭）推奨。目安 0。",
                 )
                 show_frame_btn = gr.Button("このフレームを表示")
             bidirectional = gr.Checkbox(
                 value=False, label="双方向伝播（前後フレームへ追跡）",
-                info="ON: 起点フレームから過去方向と未来方向の両方へ追跡を伝搬し、各 frame のマスクを OR 統合する（途中フレームを起点にした時に有効。処理時間は約2倍）。OFF: 起点フレームから未来方向のみ。真偽値。SAMURAI 選択時は forward-only のため自動で OFF ・無効化される。",
+                info="ON: 起点フレームから過去・未来方向の両方へ追跡を伝搬し各 frame の mask を OR 統合する（処理時間は約2倍）。OFF: 未来方向のみ。真偽値。SAMURAI 選択時は forward-only のため自動で OFF・無効化される。",
             )
 
             prompt_state = gr.State(value=empty_prompt_state())
             prompt_status = gr.Textbox(label="Prompt Status", interactive=False)
+            with gr.Accordion("Prompt 編集（個別削除）", open=False):
+                gr.Markdown("誤って追加した point（positive/negative）や bbox（manual/union）だけを選択して削除できます。")
+                with gr.Row():
+                    point_selection_group = gr.CheckboxGroup(
+                        choices=[],
+                        value=[],
+                        label="削除する point prompt を選択",
+                        info="positive / negative を個別に削除します。",
+                    )
+                    box_selection_group = gr.CheckboxGroup(
+                        choices=[],
+                        value=[],
+                        label="削除する bbox を選択",
+                        info="manual box と union boxes を個別に削除します。",
+                    )
+                with gr.Row():
+                    remove_selected_points_btn = gr.Button("選択した point を削除")
+                    remove_selected_boxes_btn = gr.Button("選択した bbox を削除")
 
             with gr.Accordion("Optional: Text Prompt to Box (GroundingDINO)", open=False):
                 gr.Markdown(
@@ -726,7 +839,7 @@ with gr.Blocks(title="SAM2 + Transparent Background Haystack for Movie") as demo
                 with gr.Row():
                     text_box_threshold = gr.Slider(
                         0.05, 0.95, value=0.25, step=0.01, label="Box threshold",
-                        info="GroundingDINO の物体信頼度しきい値（0.05〜0.95 のスコア、単位なし）。高いほど検出が厳しく誤検出が減る。低いほど候補が増える。目安 0.25。",
+                        info="GroundingDINO の物体信頼度しきい値（0.05〜0.95 のスコア、単位なし）。高いほど検出が厳しく誤検出が減る。目安 0.25。",
                     )
                     text_text_threshold = gr.Slider(
                         0.05, 0.95, value=0.25, step=0.01, label="Text threshold",
@@ -734,7 +847,7 @@ with gr.Blocks(title="SAM2 + Transparent Background Haystack for Movie") as demo
                     )
                     text_top_k = gr.Slider(
                         1, 10, value=5, step=1, label="候補数 top-k",
-                        info="保持する検出 box の最大個数（個数、整数）。スコア上位から K 個まで表示し、最上位を SAM2 prompt にコピーする。目安 5。",
+                        info="保持する検出 box の最大個数（個数、整数）。スコア上位から K 個まで表示し最上位を SAM2 prompt にコピーする。目安 5。",
                     )
                 detect_text_btn = gr.Button("Text Prompt から bbox を検出")
                 detected_boxes = gr.Dataframe(
@@ -747,7 +860,7 @@ with gr.Blocks(title="SAM2 + Transparent Background Haystack for Movie") as demo
                     choices=[],
                     value=[],
                     label="複合対象に使う候補 bbox を選択（union 用）",
-                    info="複数選択すると各 bbox を別オブジェクトとして追跡し、frame ごとに OR 統合する（例: person playing drums で人とドラムを両方選ぶ）。検出後に top1 が自動 ON。選択後に下のボタンで反映。単位なしの選択値。",
+                    info="複数選択すると各 bbox を別オブジェクトとして追跡し frame ごとに OR 統合する。検出後に top1 が自動 ON。選択後に下のボタンで反映。単位なしの選択値。",
                 )
                 apply_boxes_btn = gr.Button("選択した候補 bbox を複合対象として反映")
 
@@ -756,38 +869,87 @@ with gr.Blocks(title="SAM2 + Transparent Background Haystack for Movie") as demo
                     choices=build_dropdown_choices("tracker"),
                     value="sam2_hiera_l",
                     label="トラッカーモデル（Tracker Model）",
-                    info="SAM2/SAMURAI のモデル。変更時はパイプラインが再初期化されます（初回のみ時間がかかります）。",
+                    info="SAM2/SAMURAI のモデル。変更時はパイプラインが再初期化されます（初回のみ時間がかかります）。複数対象は標準 SAM2 を推奨。",
                 )
-                background_model = gr.Dropdown(
-                    choices=build_dropdown_choices("background"),
-                    value="tb_base",
-                    label="背景除去モデル（Background Model）",
-                    info="transparent-background のモード。base: 標準品質。fast: 軽量・高速だが精度低。base-nightly: 最新版。",
+                matte_mode = gr.Radio(
+                    MATTE_MODE_CHOICES, value=MATTE_MODE_CHOICES[0], label="合成モード（Matte Mode）",
+                    info="union: union マスクから 1 ゲートを作り BEN2 を frame あたり 1 回（高速）。per_object: 対象ごとに誘導・BEN2 推論し所有権で α 合成（忠実だが対象数×回で重い）。単位なしの選択値。",
                 )
 
-            run_btn = gr.Button("動画背景除去を実行", variant="primary")
+            run_btn = gr.Button("ルートA実行", variant="primary")
 
-            with gr.Accordion("Advanced: 動画処理設定", open=False):
+            with gr.Accordion("Advanced: ルートA / 動画処理設定", open=False):
                 gr.Markdown(
                     """
 | パラメーター | 何を変えるか | 目安 |
 |---|---|---|
-| 最大処理フレーム数 | 先頭から処理する frame 数。多いほど長く、出力も重くなります。 | 初回 30、最終確認 300+ |
-| フレーム間引きステップ | 何 frame ごとに処理するか。大きいほど速いが追跡が粗くなります。 | 通常 1、確認用のみ 2 以上 |
-| 出力形式 | 動画、PNG 連番、両方。codec エラー時は連番が安全です。 | 初回は動画、失敗時は連番 |
-| RGBA 動画コーデック | 透明付き動画の保存方式。環境により使えない場合があります。 | webm_vp9 優先、だめなら mov_png |
-| transparent-background mode | 背景除去モデルの速度/品質。 | base が標準、fast は軽量 |
-| Alpha threshold | 透明度を二値化する強さ。0 はソフトな髪/境界を残します。 | 通常 0 |
-| Crop padding | SAM2 mask bbox の外側余白（髪など細部の検出漏れ防止）。大きすぎると mask が壊れます。 | 既定 5、細部が切れる時のみ 5〜30 |
+| 下地マスク膨張(px) | ゲート G を SAM2 マスクからどれだけ広げるか。 | 16〜32 |
+| 背景ブラーカーネル(px) | G 外をどれだけ強くぼかすか（奇数）。 | 31〜61 |
+| 背景ブラーσ | ガウシアンの標準偏差。0 でカーネルから自動。 | 0 |
+| 羽根幅(px) | G 境界の馴染ませ幅。 | 8〜16 |
+| 境界精緻化 | BEN2 の髪エッジ後処理（精度↑/時間↑）。 | 必要時のみ ON |
+| ゲートでα制限 | BEN2 αをゲート内に限定し背景漏れを抑える（αを絞る）。 | 通常 OFF |
+| SAM2マスクでα底上げ | SAM2 の安定マスクを α の床にし BEN2 のちらつきを補う（αを底上げ）。 | none、ちらつき時 screen/比較明 |
+| 最大処理フレーム数 | 先頭から処理する frame 数。 | 初回 30、最終 300+ |
 """
                 )
                 with gr.Row():
+                    dilation_px = gr.Slider(
+                        0, 128, value=int(_BLUR_DEFAULTS.get("dilation_px", 24)), step=1, label="下地マスク膨張(px)",
+                        info="SAM2 下地マスク M を膨張してゲート G を作る量（px、整数）。0 で二値化のみ。大きいほど前景候補を広く残すが背景も入りやすい。目安 16〜32。",
+                    )
+                    blur_kernel = gr.Slider(
+                        1, 151, value=int(_BLUR_DEFAULTS.get("blur_kernel", 41)), step=2, label="背景ブラーカーネル(px)",
+                        info="ゲート外をぼかすガウシアンカーネルサイズ（px、奇数）。大きいほど誘導が強い。偶数は自動で +1 補正。目安 31〜61。",
+                    )
+                with gr.Row():
+                    blur_sigma = gr.Slider(
+                        0.0, 50.0, value=float(_BLUR_DEFAULTS.get("blur_sigma", 0.0)), step=0.5, label="背景ブラーσ",
+                        info="ガウシアンブラーの標準偏差（単位なし）。0.0 でカーネルサイズから自動算出。大きいほど強くぼかす。目安 0.0。",
+                    )
+                    feather_px = gr.Slider(
+                        0, 64, value=int(_BLUR_DEFAULTS.get("feather_px", 12)), step=1, label="羽根幅(px)",
+                        info="ゲート G 境界をぼかして鮮明部と背景を馴染ませる幅（px、整数）。大きいほど境界が滑らか。目安 8〜16。",
+                    )
+                with gr.Row():
+                    refine_foreground = gr.Checkbox(
+                        value=bool(_ALPHA_DEFAULTS.get("refine_foreground", False)), label="境界精緻化（refine foreground）",
+                        info="ON: BEN2 の髪エッジ後処理を行い境界品質を上げる（時間↑）。OFF: 標準。真偽値。",
+                    )
+                    gate_alpha = gr.Checkbox(
+                        value=bool(_COMPOSITE_DEFAULTS.get("gate_alpha", False)), label="ゲートでαを制限",
+                        info="ON: BEN2 α をゲート G 内に限定し、ゲート外の背景誤検出を 0 にする。OFF: BEN2 α をそのまま使う。真偽値。",
+                    )
+                gr.Markdown(
+                    """
+**SAM2マスクでα底上げ（合成）＝ちらつき対策**
+SAM2 が最後まで追跡できているのに BEN2 の α がフレームごとに揺れて被写体が点滅する場合、
+SAM2 の安定マスク **M** を α の「床（最低値）」として合成し、抜け落ちを埋めて点滅を抑えます。
+`gate_alpha`（α を絞る）とは逆向きの **α 底上げ** で、両者は併用できます。
+
+- **none**: 無効（BEN2 の α をそのまま使う・既定）
+- **screen**: 1-(1-α)(1-M) で柔らかく底上げ（境界が自然）
+- **lighten / 比較明**: 画素ごと max(α, M) で確実に塗る（前景ブラー・背景同系色・高速な被写体向け）
+"""
+                )
+                with gr.Row():
+                    mask_floor_mode = gr.Radio(
+                        MASK_FLOOR_MODE_CHOICES,
+                        value=_mask_floor_label_from_value(_COMPOSITE_DEFAULTS.get("mask_floor_mode", "none")),
+                        label="SAM2マスクでα底上げ（合成）",
+                        info=(
+                            "SAM2 の安定マスクを α の『床』として加算合成し BEN2 の抜け落ち（ちらつき）を補う。"
+                            "screen=1-(1-α)(1-M) で自然に底上げ。lighten=max(α,M) で確実に塗る（前景ブラー/背景同系色の動画向け）。"
+                            "gate_alpha が α を絞るのに対し、本機能は α を底上げ（逆向き）。"
+                        ),
+                    )
+                with gr.Row():
                     max_frames = gr.Slider(1, 2000, value=30, step=1, label="最大処理フレーム数",
-                        info="先頭から処理する frame 数（frame 数、整数）。多いほど処理が長く出力も重くなる。初回クイックプレビュー 30、最終確認 300 以上が目安。",
+                        info="先頭から処理する frame 数（frame 数、整数）。多いほど処理が長く出力も重くなる。初回 30、最終確認 300 以上が目安。",
                     )
                     frame_step = gr.Slider(1, 10, value=1, step=1, label="フレーム間引きステップ",
                         elem_id="movie-frame-step",
-                        info="何 frame ごとに1枚処理するか（frame 間隔、整数）。1 で全 frame。2 以上は速いが追跡が粗くなる。通常 1、確認用のみ 2 以上。",
+                        info="何 frame ごとに1枚処理するか（frame 間隔、整数）。1 で全 frame。2 以上は速いが追跡が粗くなる。通常 1。",
                     )
                 with gr.Row():
                     output_mode = gr.Radio(
@@ -796,119 +958,112 @@ with gr.Blocks(title="SAM2 + Transparent Background Haystack for Movie") as demo
                     )
                     rgba_codec = gr.Radio(
                         ["webm_vp9", "mov_png"], value="webm_vp9", label="RGBA 動画コーデック",
-                        info="透明付き動画の保存方式（imageio+ffmpeg で alpha 保持）。webm_vp9: VP9/WebM（軽量・推奨）。mov_png: PNG コーデックの MOV（高互換・大容量）。書き出せない環境では連番(PNG)出力が確実。単位なしの選択値。",
+                        info="透明付き動画の保存方式。webm_vp9: VP9/WebM（軽量・推奨）。mov_png: PNG コーデックの MOV（高互換・大容量）。書き出せない環境では連番(PNG)が確実。単位なしの選択値。",
                     )
-                with gr.Row():
-                    tb_jit = gr.Checkbox(
-                        value=False, label="JIT",
-                        info="ON: TorchScript JIT で推論を高速化（初回コンパイルに時間）。OFF: 通常実行。真偽値。",
-                    )
-                    tb_threshold = gr.Slider(
-                        0.0, 1.0, value=0.0, step=0.01, label="Alpha threshold",
-                        info="アルファを二値化するしきい値（0.0〜1.0 の正規化アルファ、単位なし）。0.0: 二値化せず髪などのソフトな半透明を残す。上げるほどその値未満を透明にし輪郭が硬くなる。目安 0.0。",
-                    )
-                    crop_padding = gr.Slider(
-                        0, 64, value=5, step=1, label="Crop padding",
-                        info="SAM2 mask の外接矩形の外側に加える余白（px、整数）。既定 5。主目的は髪・手足先など細部の検出漏れ防止。大きすぎると mask が背景を巻き込み壊れるため、細部が切れる時のみ 5〜30 に増やす。",
-                    )
-                tb_output_type = gr.Radio(
+                output_type = gr.Radio(
                     ["rgba", "green", "white", "blur"], value="rgba", label="Preview type",
                     info="プレビュー動画の背景表示方法。rgba: 透明。green: 緑背景。white: 白背景。blur: 元背景をぼかす。RGBA 出力本体には影響しない。単位なしの選択値。",
                 )
-                mask_guard_enabled = gr.Checkbox(
-                    value=False, label="Mask guard を手動調整",
-                    info="OFF（既定）: 従来挙動（config の feather と dilate=21）を維持し出力は変わりません。ON: 下の feather/dilate スライダで SAM2 mask の外側ゲートを手動調整します。真偽値。",
-                )
-                with gr.Row():
-                    mask_guard_feather = gr.Slider(
-                        0, 64, value=0, step=1, label="Mask guard feather",
-                        info="SAM2 mask 境界をぼかす幅（px、整数）。0: 二値ゲート（内部 1.0・外部 0）で tb の内部アルファを削らない。上げるほど境界が連続化し馴染むが、追跡ずれ時は背景を巻き込みやすい。手動調整 ON のときのみ有効。",
-                    )
-                    mask_guard_dilate = gr.Slider(
-                        1, 81, value=21, step=2, label="Mask guard dilate",
-                        info="二値ゲート（feather=0 時）の膨張カーネルサイズ（px、奇数）。既定 21。大きいほど SAM2 mask の外側に余白を足し細部の取りこぼしを減らすが、背景の巻き込みも増える。手動調整 ON のときのみ有効。",
-                    )
                 overlay_enabled = gr.Checkbox(
                     value=True, label="Tracking Overlay を生成",
-                    info="ON: SAM2/SAMURAI の追跡 mask を元動画に半透明で重ねた確認用動画を生成し、追従が正しいか目視できる（処理がわずかに増えます）。OFF: 生成しない。真偽値。",
+                    info="ON: SAM2/SAMURAI の追跡 mask を元動画に半透明で重ねた確認用動画を生成する（処理がわずかに増えます）。OFF: 生成しない。真偽値。",
                 )
 
             with gr.Row():
                 rgba_video = gr.Video(label="RGBA Video")
                 alpha_video = gr.Video(label="Alpha Video")
                 preview_video = gr.Video(label="Preview Video")
-            tracking_overlay_video = gr.Video(
-                label="Tracking Overlay (追跡確認用)",
-            )
+            tracking_overlay_video = gr.Video(label="Tracking Overlay (追跡確認用)")
             sequence_files = gr.Files(label="連番 PNG サンプル")
             sequence_dirs = gr.Textbox(label="連番出力フォルダ", interactive=False)
             run_status = gr.Markdown()
 
-        with gr.Tab("背景除去のみ (tb only)"):
+        with gr.Tab("BEN2 のみ (追跡なし)"):
             gr.Markdown(
                 """
-### 背景除去のみ（SAM2 追跡なし）
-グリーンバックや単一 salient 対象など、追跡が不要で背景除去モデルだけで足りる用途向けの軽量経路です。
-**prompt は不要**で、各フレームを全画面のまま transparent-background に渡します（crop / guard / 所有権合成・tracking overlay は行いません）。
-複数人物・複合対象を意味で選び分けたい場合や、対象を限定して追跡したい場合は「SAM2 追跡 + 背景除去」タブを使ってください。
+### BEN2 のみ（SAM2 追跡なし）
+単一 salient 対象など、追跡が不要で BEN2 だけで足りる用途向けの軽量経路です。
+**prompt は不要**で、各フレームをそのまま BEN2 に渡して α を生成します（誘導ブラー・所有権合成・tracking overlay は行いません）。
+複数人物・複合対象を選び分けたい場合や対象を限定して追跡したい場合は「SAM2 追跡 + ルートA」タブを使ってください。
 """
             )
-            tb_only_input_video = gr.Video(label="Input Video", sources=["upload"], elem_id="tb-only-input-video")
-            tb_only_background_model = gr.Dropdown(
-                choices=build_dropdown_choices("background"),
-                value="tb_base",
-                label="背景除去モデル（Background Model）",
-                info="transparent-background のモード。base: 標準品質。fast: 軽量・高速だが精度低。base-nightly: 最新版。",
-            )
-            tb_only_run_btn = gr.Button("背景除去のみを実行", variant="primary")
+            route_a_only_input_video = gr.Video(label="Input Video", sources=["upload"], elem_id="ben2-only-input-video")
+            route_a_only_run_btn = gr.Button("BEN2 のみを実行", variant="primary")
 
             with gr.Accordion("Advanced: 動画処理設定", open=False):
                 with gr.Row():
-                    tb_only_max_frames = gr.Slider(1, 2000, value=30, step=1, label="最大処理フレーム数",
-                        info="先頭から処理する frame 数（frame 数、整数）。多いほど処理が長く出力も重くなる。初回クイックプレビュー 30、最終確認 300 以上が目安。",
+                    route_a_only_max_frames = gr.Slider(1, 2000, value=30, step=1, label="最大処理フレーム数",
+                        info="先頭から処理する frame 数（frame 数、整数）。多いほど処理が長く出力も重くなる。初回 30、最終確認 300 以上が目安。",
                     )
-                    tb_only_frame_step = gr.Slider(1, 10, value=1, step=1, label="フレーム間引きステップ",
-                        info="何 frame ごとに1枚処理するか（frame 間隔、整数）。1 で全 frame。2 以上は速いが粗くなる。通常 1、確認用のみ 2 以上。",
+                    route_a_only_frame_step = gr.Slider(1, 10, value=1, step=1, label="フレーム間引きステップ",
+                        info="何 frame ごとに1枚処理するか（frame 間隔、整数）。1 で全 frame。2 以上は速いが粗くなる。通常 1。",
                     )
                 with gr.Row():
-                    tb_only_output_mode = gr.Radio(
+                    route_a_only_output_mode = gr.Radio(
                         OUTPUT_MODE_CHOICES, value="動画 (video)", label="出力形式",
                         info="動画: 1つの動画ファイル。連番静止画: frame ごとの PNG。両方: 動画と PNG の両方。codec エラー時は連番が安全。単位なしの選択値。",
                     )
-                    tb_only_rgba_codec = gr.Radio(
+                    route_a_only_rgba_codec = gr.Radio(
                         ["webm_vp9", "mov_png"], value="webm_vp9", label="RGBA 動画コーデック",
-                        info="透明付き動画の保存方式（imageio+ffmpeg で alpha 保持）。webm_vp9: VP9/WebM（軽量・推奨）。mov_png: PNG コーデックの MOV（高互換・大容量）。書き出せない環境では連番(PNG)出力が確実。単位なしの選択値。",
+                        info="透明付き動画の保存方式。webm_vp9: VP9/WebM（軽量・推奨）。mov_png: PNG コーデックの MOV（高互換・大容量）。書き出せない環境では連番(PNG)が確実。単位なしの選択値。",
                     )
-                with gr.Row():
-                    tb_only_jit = gr.Checkbox(
-                        value=False, label="JIT",
-                        info="ON: TorchScript JIT で推論を高速化（初回コンパイルに時間）。OFF: 通常実行。真偽値。",
-                    )
-                    tb_only_threshold = gr.Slider(
-                        0.0, 1.0, value=0.0, step=0.01, label="Alpha threshold",
-                        info="アルファを二値化するしきい値（0.0〜1.0 の正規化アルファ、単位なし）。0.0: 二値化せず髪などのソフトな半透明を残す。上げるほどその値未満を透明にし輪郭が硬くなる。目安 0.0。",
-                    )
-                tb_only_output_type = gr.Radio(
+                route_a_only_refine = gr.Checkbox(
+                    value=bool(_ALPHA_DEFAULTS.get("refine_foreground", False)), label="境界精緻化（refine foreground）",
+                    info="ON: BEN2 の髪エッジ後処理を行い境界品質を上げる（時間↑）。OFF: 標準。真偽値。",
+                )
+                route_a_only_output_type = gr.Radio(
                     ["rgba", "green", "white", "blur"], value="rgba", label="Preview type",
                     info="プレビュー動画の背景表示方法。rgba: 透明。green: 緑背景。white: 白背景。blur: 元背景をぼかす。RGBA 出力本体には影響しない。単位なしの選択値。",
                 )
 
             with gr.Row():
-                tb_only_rgba_video = gr.Video(label="RGBA Video")
-                tb_only_alpha_video = gr.Video(label="Alpha Video")
-                tb_only_preview_video = gr.Video(label="Preview Video")
-            tb_only_sequence_files = gr.Files(label="連番 PNG サンプル")
-            tb_only_sequence_dirs = gr.Textbox(label="連番出力フォルダ", interactive=False)
-            tb_only_run_status = gr.Markdown()
+                route_a_only_rgba_video = gr.Video(label="RGBA Video")
+                route_a_only_alpha_video = gr.Video(label="Alpha Video")
+                route_a_only_preview_video = gr.Video(label="Preview Video")
+            route_a_only_sequence_files = gr.Files(label="連番 PNG サンプル")
+            route_a_only_sequence_dirs = gr.Textbox(label="連番出力フォルダ", interactive=False)
+            route_a_only_run_status = gr.Markdown()
 
-    input_video.change(extract_first_frame_outputs, inputs=[input_video], outputs=[prompt_canvas, prompt_state, prompt_status, prompt_frame_idx])
-    load_first_frame_btn.click(extract_first_frame, inputs=[input_video], outputs=[prompt_canvas, prompt_state, prompt_status])
-    prompt_canvas.select(select_sam2_prompt, inputs=[prompt_canvas, prompt_mode, point_label, prompt_state], outputs=[prompt_canvas, prompt_state, prompt_status])
-    clear_prompt_btn.click(clear_prompt, inputs=[prompt_canvas], outputs=[prompt_canvas, prompt_state, prompt_status])
-    extend_left_btn.click(lambda image, state: extend_box_to_edge(image, state, "left"), inputs=[prompt_canvas, prompt_state], outputs=[prompt_canvas, prompt_state, prompt_status])
-    extend_right_btn.click(lambda image, state: extend_box_to_edge(image, state, "right"), inputs=[prompt_canvas, prompt_state], outputs=[prompt_canvas, prompt_state, prompt_status])
-    extend_top_btn.click(lambda image, state: extend_box_to_edge(image, state, "top"), inputs=[prompt_canvas, prompt_state], outputs=[prompt_canvas, prompt_state, prompt_status])
-    extend_bottom_btn.click(lambda image, state: extend_box_to_edge(image, state, "bottom"), inputs=[prompt_canvas, prompt_state], outputs=[prompt_canvas, prompt_state, prompt_status])
+    input_video.change(extract_first_frame_outputs, inputs=[input_video], outputs=[prompt_canvas, prompt_state, prompt_status, prompt_frame_idx]).then(
+        refresh_prompt_selection_widgets,
+        inputs=[prompt_state],
+        outputs=[point_selection_group, box_selection_group],
+    )
+    load_first_frame_btn.click(extract_first_frame, inputs=[input_video], outputs=[prompt_canvas, prompt_state, prompt_status]).then(
+        refresh_prompt_selection_widgets,
+        inputs=[prompt_state],
+        outputs=[point_selection_group, box_selection_group],
+    )
+    prompt_canvas.select(select_sam2_prompt, inputs=[prompt_canvas, prompt_mode, point_label, prompt_state], outputs=[prompt_canvas, prompt_state, prompt_status]).then(
+        refresh_prompt_selection_widgets,
+        inputs=[prompt_state],
+        outputs=[point_selection_group, box_selection_group],
+    )
+    clear_prompt_btn.click(clear_prompt, inputs=[prompt_canvas], outputs=[prompt_canvas, prompt_state, prompt_status]).then(
+        refresh_prompt_selection_widgets,
+        inputs=[prompt_state],
+        outputs=[point_selection_group, box_selection_group],
+    )
+    extend_left_btn.click(lambda image, state: extend_box_to_edge(image, state, "left"), inputs=[prompt_canvas, prompt_state], outputs=[prompt_canvas, prompt_state, prompt_status]).then(
+        refresh_prompt_selection_widgets,
+        inputs=[prompt_state],
+        outputs=[point_selection_group, box_selection_group],
+    )
+    extend_right_btn.click(lambda image, state: extend_box_to_edge(image, state, "right"), inputs=[prompt_canvas, prompt_state], outputs=[prompt_canvas, prompt_state, prompt_status]).then(
+        refresh_prompt_selection_widgets,
+        inputs=[prompt_state],
+        outputs=[point_selection_group, box_selection_group],
+    )
+    extend_top_btn.click(lambda image, state: extend_box_to_edge(image, state, "top"), inputs=[prompt_canvas, prompt_state], outputs=[prompt_canvas, prompt_state, prompt_status]).then(
+        refresh_prompt_selection_widgets,
+        inputs=[prompt_state],
+        outputs=[point_selection_group, box_selection_group],
+    )
+    extend_bottom_btn.click(lambda image, state: extend_box_to_edge(image, state, "bottom"), inputs=[prompt_canvas, prompt_state], outputs=[prompt_canvas, prompt_state, prompt_status]).then(
+        refresh_prompt_selection_widgets,
+        inputs=[prompt_state],
+        outputs=[point_selection_group, box_selection_group],
+    )
     detect_text_btn.click(
         detect_text_boxes_for_video,
         inputs=[prompt_canvas, text_prompt, text_box_threshold, text_text_threshold, text_top_k, prompt_state],
@@ -917,47 +1072,72 @@ with gr.Blocks(title="SAM2 + Transparent Background Haystack for Movie") as demo
         populate_candidate_choices,
         inputs=[detected_boxes],
         outputs=[box_candidate_group],
+    ).then(
+        refresh_prompt_selection_widgets,
+        inputs=[prompt_state],
+        outputs=[point_selection_group, box_selection_group],
     )
     apply_boxes_btn.click(
         apply_selected_boxes,
         inputs=[prompt_canvas, prompt_state, box_candidate_group],
         outputs=[prompt_canvas, prompt_state, prompt_status],
+    ).then(
+        refresh_prompt_selection_widgets,
+        inputs=[prompt_state],
+        outputs=[point_selection_group, box_selection_group],
     )
     show_frame_btn.click(
         extract_prompt_frame,
         inputs=[input_video, prompt_frame_idx, frame_step],
         outputs=[prompt_canvas, prompt_state, prompt_status],
+    ).then(
+        refresh_prompt_selection_widgets,
+        inputs=[prompt_state],
+        outputs=[point_selection_group, box_selection_group],
     )
-    # スライダー1本に集約: 起点フレーム位置を変えると即座に SAM2 prompt canvas を更新する。
     prompt_frame_idx.change(
         extract_prompt_frame,
         inputs=[input_video, prompt_frame_idx, frame_step],
         outputs=[prompt_canvas, prompt_state, prompt_status],
+    ).then(
+        refresh_prompt_selection_widgets,
+        inputs=[prompt_state],
+        outputs=[point_selection_group, box_selection_group],
+    )
+    remove_selected_points_btn.click(
+        remove_selected_prompt_points,
+        inputs=[prompt_canvas, prompt_state, point_selection_group],
+        outputs=[prompt_canvas, prompt_state, prompt_status, point_selection_group, box_selection_group],
+    )
+    remove_selected_boxes_btn.click(
+        remove_selected_prompt_boxes,
+        inputs=[prompt_canvas, prompt_state, box_selection_group],
+        outputs=[prompt_canvas, prompt_state, prompt_status, point_selection_group, box_selection_group],
     )
     output_mode.change(update_codec_visibility, inputs=[output_mode], outputs=[rgba_codec])
     prompt_mode.change(update_point_label_visibility, inputs=[prompt_mode], outputs=[point_label])
     tracker_model.change(update_bidirectional_for_tracker, inputs=[tracker_model], outputs=[bidirectional])
     run_btn.click(
-        run_video_background_removal,
-        inputs=[input_video, prompt_state, prompt_frame_idx, bidirectional, max_frames, frame_step, output_mode, rgba_codec, tracker_model, background_model, tb_jit, tb_threshold, tb_output_type, crop_padding, mask_guard_enabled, mask_guard_feather, mask_guard_dilate, overlay_enabled],
+        run_route_a_background_removal,
+        inputs=[input_video, prompt_state, prompt_frame_idx, bidirectional, max_frames, frame_step, output_mode, rgba_codec, tracker_model, matte_mode, dilation_px, blur_kernel, blur_sigma, feather_px, refine_foreground, gate_alpha, mask_floor_mode, output_type, overlay_enabled],
         outputs=[rgba_video, alpha_video, preview_video, tracking_overlay_video, sequence_files, sequence_dirs, run_status],
     )
 
-    tb_only_output_mode.change(update_codec_visibility, inputs=[tb_only_output_mode], outputs=[tb_only_rgba_codec])
-    tb_only_run_btn.click(
-        run_tb_only_background_removal,
-        inputs=[tb_only_input_video, tb_only_max_frames, tb_only_frame_step, tb_only_output_mode, tb_only_rgba_codec, tb_only_background_model, tb_only_jit, tb_only_threshold, tb_only_output_type],
-        outputs=[tb_only_rgba_video, tb_only_alpha_video, tb_only_preview_video, tb_only_sequence_files, tb_only_sequence_dirs, tb_only_run_status],
+    route_a_only_output_mode.change(update_codec_visibility, inputs=[route_a_only_output_mode], outputs=[route_a_only_rgba_codec])
+    route_a_only_run_btn.click(
+        run_route_a_only_background_removal,
+        inputs=[route_a_only_input_video, route_a_only_max_frames, route_a_only_frame_step, route_a_only_output_mode, route_a_only_rgba_codec, route_a_only_refine, route_a_only_output_type],
+        outputs=[route_a_only_rgba_video, route_a_only_alpha_video, route_a_only_preview_video, route_a_only_sequence_files, route_a_only_sequence_dirs, route_a_only_run_status],
     )
 
 
 def parse_args() -> argparse.Namespace:
     """CLI 引数を解析する。"""
-    parser = argparse.ArgumentParser(description="SAM2 + transparent-background Haystack movie demo")
+    parser = argparse.ArgumentParser(description="SAM2 + BEN2 Route A (blur-guidance) Haystack movie demo")
     parser.add_argument("--share", action="store_true", help="Gradio public link を有効化")
     parser.add_argument("--debug", action="store_true", help="Gradio debug mode")
     parser.add_argument("--server-name", default="127.0.0.1", help="Gradio server name")
-    parser.add_argument("--server-port", type=int, default=7861, help="Gradio server port")
+    parser.add_argument("--server-port", type=int, default=7862, help="Gradio server port")
     return parser.parse_args()
 
 

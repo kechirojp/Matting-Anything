@@ -25,3 +25,6 @@ scikit-image
 opencv-python
 pycocotools
 matplotlib
+# BEN2 (PramaLLC, MIT): ルートA背景透過モデル。PyPI 未配布のため git から導入する。
+# pip install git+https://github.com/PramaLLC/BEN2.git
+# 重みは初回推論時に Hugging Face `PramaLLC/BEN2` から自動取得される。

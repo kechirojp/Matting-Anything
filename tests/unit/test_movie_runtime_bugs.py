@@ -63,10 +63,26 @@ def test_populate_candidate_choices_still_accepts_list_rows() -> None:
 
 
 # ─────────────────────────────────────────
-# Bug B: prompt_frame_idx 範囲を pipeline.run 前に fail-fast 検証
+# Bug B: prompt_frame_idx は任意フレームを許可（読み込み窓を自動拡張）
 # ─────────────────────────────────────────
-def test_run_video_validates_prompt_frame_idx_before_pipeline() -> None:
-    """prompt_frame_idx が処理 frame 数以上なら 18s 待たずに gr.Error を出す。"""
+def test_effective_read_frames_expands_window_to_include_prompt_frame() -> None:
+    """prompt_frame_idx が max_frames を超える時、読み込み窓を prompt フレームまで拡張する。"""
+    # prompt が窓内: 既存の max_frames を維持。
+    assert movie_app._effective_read_frames(30, 5) == 30
+    assert movie_app._effective_read_frames(30, 29) == 30
+    # prompt が窓外: prompt_frame_idx + 1 まで拡張。
+    assert movie_app._effective_read_frames(30, 30) == 31
+    assert movie_app._effective_read_frames(30, 75) == 76
+    # 下限は 1。
+    assert movie_app._effective_read_frames(1, 0) == 1
+
+
+def test_run_video_no_longer_rejects_prompt_frame_idx_beyond_max_frames() -> None:
+    """prompt_frame_idx >= max_frames でも『処理フレーム数以上』の範囲外エラーを出さない。
+
+    任意フレーム実行を許可したため、旧 fail-fast バリデーションは撤廃済み。窓拡張後に
+    pipeline へ進み、ローカル環境では GPU 不在等で別エラー（動画処理に失敗）となる。
+    """
     state = movie_app.empty_prompt_state()
     state["box"] = [10, 20, 110, 220]
 
@@ -88,12 +104,16 @@ def test_run_video_validates_prompt_frame_idx_before_pipeline() -> None:
             tb_threshold=0.0,
             tb_output_type="rgba",
             crop_padding=5,
+            mask_guard_enabled=False,
+            mask_guard_feather_ui=0,
+            mask_guard_dilate_ui=21,
             overlay_enabled=False,
         )
 
     message = str(excinfo.value)
-    assert "75" in message
-    assert "30" in message
+    # 旧バリデーションの文言（処理フレーム数 N 以上）は出ないこと。
+    assert "処理フレーム数" not in message
+    assert "範囲で指定してください" not in message
 
 
 # ─────────────────────────────────────────
@@ -124,3 +144,102 @@ def test_warm_up_registers_samurai_searchpath_helper_called() -> None:
     """warm_up が samurai 検索パス登録ヘルパを呼ぶ（ソース契約）。"""
     source = Path(video_model_components.__file__).read_text(encoding="utf-8")
     assert "_ensure_samurai_config_searchpath" in source
+
+
+# ─────────────────────────────────────────
+# Bug D: RGBA(透過)動画は imageio+ffmpeg で alpha 付き書き出す（cv2 は 4ch 不可）（ERR047）
+# ─────────────────────────────────────────
+def test_select_rgba_codec_returns_alpha_capable_imageio_spec(monkeypatch, tmp_path) -> None:
+    """RGBA codec 選択は cv2 VP90 fourcc ではなく alpha 対応 imageio spec を返す。
+
+    cv2.VideoWriter は 4ch(RGBA) frame を書けず全 frame skip するため、透過動画は
+    imageio+ffmpeg（webm_vp9=libvpx-vp9/yuva420p, mov_png=png/rgba）で書き出す。
+    """
+    monkeypatch.setattr(video_model_components, "_require_imageio", lambda: object())
+    writer = video_model_components.VideoWriter(output_dir=str(tmp_path))
+
+    spec, fallback = writer._select_rgba_codec((4, 6), preferred_rgba_codec="webm_vp9")
+    assert spec.suffix == ".webm"
+    assert spec.codec == "libvpx-vp9"
+    assert spec.pixelformat == "yuva420p"  # alpha 付き 4:2:0
+    assert any(label == "webm_vp9" for label, _ in fallback)
+
+    spec_mov, _ = writer._select_rgba_codec((4, 6), preferred_rgba_codec="mov_png")
+    assert spec_mov.suffix == ".mov"
+    assert spec_mov.codec == "png"
+    assert spec_mov.pixelformat == "rgba"  # PNG-in-MOV で alpha 保持
+
+
+def test_select_rgba_codec_raises_clear_error_when_imageio_missing(monkeypatch, tmp_path) -> None:
+    """imageio[ffmpeg] が無いとき、握り潰さず連番出力を促す明確なエラーにする。"""
+
+    def _no_imageio() -> object:
+        raise RuntimeError(
+            "RGBA(透過)動画の書き出しには imageio[ffmpeg] が必要です。連番(PNG)出力を選択してください。"
+        )
+
+    monkeypatch.setattr(video_model_components, "_require_imageio", _no_imageio)
+    writer = video_model_components.VideoWriter(output_dir=str(tmp_path))
+    with pytest.raises(RuntimeError) as excinfo:
+        writer._select_rgba_codec((4, 6), preferred_rgba_codec="webm_vp9")
+    assert "imageio" in str(excinfo.value)
+
+
+def test_transparent_bg_video_rgba_streams_4channel_to_imageio(monkeypatch, tmp_path) -> None:
+    """動画モードの RGBA stream が 4ch RGBA を imageio へ append する（cv2 へは渡さない）。"""
+    import numpy as np
+
+    appended: list[np.ndarray] = []
+    writer_kwargs: dict[str, object] = {}
+
+    class _FakeImageioWriter:
+        def append_data(self, frame: np.ndarray) -> None:
+            appended.append(np.asarray(frame))
+
+        def close(self) -> None:
+            return None
+
+    class _FakeImageio:
+        def get_writer(self, *args: object, **kwargs: object) -> "_FakeImageioWriter":
+            writer_kwargs.update(kwargs)
+            return _FakeImageioWriter()
+
+    captured_channels: list[int] = []
+
+    class _FakeOpenCVWriter:
+        def __init__(self, path, first_frame, fps, fourcc_name, channels) -> None:
+            captured_channels.append(int(channels))
+
+        def write(self, frame: np.ndarray) -> None:
+            return None
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(video_model_components, "_require_imageio", lambda: _FakeImageio())
+    monkeypatch.setattr(video_model_components, "_OpenCVFrameVideoWriter", _FakeOpenCVWriter)
+
+    extractor = video_model_components.TransparentBGVideoExtractor(output_dir=str(tmp_path))
+
+    def fake_extract(**kwargs):
+        image = np.asarray(kwargs["image"])
+        height, width = image.shape[:2]
+        rgba = np.dstack([image, np.full((height, width), 255, dtype=np.uint8)])
+        alpha = np.full((height, width), 255, dtype=np.uint8)
+        return {"rgba": rgba, "alpha": alpha, "preview": image}
+
+    extractor.extractor.run = fake_extract
+    frames = [
+        np.full((4, 6, 3), 10, dtype=np.uint8),
+        np.full((4, 6, 3), 20, dtype=np.uint8),
+    ]
+
+    matte = extractor.run(frames=frames, output_mode="video", rgba_codec="webm_vp9")["matte"]
+
+    assert matte["rgba_video_path"].endswith(".webm")
+    # RGBA は imageio へ 4ch のまま 2 frame 渡る。
+    assert len(appended) == 2
+    assert appended[0].ndim == 3 and appended[0].shape[2] == 4
+    # alpha/preview のみ cv2 writer（1ch/3ch）。RGBA(4ch) は cv2 へ渡さない。
+    assert 4 not in captured_channels
+    assert writer_kwargs.get("pixelformat") == "yuva420p"

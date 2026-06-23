@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+import contextlib
 import datetime
 import os
 import shutil
 import tempfile
+import time
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 import cv2
 import numpy as np
@@ -36,6 +38,11 @@ from .video_common import (
 
 ProgressCallback = Callable[[str, float, str], None]
 
+# SSE keep-alive 間隔（秒）。Colab / gradio.live の共有トンネルは無通信が続くと
+# event SSE 接続を idle 切断し、ブラウザに "Connection errored out" を表示する一方で
+# サーバ側 Python は処理を継続する（ERR048）。frame 数ではなく実時間で進捗を流して接続を保つ。
+_PROGRESS_KEEPALIVE_SEC = 2.0
+
 
 def _resolve_output_dir(output_dir: str) -> Path:
     """出力ディレクトリを PROJECT_ROOT 基準の絶対パスへ解決する。"""
@@ -56,6 +63,61 @@ def _notify_progress(
     if progress_callback is None:
         return
     progress_callback(stage, min(max(float(fraction), 0.0), 1.0), description)
+
+
+class _ProgressKeepAlive:
+    """長時間ループ中に SSE 接続が idle 切断されないよう、一定間隔で進捗を流す throttle。
+
+    frame 数ベースの間引き（例: 10 frame ごと）だと、低速 GPU で 1 frame に数秒かかる場合に
+    通知間隔が数十秒に広がり、Colab / gradio.live の共有トンネルが event SSE を idle で閉じる
+    （ブラウザに "Connection errored out" を表示する一方でサーバ処理は継続。ERR048）。
+    本 throttle は frame 速度によらず、最初/最後の frame に加えて最低 ``min_interval_sec``
+    間隔で進捗を送り、無通信ギャップを上限内に抑えて接続を維持する。
+
+    Args:
+        progress_callback: Gradio へ進捗を渡すコールバック（None なら no-op）。
+        stage: 進捗 stage 名。
+        min_interval_sec: 進捗を流す最小間隔（秒）。
+        clock: 単調増加時刻を返す関数。テスト用に注入可能。
+    """
+
+    def __init__(
+        self,
+        progress_callback: ProgressCallback | None,
+        stage: str,
+        *,
+        min_interval_sec: float = _PROGRESS_KEEPALIVE_SEC,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._progress_callback = progress_callback
+        self._stage = stage
+        self._min_interval = float(min_interval_sec)
+        self._clock = clock
+        self._last_emit = clock()
+
+    def maybe(
+        self,
+        index: int,
+        total: int,
+        fraction: float,
+        description: str,
+        *,
+        force: bool = False,
+    ) -> None:
+        """境界 frame・経過時間・force のいずれかを満たす時のみ進捗を流す。
+
+        Args:
+            index: 0 始まりの現在 frame index。
+            total: 総 frame 数。
+            fraction: 0.0〜1.0 の進捗割合。
+            description: 進捗説明文。
+            force: True なら間隔に関わらず必ず流す。
+        """
+        now = self._clock()
+        is_boundary = index <= 0 or index + 1 >= total
+        if force or is_boundary or (now - self._last_emit) >= self._min_interval:
+            _notify_progress(self._progress_callback, self._stage, fraction, description)
+            self._last_emit = now
 
 
 class _OpenCVFrameVideoWriter:
@@ -95,6 +157,80 @@ class _OpenCVFrameVideoWriter:
 
     def close(self) -> None:
         self._writer.release()
+
+
+def _require_imageio() -> Any:
+    """RGBA(透過)動画書き出し用に imageio(v2)+ffmpeg を取得する。
+
+    cv2.VideoWriter は 4ch(RGBA) frame を書けず全 frame を skip する（FFmpeg
+    "expected 3 channels but got 4"）。透過動画は imageio+ffmpeg で書き出す必要がある。
+    依存が無ければ握り潰さず、連番(PNG)出力を促す明確なエラーにする（ERR047）。
+
+    Returns:
+        imageio.v2 モジュール（``get_writer`` を持つ）。
+
+    Raises:
+        RuntimeError: imageio または imageio-ffmpeg(ffmpeg 実体) が利用できない場合。
+    """
+    try:
+        import imageio.v2 as imageio
+    except ImportError as exc:
+        raise RuntimeError(
+            "RGBA(透過)動画の書き出しには imageio[ffmpeg] が必要です。"
+            "`pip install imageio[ffmpeg]` を実行するか、出力モードを連番(PNG)にしてください。"
+        ) from exc
+    try:
+        import imageio_ffmpeg  # noqa: F401  # ffmpeg 実体の同梱を保証する
+    except ImportError as exc:
+        raise RuntimeError(
+            "RGBA(透過)動画の書き出しに必要な ffmpeg(imageio-ffmpeg) が見つかりません。"
+            "`pip install imageio[ffmpeg]` を実行するか、出力モードを連番(PNG)にしてください。"
+        ) from exc
+    return imageio
+
+
+class _RgbaCodecSpec(NamedTuple):
+    """RGBA(透過)動画を imageio+ffmpeg で書き出すための codec パラメータ。"""
+
+    label: str
+    suffix: str
+    codec: str
+    pixelformat: str
+    output_params: tuple[str, ...]
+    macro_block_size: int
+
+
+class _ImageioAlphaVideoWriter:
+    """imageio+ffmpeg で 1 frame ずつ alpha 付き動画を書き出す軽量 writer。
+
+    cv2.VideoWriter と異なり 4ch(RGBA, RGB order) frame をそのまま受け取り、
+    webm(VP9/yuva420p) や mov(PNG/rgba) として透過を保持して書き出す。
+    """
+
+    def __init__(self, path: Path, first_frame: np.ndarray, fps: float, spec: _RgbaCodecSpec) -> None:
+        imageio = _require_imageio()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self._path = path
+        # first_frame は形状参照用（cv2 版と同じ契約）。実書き込みは write() で行う。
+        np.asarray(first_frame)
+        self._writer = imageio.get_writer(
+            str(path),
+            format="FFMPEG",
+            mode="I",
+            fps=float(fps),
+            codec=spec.codec,
+            pixelformat=spec.pixelformat,
+            output_params=list(spec.output_params),
+            macro_block_size=spec.macro_block_size,
+        )
+
+    def write(self, frame: np.ndarray) -> None:
+        # imageio は RGB order を期待する。normalize_rgba_frame 済みの RGBA をそのまま渡す。
+        frame_array = normalize_rgba_frame(frame)
+        self._writer.append_data(frame_array)
+
+    def close(self) -> None:
+        self._writer.close()
 
 
 @component
@@ -185,6 +321,38 @@ def _samurai_config_root(config_name: str | None) -> Path | None:
     return None
 
 
+def _require_samurai_capable_sam2(config_name: str | None) -> None:
+    """SAMURAI config 利用時、import される sam2 が SAMURAI 対応 fork かを事前検証する。
+
+    Colab 等で facebook 版 sam2 が入っていると ``configs/samurai/`` も ``samurai_mode``
+    対応モデルコードも無く、Hydra の ``MissingConfigException`` や ``SAM2Base`` の
+    ``TypeError`` という分かりにくい例外になる（ERR038 の検索パス追加だけでは解決不能）。
+    事前に installed sam2 を検査し、SAMURAI fork（``pip install -e samurai/sam2``）導入を
+    促す明確なエラーにする。非 samurai config では no-op。
+
+    Args:
+        config_name: build_sam2_video_predictor に渡す Hydra config 名。
+
+    Raises:
+        RuntimeError: samurai config なのに installed sam2 が SAMURAI fork でない場合。
+    """
+    if not config_name or "samurai" not in str(config_name).lower():
+        return
+    import sam2
+
+    installed_root = Path(sam2.__file__).resolve().parent
+    if (installed_root / "configs" / "samurai").is_dir():
+        return
+    raise RuntimeError(
+        "SAMURAI tracker を選択しましたが、現在 import される sam2 パッケージは "
+        f"SAMURAI 対応 fork ではありません（installed: {installed_root}）。 "
+        "SAMURAI は config だけでなく samurai_mode 対応のモデルコードを必要とします。 "
+        "同梱の SAMURAI fork を導入してください: `pip install -e samurai/sam2` "
+        "（Colab はランタイム再起動後に install セルから再実行）。 "
+        "標準 SAM2 で良ければ tracker を SAM2.1（standard）に切り替えてください。"
+    )
+
+
 def _ensure_samurai_config_searchpath(config_name: str | None) -> None:
     """SAMURAI config をローカル sam2 package root から解決できるよう Hydra 検索パスに追加する。
 
@@ -217,7 +385,16 @@ def _ensure_samurai_config_searchpath(config_name: str | None) -> None:
 class SAM2VideoPropagator:
     """SAM2 video predictor で first-frame prompt から全 frame の mask を伝搬する Component。"""
 
-    def __init__(self, checkpoint_path: str | None = None, config_name: str | None = None, device: str | None = None) -> None:
+    def __init__(
+        self,
+        checkpoint_path: str | None = None,
+        config_name: str | None = None,
+        device: str | None = None,
+        offload_video_to_cpu: bool = False,
+        offload_state_to_cpu: bool = False,
+        autocast_dtype: str | None = "float16",
+        single_object_only: bool = False,
+    ) -> None:
         project_root = Path(os.environ.get("PROJECT_ROOT", Path(__file__).resolve().parents[2]))
         self.checkpoint_path = checkpoint_path or os.environ.get(
             "SAM2_CKPT_PATH",
@@ -225,7 +402,36 @@ class SAM2VideoPropagator:
         )
         self.config_name = config_name or os.environ.get("SAM2_CONFIG_NAME", "configs/sam2.1/sam2.1_hiera_l.yaml")
         self.device = device or default_device()
+        # SAM2 video state の CPU offload。SAMURAI 等で GPU 常駐メモリが大きい場合に
+        # 伝搬の最初の重い frame で VRAM 枯渇 stall になるのを防ぐ（ERR049）。registry
+        # (config/inference_models.toml) の tracker entry から渡し、既定は現状維持の False。
+        self.offload_video_to_cpu = bool(offload_video_to_cpu)
+        self.offload_state_to_cpu = bool(offload_state_to_cpu)
+        # 伝搬を mixed precision (autocast) で回し VRAM を抑え高速化する（ERR050）。SAMURAI 本家
+        # (scripts/main_inference.py) も torch.autocast("cuda", float16) を使う。device==cuda のときのみ
+        # 適用し、"none"/None/"" で無効化できる。registry の tracker entry から上書き可。
+        self.autocast_dtype = autocast_dtype
+        # SAMURAI は Kalman filter による単一オブジェクト追跡専用で、KF 状態を予測器インスタンスで
+        # 共有するため複数 obj を同時伝搬できない。fork の `_forward_sam_heads` も B=1 前提
+        # (`ious[0][best_iou_inds]`) で、複数 obj 時に 'Boolean value of Tensor with more than one
+        # value is ambiguous' で落ちる（ERR051）。samurai/ は変更しないため、registry の
+        # tracker entry から渡し、複数 obj を伝搬前に actionable に弾く。既定は後方互換で False。
+        self.single_object_only = bool(single_object_only)
         self._video_predictor: Any | None = None
+
+    def _autocast_context(self, torch_module: Any):
+        """device==cuda かつ autocast_dtype が有効なとき torch.autocast を返す（ERR050）。
+
+        CPU や無効指定時は nullcontext で既存挙動を維持する。
+        """
+        dtype_name = self.autocast_dtype
+        if self.device != "cuda" or dtype_name in (None, "", "none"):
+            return contextlib.nullcontext()
+        dtype = {
+            "float16": torch_module.float16,
+            "bfloat16": torch_module.bfloat16,
+        }.get(str(dtype_name), torch_module.float16)
+        return torch_module.autocast("cuda", dtype=dtype)
 
     def tracker_metadata(self) -> dict[str, Any]:
         """使用中の tracker config / checkpoint と samurai_mode を可視化用に公開する。"""
@@ -241,6 +447,7 @@ class SAM2VideoPropagator:
         if self._video_predictor is not None:
             return
         require_gpu_for_heavy_inference(self.__class__.__name__, self.device)
+        _require_samurai_capable_sam2(self.config_name)
         _ensure_samurai_config_searchpath(self.config_name)
         from sam2.build_sam import build_sam2_video_predictor
 
@@ -274,6 +481,15 @@ class SAM2VideoPropagator:
         prompt_frame_idx = int(prompt_frame_idx)
         if prompt_frame_idx < 0 or prompt_frame_idx >= len(frames):
             raise ValueError(f"prompt_frame_idx が範囲外です: {prompt_frame_idx}（許容 0〜{len(frames) - 1}）")
+        # ERR051: single_object_only な tracker(SAMURAI) は複数 obj を同時追跡できない。warm_up
+        # （モデル build）前に fail-fast し、原因と回避策を明示する。
+        requested_object_count = len(boxes) if boxes else 1
+        if self.single_object_only and requested_object_count > 1:
+            raise ValueError(
+                f"選択中の tracker は単一オブジェクト専用です（SAMURAI は Kalman filter による単一対象"
+                f"追跡のみ対応）。指定オブジェクト数={requested_object_count}。box / オブジェクトを 1 つに"
+                f"減らすか、複数対象を扱う場合は標準 SAM2 tracker に切り替えてください。"
+            )
         _notify_progress(progress_callback, "sam2_video", 0.0, "SAM2 video predictor を初期化しています")
         self.warm_up()
         _notify_progress(progress_callback, "sam2_video", 0.08, "SAM2 用の一時 frame を準備しています")
@@ -298,21 +514,28 @@ class SAM2VideoPropagator:
         source_indices = list((metadata or {}).get("metadata", {}).get("sampled_frame_indices", range(len(frames))))
         total_frames = max(len(frames), 1)
         propagation_total = total_frames * len(directions)
+        # frame 数ベースの間引きだと低速 GPU で通知間隔が数十秒に広がり SSE が idle 切断されるため（ERR048）、
+        # 時間ベース keep-alive throttle で進捗を流し接続を保つ。
+        prep_keepalive = _ProgressKeepAlive(progress_callback, "sam2_video")
+        propagate_keepalive = _ProgressKeepAlive(progress_callback, "sam2_video")
         with tempfile.TemporaryDirectory(prefix="sam2_video_frames_") as temp_dir:
             temp_path = Path(temp_dir)
             for frame_index, frame in enumerate(frames):
                 frame_rgb = ensure_rgb_array(frame)
                 cv2.imwrite(str(temp_path / f"{frame_index:06d}.jpg"), cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR))
-                if frame_index == 0 or (frame_index + 1) % 10 == 0 or frame_index + 1 == total_frames:
-                    _notify_progress(
-                        progress_callback,
-                        "sam2_video",
-                        0.08 + 0.12 * ((frame_index + 1) / total_frames),
-                        f"SAM2 用の一時 frame を準備しています ({frame_index + 1}/{total_frames})",
-                    )
-            with torch.inference_mode():
+                prep_keepalive.maybe(
+                    frame_index,
+                    total_frames,
+                    0.08 + 0.12 * ((frame_index + 1) / total_frames),
+                    f"SAM2 用の一時 frame を準備しています ({frame_index + 1}/{total_frames})",
+                )
+            with torch.inference_mode(), self._autocast_context(torch):
                 _notify_progress(progress_callback, "sam2_video", 0.22, "SAM2 の video state を初期化しています")
-                state = self._video_predictor.init_state(video_path=str(temp_path))
+                state = self._video_predictor.init_state(
+                    video_path=str(temp_path),
+                    offload_video_to_cpu=self.offload_video_to_cpu,
+                    offload_state_to_cpu=self.offload_state_to_cpu,
+                )
                 if boxes:
                     for obj_id, single_box in zip(range(1, len(boxes) + 1), boxes):
                         add_kwargs: dict[str, Any] = {
@@ -368,13 +591,12 @@ class SAM2VideoPropagator:
                             gathered_any = True
                         if not gathered_any:
                             continue
-                        if propagated_count == 1 or propagated_count % 10 == 0 or propagated_count == propagation_total:
-                            _notify_progress(
-                                progress_callback,
-                                "sam2_video",
-                                0.25 + 0.75 * (propagated_count / propagation_total),
-                                f"SAM2 mask を動画全体へ伝搬しています ({propagated_count}/{propagation_total})",
-                            )
+                        propagate_keepalive.maybe(
+                            propagated_count - 1,
+                            propagation_total,
+                            0.25 + 0.75 * (propagated_count / propagation_total),
+                            f"SAM2 mask を動画全体へ伝搬しています ({propagated_count}/{propagation_total})",
+                        )
         # id ベースで集めた logit を target_object_ids 順に (N,H,W) へ整列する。
         # ある pass で欠損した obj は -1e6（≒確率0）で埋め、チャネル位置と obj_id を固定対応させる。
         per_object_logits: dict[int, np.ndarray] = {}
@@ -439,6 +661,7 @@ class TransparentBGVideoExtractor:
         tb_output_type: str,
         crop_padding: int,
         mask_guard_feather: int,
+        mask_guard_dilate: int = 21,
     ) -> dict[str, np.ndarray]:
         """per_object モード: 対象ごとに crop tb を実行し、所有権でアルファ合成する（Phase2 ④⑤）。
 
@@ -451,7 +674,7 @@ class TransparentBGVideoExtractor:
             frame: 元フレーム (H,W,3)。
             logits: 対象ごとの SAM2 logit (N,H,W)。
             ownership: 所有権 (N+1,H,W)。先頭 N が前景、最終が背景。
-            tb_mode/tb_jit/tb_threshold/crop_padding/mask_guard_feather: tb 推論パラメータ。
+            tb_mode/tb_jit/tb_threshold/crop_padding/mask_guard_feather/mask_guard_dilate: tb 推論パラメータ。
             tb_output_type: preview の背景合成種別（green/white/blur/それ以外は rgba）。
 
         Returns:
@@ -472,6 +695,7 @@ class TransparentBGVideoExtractor:
                 tb_output_type="rgba",
                 crop_padding=int(crop_padding),
                 mask_guard_feather=int(mask_guard_feather),
+                mask_guard_dilate=int(mask_guard_dilate),
             )
             alpha_o = np.asarray(result["alpha"], dtype=np.float32) / 255.0
             per_object_alphas.append(alpha_o)
@@ -501,6 +725,7 @@ class TransparentBGVideoExtractor:
         tb_output_type: str = "rgba",
         crop_padding: int = 40,
         mask_guard_feather: int = 0,
+        mask_guard_dilate: int = 21,
         rgba_codec: str = "webm_vp9",
         video_matte_mode: str = "union",
         progress_callback: ProgressCallback | None = None,
@@ -532,15 +757,18 @@ class TransparentBGVideoExtractor:
         rgba_video_path: Path | None = None
         alpha_video_path: Path | None = None
         preview_video_path: Path | None = None
-        rgba_stream: _OpenCVFrameVideoWriter | None = None
+        rgba_stream: _ImageioAlphaVideoWriter | None = None
         alpha_stream: _OpenCVFrameVideoWriter | None = None
         preview_stream: _OpenCVFrameVideoWriter | None = None
         codec_fallback: list[tuple[str, str]] = []
         used_rgba_codec: str | None = None
         total_frames = max(len(frames), 1)
         _notify_progress(progress_callback, "transparent_bg", 0.0, "transparent-background を初期化しています")
+        # 低速 frame でも SSE 接続を保つため時間ベース keep-alive throttle を使う（ERR048）。
+        tb_keepalive = _ProgressKeepAlive(progress_callback, "transparent_bg")
         try:
             for local_index, frame in enumerate(frames):
+
                 source_index = int(source_indices[local_index]) if local_index < len(source_indices) else local_index
                 logits = per_object_logits.get(source_index)
                 ownership = ownership_by_frame.get(source_index)
@@ -563,6 +791,7 @@ class TransparentBGVideoExtractor:
                         tb_output_type=tb_output_type,
                         crop_padding=int(crop_padding),
                         mask_guard_feather=int(mask_guard_feather),
+                        mask_guard_dilate=int(mask_guard_dilate),
                     )
                 else:
                     mask = frame_masks.get(source_index)
@@ -575,6 +804,7 @@ class TransparentBGVideoExtractor:
                         tb_output_type=tb_output_type,
                         crop_padding=int(crop_padding),
                         mask_guard_feather=int(mask_guard_feather),
+                        mask_guard_dilate=int(mask_guard_dilate),
                     )
                 rgba_frame = normalize_rgba_frame(result["rgba"])
                 alpha_frame = np.asarray(result["alpha"]).astype(np.uint8, copy=False)
@@ -582,15 +812,15 @@ class TransparentBGVideoExtractor:
                 if local_index == 0 and normalized_mode in {"video", "both"}:
                     _notify_progress(progress_callback, "transparent_bg", 0.03, "動画 codec を確認しています")
                     video_helper = VideoWriter(str(self.output_dir))
-                    fourcc, suffix, codec_fallback = video_helper._select_rgba_codec(
+                    spec, codec_fallback = video_helper._select_rgba_codec(
                         rgba_frame.shape[:2],
                         preferred_rgba_codec=rgba_codec,
                     )
-                    rgba_video_path = video_dir / f"rgba{suffix}"
+                    rgba_video_path = video_dir / f"rgba{spec.suffix}"
                     alpha_video_path = video_dir / "alpha.mp4"
                     preview_video_path = video_dir / "preview.mp4"
-                    used_rgba_codec = suffix.lstrip(".")
-                    rgba_stream = _OpenCVFrameVideoWriter(rgba_video_path, rgba_frame, fps, fourcc, channels=4)
+                    used_rgba_codec = spec.label
+                    rgba_stream = _ImageioAlphaVideoWriter(rgba_video_path, rgba_frame, fps, spec)
                     alpha_stream = _OpenCVFrameVideoWriter(alpha_video_path, alpha_frame, fps, "mp4v", channels=1)
                     preview_stream = _OpenCVFrameVideoWriter(preview_video_path, preview_frame, fps, "mp4v", channels=3)
                 if rgba_stream is not None:
@@ -603,13 +833,12 @@ class TransparentBGVideoExtractor:
                     write_png_frame(rgba_dir / f"frame_{local_index:06d}.png", rgba_frame)
                     write_png_frame(alpha_dir / f"frame_{local_index:06d}.png", alpha_frame)
                     write_png_frame(preview_dir / f"frame_{local_index:06d}.png", preview_frame)
-                if local_index == 0 or (local_index + 1) % 5 == 0 or local_index + 1 == total_frames:
-                    _notify_progress(
-                        progress_callback,
-                        "transparent_bg",
-                        (local_index + 1) / total_frames,
-                        f"transparent-background を frame ごとに適用・保存しています ({local_index + 1}/{total_frames})",
-                    )
+                tb_keepalive.maybe(
+                    local_index,
+                    total_frames,
+                    (local_index + 1) / total_frames,
+                    f"transparent-background を frame ごとに適用・保存しています ({local_index + 1}/{total_frames})",
+                )
         finally:
             for stream in (rgba_stream, alpha_stream, preview_stream):
                 if stream is not None:
@@ -687,6 +916,7 @@ class TrackingOverlayWriter:
         overlay_stream: _OpenCVFrameVideoWriter | None = None
         total_frames = max(len(frames), 1)
         _notify_progress(progress_callback, "tracking_overlay", 0.0, "追跡確認用 overlay を生成しています")
+        overlay_keepalive = _ProgressKeepAlive(progress_callback, "tracking_overlay")
         try:
             for local_index, frame in enumerate(frames):
                 source_index = int(source_indices[local_index]) if local_index < len(source_indices) else local_index
@@ -700,13 +930,13 @@ class TrackingOverlayWriter:
                     overlay_stream = _OpenCVFrameVideoWriter(overlay_video_path, overlay_frame, fps, "mp4v", channels=3)
                 overlay_stream.write(overlay_frame)
                 write_png_frame(overlay_sequence_dir / f"frame_{local_index:06d}.png", overlay_frame)
-                if local_index == 0 or (local_index + 1) % 5 == 0 or local_index + 1 == total_frames:
-                    _notify_progress(
-                        progress_callback,
-                        "tracking_overlay",
-                        (local_index + 1) / total_frames,
-                        f"追跡確認用 overlay を frame ごとに保存しています ({local_index + 1}/{total_frames})",
-                    )
+                overlay_keepalive.maybe(
+                    local_index,
+                    total_frames,
+                    (local_index + 1) / total_frames,
+                    f"追跡確認用 overlay を frame ごとに保存しています ({local_index + 1}/{total_frames})",
+                )
+
         finally:
             if overlay_stream is not None:
                 overlay_stream.close()
@@ -733,21 +963,6 @@ class VideoWriter:
 
     def __init__(self, output_dir: str = "outputs") -> None:
         self.output_dir = _resolve_output_dir(output_dir)
-        self._codec_cache: dict[str, bool] = {}
-
-    def _test_codec(self, codec: str, suffix: str, frame_shape: tuple[int, int], channels: int = 3) -> bool:
-        if codec in self._codec_cache:
-            return self._codec_cache[codec]
-        self.output_dir.mkdir(parents=True, exist_ok=True)
-        test_path = self.output_dir / f"_codec_test_{codec}{suffix}"
-        fourcc = cv2.VideoWriter_fourcc(*codec)
-        writer = cv2.VideoWriter(str(test_path), fourcc, 1.0, (frame_shape[1], frame_shape[0]), isColor=channels != 1)
-        ok = writer.isOpened()
-        writer.release()
-        if test_path.exists():
-            test_path.unlink()
-        self._codec_cache[codec] = ok
-        return ok
 
     def warm_up(self) -> None:
         """Haystack Pipeline の no-arg warm_up 契約に合わせる。"""
@@ -757,21 +972,48 @@ class VideoWriter:
         self,
         frame_shape: tuple[int, int],
         preferred_rgba_codec: str = "webm_vp9",
-    ) -> tuple[str, str, list[tuple[str, str]]]:
-        """利用可能な動画 codec を確認し、RGBA 用 codec を選ぶ。"""
-        fallback: list[tuple[str, str]] = []
-        candidates = []
+    ) -> tuple[_RgbaCodecSpec, list[tuple[str, str]]]:
+        """RGBA(透過)動画用の imageio+ffmpeg codec spec を選ぶ。
+
+        cv2.VideoWriter は 4ch(RGBA) frame を書けず全 frame skip するため使わない。
+        webm_vp9(libvpx-vp9/yuva420p) を既定、mov_png(png/rgba) を代替とする。
+        imageio[ffmpeg] が無い場合は握り潰さず連番出力を促すエラーにする（ERR047）。
+
+        Args:
+            frame_shape: (height, width)。spec 選択自体には未使用だが契約を維持する。
+            preferred_rgba_codec: "webm_vp9" もしくは "mov_png"。
+
+        Returns:
+            (選択した _RgbaCodecSpec, 候補ごとの採否ログ)。
+
+        Raises:
+            RuntimeError: imageio[ffmpeg] が利用できない場合。
+        """
+        # ffmpeg(imageio) 可用性を先に検証（cv2 isOpened のような偽陽性を避ける）。
+        _require_imageio()
+        webm_spec = _RgbaCodecSpec(
+            label="webm_vp9",
+            suffix=".webm",
+            codec="libvpx-vp9",
+            pixelformat="yuva420p",
+            # VP9 alpha は auto-alt-ref を無効化する必要がある。yuv420p のため偶数に padding。
+            output_params=("-auto-alt-ref", "0"),
+            macro_block_size=2,
+        )
+        mov_spec = _RgbaCodecSpec(
+            label="mov_png",
+            suffix=".mov",
+            codec="png",
+            pixelformat="rgba",
+            output_params=(),
+            macro_block_size=1,
+        )
         if preferred_rgba_codec == "mov_png":
-            candidates.append(("png ", ".mov", "mov_png"))
+            chosen = mov_spec
         else:
-            candidates.append(("VP90", ".webm", "webm_vp9"))
-            candidates.append(("png ", ".mov", "mov_png"))
-        for fourcc, suffix, label in candidates:
-            if self._test_codec(fourcc, suffix, frame_shape, channels=4):
-                fallback.append((label, "ok (used)"))
-                return fourcc, suffix, fallback
-            fallback.append((label, "failed (skipped)"))
-        raise ValueError("RGBA 動画を書き出せる codec が見つかりません。連番出力を選択してください。")
+            chosen = webm_spec
+        fallback = [(chosen.label, "ok (used)")]
+        return chosen, fallback
 
     def _write_video(
         self,
@@ -818,6 +1060,34 @@ class VideoWriter:
         finally:
             writer.release()
 
+    def _write_rgba_video(
+        self,
+        path: Path,
+        frames: list[np.ndarray],
+        fps: float,
+        spec: _RgbaCodecSpec,
+        progress_callback: ProgressCallback | None = None,
+        progress_prefix: str = "RGBA 動画を書き出しています",
+    ) -> None:
+        """RGBA(透過)動画を imageio+ffmpeg で書き出す（cv2 は 4ch 不可）。"""
+        if not frames:
+            raise ValueError(f"動画に書き出す frame がありません: {path}")
+        stream = _ImageioAlphaVideoWriter(path, frames[0], fps, spec)
+        try:
+            total_frames = max(len(frames), 1)
+            for frame_index, frame in enumerate(frames):
+                stream.write(frame)
+                written_count = frame_index + 1
+                if written_count == 1 or written_count % 20 == 0 or written_count == total_frames:
+                    _notify_progress(
+                        progress_callback,
+                        "video_writer",
+                        written_count / total_frames,
+                        f"{progress_prefix} ({written_count}/{total_frames})",
+                    )
+        finally:
+            stream.close()
+
     @component.output_types(matte=dict)
     def run(
         self,
@@ -840,17 +1110,16 @@ class VideoWriter:
                 return {"matte": matte}
             raise ValueError("RGBA frame が空です。")
         _notify_progress(progress_callback, "video_writer", 0.0, "RGBA 動画 codec を確認しています")
-        fourcc, suffix, fallback = self._select_rgba_codec(rgba_frames[0].shape[:2], preferred_rgba_codec=rgba_codec)
-        rgba_path = video_dir / f"rgba{suffix}"
+        spec, fallback = self._select_rgba_codec(rgba_frames[0].shape[:2], preferred_rgba_codec=rgba_codec)
+        rgba_path = video_dir / f"rgba{spec.suffix}"
         alpha_path = video_dir / "alpha.mp4"
         preview_path = video_dir / "preview.mp4"
         _notify_progress(progress_callback, "video_writer", 0.10, "RGBA 動画を書き出しています")
-        self._write_video(
+        self._write_rgba_video(
             rgba_path,
             rgba_frames,
             matte.get("fps", 30.0),
-            fourcc,
-            channels=4,
+            spec,
             progress_callback=progress_callback,
             progress_prefix="RGBA 動画を書き出しています",
         )
@@ -880,7 +1149,7 @@ class VideoWriter:
         updated["alpha_video_path"] = str(alpha_path)
         updated["preview_video_path"] = str(preview_path)
         updated.setdefault("metadata", {})["codec_fallback"] = fallback
-        updated.setdefault("metadata", {})["used_rgba_codec"] = suffix.lstrip(".")
+        updated.setdefault("metadata", {})["used_rgba_codec"] = spec.label
         return {"matte": updated}
 
 

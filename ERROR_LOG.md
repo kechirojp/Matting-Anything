@@ -1279,7 +1279,310 @@ hydra.errors.MissingConfigException: Cannot find primary config 'configs/samurai
 - 回帰テスト `_samurai_config_root`（samurai / 非 samurai）と warm_up のヘルパ呼出契約テストを追加。
 
 
-### [ERR039] 動画/静止画の切り抜き alpha が SAM2 mask の外接矩形で「横一直線」に切れる
+### [ERR041] SAMURAI tracker が facebook 版 sam2 では動かない（検索パス追加だけでは不十分）— fork 導入が必須
+
+| 項目 | 内容 |
+|------|------|
+| **深刻度** | High |
+| **頻度** | Colab 等 facebook 版 sam2 環境で SAMURAI tracker を選ぶ度に再発（ERR038 対処後も） |
+| **初回発生日** | 2026-06-19 |
+| **関連ファイル** | `pipelines/components/video_model_components.py`, `Sam2_Transparent_Background_Haystack_for_Movie.py`, `config/inference_models.toml` |
+
+**エラー内容**:
+```
+hydra.errors.MissingConfigException: Cannot find primary config 'configs/samurai/sam2.1_hiera_l.yaml'
+Config search path:
+	provider=hydra, path=pkg://hydra.conf
+	provider=main, path=pkg://sam2
+	provider=schema, path=structured://
+```
+ERR038 の `_ensure_samurai_config_searchpath`（検索パス append）を入れても、Colab で SAMURAI tracker 選択時に同じ MissingConfigException が再発（append した `samurai-local` provider が compose 時の検索パスに現れない）。
+
+**原因（真因）**:
+Colab notebook が **facebook 版 sam2**（`pip install git+https://github.com/facebookresearch/sam2.git`）を導入していた。SAMURAI は config だけの問題ではなく、
+1. facebook 版 sam2 package に `configs/samurai/` が無い（→ MissingConfigException）。
+2. 仮に config を解決できても、`configs/samurai/sam2.1_hiera_l.yaml` は `sam2.modeling.sam2_base.SAM2Base` に `samurai_mode` / `stable_frames_threshold` / `kf_score_weight` 等を渡すが、facebook 版 `SAM2Base` はこれらを受け付けず instantiate で `TypeError`。
+
+つまり SAMURAI には **samurai 対応のモデルコードを持つ fork（同梱 `samurai/sam2`）を `sam2` として import させること**が必須。ERR038 の Hydra 検索パス append は config 配置の症状対処に過ぎず、モデルコード差異は解決できない（false hope）。SAMURAI は訓練不要モジュールで checkpoint は標準 `sam2.1_hiera_large.pt` を再利用するため追加 DL は不要。
+
+**対処法（samurai/ は変更しない: 読み取り＋ installed package 差し替え）**:
+- Colab notebook（`Sam2_Transparent_Background_Haystack_for_Movie.py` 正本）: Cell 1 から facebook sam2 install を削除し、Cell 2（Drive マウント後）で同梱 fork を editable 導入 `pip install -e "{PROJECT_ROOT}/samurai/sam2"`。fork は `configs/sam2.1/` と `configs/samurai/` の両方を含むため facebook / SAMURAI 両 tracker を 1 つの sam2 で賄う。Cell 2.5 の診断メッセージも fork 参照へ更新。`.ipynb` は jupytext で再生成。
+- `_require_samurai_capable_sam2(config_name)` を追加し `warm_up()` の build 直前で呼ぶ。samurai config のとき installed sam2 の `Path(sam2.__file__).parent / configs / samurai` を検査し、無ければ **actionable な RuntimeError**（`pip install -e samurai/sam2` を促す / 標準 SAM2 への切替案内）を raise。cryptic な MissingConfigException / TypeError を回避。非 samurai config では `import sam2` せず no-op。
+
+**再発防止**:
+- SAMURAI tracker は「config 配置」ではなく「import される sam2 が SAMURAI fork であること」が前提。env / 検索パス append だけでは不十分（ERR038 の教訓を更新）。
+- fork は標準 config も内包するため、Colab では sam2 を fork 一本に統一してよい（facebook tracker も動作）。追加 checkpoint は不要（標準 sam2.1 重みを再利用）。
+- 新カーネルで「上から順に全セル実行」する前提。同一カーネルで先に facebook sam2 を import 済みの場合は editable install が反映されないため、ランタイム再起動が必要（診断メッセージに明記）。
+- 回帰テスト: `_require_samurai_capable_sam2`（facebook で raise / fork で pass / 非 samurai で no-op、`sys.modules` の fake sam2 で GPU 非依存に検証）を追加。
+
+
+### [ERR045] Colab で SAMURAI fork の editable install（Drive）が失敗し sam2 が入らない + `_C` 未ビルドで伝搬が落ちる
+
+| 項目 | 内容 |
+|------|------|
+| **深刻度** | High |
+| **頻度** | Colab で Drive 上の `pip install -e samurai/sam2` を使う度に再発（ERR041 の対処方法を実機適用したら失敗） |
+| **初回発生日** | 2026-06-20 |
+| **関連ファイル** | `Sam2_Transparent_Background_Haystack_for_Movie.py`（Cell 2 / Cell 2.5）, `samurai/sam2/setup.py`（参照のみ・変更不可） |
+
+**エラー内容**:
+```
+ModuleNotFoundError: No module named 'sam2'
+```
+ERR041 の対処として Cell 2 で `!{sys.executable} -m pip install -e "{PROJECT_ROOT}/samurai/sam2"`（editable）を実行したが、`!pip` は失敗しても例外を出さないためそのまま進み、Cell 2.5 の `import sam2` で `ModuleNotFoundError` が表面化した。
+
+**原因（2 つの独立した問題）**:
+1. **Drive(FUSE) 上の editable install が失敗**: `pip install -e` は `.pth` / `*.egg-info` をソースディレクトリ（= Google Drive マウント）に書き込むが、Drive FUSE はこれらの書き込み・ロックに失敗しやすく、結果 sam2 が site-packages に登録されない。`!pip` は非ゼロ終了でもセルを止めないため、失敗が後段の cryptic なエラーに化ける。
+2. **`_C`（CUDA 拡張）未ビルド**: `samurai/sam2/sam2/build_sam.py` が `build_sam2_video_predictor` で Hydra override `++model.fill_hole_area=8` を強制する。伝搬中 `sam2_video_predictor.py` の `if self.fill_hole_area > 0:` → `fill_holes_in_mask_scores` → `sam2/utils/misc.py` の `get_connected_components` が `from sam2 import _C; return _C.get_connected_componnets(...)` を **CPU fallback 無し**で呼ぶ。通常の `pip install`（build isolation 有効）では分離環境に torch が無く、setup.py の `get_extensions()` が `BUILD_ALLOW_ERRORS=1` で `ext_modules=[]` に縮退 → `_C` がビルドされず、伝搬時に `ModuleNotFoundError: sam2._C` で落ちる。
+
+**対処法（samurai/ は変更しない: notebook の install 方法のみ修正）**:
+- Cell 2 の install を **非 editable + `--no-build-isolation`** に変更:
+  `!{sys.executable} -m pip install --no-build-isolation "{SAMURAI_SAM2_DIR_POSIX}"`。
+  - 非 editable: pip がソースを temp に複製してビルドするため Drive の `.pth`/egg 書き込み失敗を回避。`configs/*.yaml`（`configs/sam2.1`・`configs/samurai`）は `MANIFEST.in` の `recursive-include sam2 *.yaml` + `include_package_data` で wheel に同梱される。
+  - `--no-build-isolation`: 現環境の torch を見せて `_C`（connected_components）を Colab GPU の nvcc でビルド。これで伝搬時の `fill_hole_area=8` 経路が動く。
+- install 直後に **fail-loud 検証**を追加: `importlib.invalidate_caches()` 後 `importlib.util.find_spec("sam2") is None` なら actionable な RuntimeError を raise（pip ログ確認 / GPU ランタイム・CUDA 整合を案内）。`!pip` の沈黙失敗が Cell 2.5 で cryptic 化するのを防ぐ。
+- Cell 2.5 の診断メッセージも `pip install --no-build-isolation samurai/sam2`（非 editable）参照へ更新。`.ipynb` は jupytext 再生成。
+
+**再発防止**:
+- Google Drive 上のパッケージは **editable(`-e`) を避け非 editable で install** する（FUSE の .pth/egg 書き込み失敗回避）。
+- notebook の `!pip install` は **fail-loud 化**（直後に import/find_spec で成功確認し、失敗なら raise）して沈黙失敗を後段に伝播させない。
+- SAM2 動画伝搬は `fill_hole_area>0`（既定 8）で `sam2._C` が必須・CPU fallback 無し。`_C` をビルドするには **`--no-build-isolation`**（torch を見せる）と nvcc が要る。build isolation 既定の `pip install` だけでは `_C` が入らない（facebook 版でも同様）。
+- 同一カーネルで先に sam2 を import 済みなら再 install が反映されないため、Colab はランタイム再起動 → 上から順に全セル実行を前提にする。
+
+
+### [ERR046] SAMURAI fork の `sam2_base.py` が `loguru` を import するが fork の依存に未宣言で `ModuleNotFoundError`
+
+| 項目 | 内容 |
+|------|------|
+| **深刻度** | High |
+| **頻度** | SAMURAI fork を install 後、`build_sam2_video_predictor` 初回呼び出しで再発 |
+| **初回発生日** | 2026-06-21 |
+| **関連ファイル** | `Sam2_Transparent_Background_Haystack_for_Movie.py`（Cell 1）, `samurai/sam2/sam2/modeling/sam2_base.py`（参照のみ・変更不可）, `samurai/sam2/setup.py`（参照のみ・変更不可） |
+
+**エラー内容**:
+```
+ModuleNotFoundError: No module named 'loguru'
+```
+`build_sam2_video_predictor` → `instantiate(cfg.model)` → `sam2.sam2_video_predictor` → `sam2.modeling.sam2_base` の冒頭 `from loguru import logger` で発生。
+
+**原因**:
+SAMURAI fork の `samurai/sam2/sam2/modeling/sam2_base.py` が `loguru` を import するが、fork の `samurai/sam2/setup.py` の `REQUIRED_PACKAGES`（torch / torchvision / numpy / tqdm / hydra-core / iopath / pillow のみ）に `loguru` が含まれない。このため fork を `pip install` しても `loguru` が入らず、伝搬器のビルド時に表面化する。facebook 版 sam2 には無い fork 固有の追加依存。
+
+**対処法（samurai/ は変更しない: notebook の install のみ修正）**:
+- Cell 1 に `!{sys.executable} -m pip install loguru` を追加して明示導入。理由コメント（ERR046）を併記。`.ipynb` は jupytext 再生成。
+- 回帰テスト `tests/unit/test_jupytext_notebooks.py::test_sam2_movie_notebook_installs_loguru_for_samurai_fork` で `pip install loguru` の存在を検証。
+
+**再発防止**:
+- vendored fork は宣言されない実行時依存（`loguru` 等）を持つことがある。fork の import を grep し、`setup.py` の `install_requires` に無いものは notebook 側で明示 install する。
+
+
+### [ERR047] RGBA(透過)動画が `cv2.VideoWriter` で全 frame skip され空動画になる（4ch 非対応 / VP90 webm 不可）
+
+| 項目 | 内容 |
+|------|------|
+| **深刻度** | High |
+| **頻度** | 動画モード + RGBA 出力で毎回 |
+| **初回発生日** | 2026-06-21 |
+| **関連ファイル** | `pipelines/components/video_model_components.py`（`_OpenCVFrameVideoWriter` / `_select_rgba_codec` / `TransparentBGVideoExtractor.run` / `VideoWriter`）, `gradio_app_sam2_transparent_BG_haystack_for_Movie.py`（RGBA codec radio info） |
+
+**エラー内容**:
+```
+OpenCV: FFMPEG: tag 0x30395056/'VP90' is not supported with codec id 167 and format 'webm / WebM'
+global cap_ffmpeg_impl.hpp:2774 writeFrame write frame skipped - expected 3 channels but got 4
+global cap_ffmpeg.cpp:218 write FFmpeg: Failed to write frame
+UserWarning: Video does not have browser-compatible container or codec. Converting to mp4.
+```
+SAMURAI 伝搬・transparent-background までは成功するが、RGBA 動画の書き出し段で全 frame が skip され、透過 webm が空（中身なし）になる。
+
+**原因**:
+`cv2.VideoWriter` は 4ch(RGBA/BGRA) frame を書けない（`isColor` は 1ch/3ch のみ）。BGRA を渡すと FFmpeg が "expected 3 channels but got 4" で **毎 frame skip**。さらに OpenCV の VP9/webm 経路は `VP90` fourcc を webm コンテナで拒否する。旧 `_select_rgba_codec` は `cv2.VideoWriter.isOpened()` だけで可用性判定していたが、VP90 では **open は成功する（偽陽性）**ため、実書き込みの失敗を検知できなかった。OpenCV は本質的に alpha 動画を書けない（真の透過は ffmpeg の `libvpx-vp9`+`yuva420p` 等が必要）。
+
+**対処法（samurai/ は変更しない）**:
+- RGBA stream を `cv2.VideoWriter` から **imageio+ffmpeg** に置換。`_require_imageio()`（`imageio.v2` + `imageio_ffmpeg` を遅延 import、無ければ握り潰さず連番(PNG)出力を促す `RuntimeError`）、`_RgbaCodecSpec`、`_ImageioAlphaVideoWriter`（`append_data` で RGB order RGBA をそのまま書く）を追加。
+- `_select_rgba_codec` は cv2 fourcc ではなく alpha 対応 imageio spec を返す: `webm_vp9` → codec `libvpx-vp9` / pixelformat `yuva420p` / `output_params=("-auto-alt-ref","0")` / `macro_block_size=2`（奇数解像度を偶数へ自動スケール、yuv420p 要件）。`mov_png` → codec `png` / pixelformat `rgba` / `macro_block_size=1`。
+- alpha(1ch) / preview(3ch) は従来通り `_OpenCVFrameVideoWriter`（cv2 で問題なし）。4ch を cv2 に渡す経路は撤廃。
+- 偽陽性の元だった `_test_codec` / `_codec_cache` を削除。UI の RGBA codec info から誤解を招く「自動で他方式に fallback」を削除し「imageio+ffmpeg で alpha 保持・書けない環境は連番(PNG)が確実」に更新。
+- 依存: Cell 1 は既に `imageio[ffmpeg]` を install 済みのため notebook 変更不要。
+- 回帰テスト `tests/unit/test_movie_runtime_bugs.py`（Bug D）: spec が alpha 対応 imageio パラメータを返す / imageio 欠如時に明確エラー / 動画モードの RGBA stream が 4ch を imageio へ append し cv2 へ渡さない。
+
+**再発防止**:
+- `cv2.VideoWriter` は RGB(3ch)/gray(1ch) 専用。alpha 動画は ffmpeg 直叩き（imageio+ffmpeg, `yuva420p`/`rgba`）でしか作れない。codec 可用性を `isOpened()` だけで判定しない（実書き込みの channel mismatch を見逃す）。
+- `macro_block_size` は imageio-ffmpeg の正規パラメータ（奇数解像度を偶数へスケール）。`2` で yuva420p 要件を満たす。
+- 真の alpha 動画の実エンコード検証は Colab（imageio+ffmpeg+GPU）でのみ可能。ローカルは mock + 全テスト + smoke の論理検証に留まる。
+
+
+### [ERR048] Colab/gradio.live で長時間の動画処理中に SSE 接続が idle 切断され全出力が「Error」表示になる（処理は継続）
+
+| 項目 | 内容 |
+|------|------|
+| **深刻度** | High |
+| **頻度** | Colab 共有リンクで動画処理が数分かかる時（特に低速 GPU） |
+| **初回発生日** | 2026-06-22 |
+| **関連ファイル** | `pipelines/components/video_model_components.py`（`_ProgressKeepAlive` / `SAM2VideoPropagator.run` / `TransparentBGVideoExtractor.run` / tracking overlay ループ） |
+
+**エラー内容**:
+```
+Error
+Connection errored out.
+```
+UI の出力欄（RGBA / Alpha / Preview Video, Tracking Overlay, 連番 PNG サンプル）が**全て "Error" 表示**になる。一方 Colab stdout には例外が出ず、`propagate in video: 24% 18/74 [00:52<03:33, 3.81s/it]` のように **SAM2 伝搬処理は継続している**。
+
+**原因**:
+Colab / gradio.live の共有トンネルは event SSE 接続に無通信が一定時間続くと idle 切断する。ブラウザ側は pending 中の全出力を "Error" にするが、サーバ側 Python 関数は最後まで実行を続ける（だから stdout に例外が出ない）。進捗通知が **frame 数ベースの間引き**（伝搬ループ `propagated_count % 10`、tb/overlay ループ `% 5`）だったため、実測 3.81s/it の低速 GPU では伝搬ループで **最大約38秒の無通信ギャップ**が生じ、その間に SSE が切れていた。`Connection errored out` はブラウザ汎用表示で、一次情報は Colab stdout（伝搬が継続している＝接続のみの問題）。
+
+**対処法（samurai/ は変更しない）**:
+- 時間ベースの keep-alive throttle `_ProgressKeepAlive` を追加。`maybe(index, total, fraction, description, force=False)` が「最初/最後の frame（`index<=0 or index+1>=total`）」「`force`」「前回送信から `_PROGRESS_KEEPALIVE_SEC=2.0` 秒経過」のいずれかで `_notify_progress` を呼ぶ。`clock` を注入可能にしテスト決定論化。
+- `SAM2VideoPropagator.run` の frame 準備ループ・伝搬ループ、`TransparentBGVideoExtractor.run`(streaming) の tb ループ、tracking overlay ループの進捗通知を、frame 数間引き（`% 10` / `% 5`）から `_ProgressKeepAlive.maybe` に置換。frame 速度によらず無通信ギャップを最大 2.0 秒に抑え SSE 接続を維持する。
+- legacy `VideoWriter._write_*` ループ（cv2 frame 書き込み・高速）は対象外（`% 20` 維持。1 frame が ms 単位で無通信ギャップ無し）。
+- 回帰テスト `tests/unit/test_progress_keepalive.py`（5 件）: 境界 frame 発火 / 旧 frame 数ベースなら落ちる「非境界 frame でも経過時間で発火」/ 間隔内抑制 / force / None no-op を FakeClock 注入で検証。
+
+**再発防止**:
+- 長時間ループの進捗通知は **frame 数ベースの間引きにしない**（低速 frame で無通信ギャップが数十秒に広がり SSE が切れる）。時間ベース keep-alive（最大数秒間隔）で接続を保つ。
+- `Connection errored out` + 全出力 "Error" でも、Colab stdout で処理（`propagate in video` 等）が継続していれば接続のみの問題。サーバ stdout を一次情報にする（ERR026/ERR027 と同方針）。
+- keep-alive 間隔は内部チューニング定数 `_PROGRESS_KEEPALIVE_SEC`（モデルパラメータではない）。Colab SSE idle timeout（概ね 30s 以上）に対し十分小さい 2.0s。
+- 実機 Colab での接続維持はユーザー要確認（ローカル .venv は torch/sam2/GPU 無しのためロジック検証に留まる）。
+
+
+### [ERR049] Colab T4 で SAMURAI 動画伝搬が最初の重い frame で GPU メモリ枯渇 stall し stdout が `propagate 1/N` で凍結する
+
+| 項目 | 内容 |
+|------|------|
+| **深刻度** | High |
+| **頻度** | Colab T4(16GB) 等で SAMURAI tracker を使い双方向伝搬する時 |
+| **初回発生日** | 2026-06-22 |
+| **関連ファイル** | `pipelines/components/video_model_components.py`（`SAM2VideoPropagator.__init__` / `run` の `init_state`）, `config/inference_models.toml`（SAMURAI tracker entry）, `gradio_app_sam2_transparent_BG_haystack_for_Movie.py`（`get_video_pipeline`） |
+
+**エラー内容**:
+```
+propagate in video:   1%|          | 1/67 [..:..<..:.., ...s/it]
+（ここで stdout が完全に凍結し、例外も進捗更新も出ない）
+```
+動画背景透過が SAM2 *video propagation* の最初の重い frame で固まる。ERR048（SSE idle 切断）と異なり、**stdout 自体が `1/67` から進まない**（＝バックエンドの hang）。**標準 SAM2 では出ず、SAMURAI checkpoint を使った時だけ**発生する。
+
+**原因**:
+SAMURAI は motion-aware memory（Kalman filter 状態）を持ち GPU 常駐メモリが標準 SAM2 より大きい。加えて T4(Turing 7.5) は非 Ampere で Flash Attention が無効化され attention のメモリ実装が重い。双方向伝搬（forward + reverse）は 2 pass 分の per-frame memory が積み上がるため、伝搬の最初の重い frame で VRAM を使い切り、CUDA アロケータがメモリ確保待ち/スラッシングで事実上 stall する（OOM 例外を投げ切らず固まる）。`samurai/` の `init_state` / `propagate_in_video` 自体は bounded ループで無限ループではない（コード確認済み）＝hang ではなく stall。
+
+**対処法（samurai/ は変更しない）**:
+- SAM2 標準の CPU offload（`init_state(offload_video_to_cpu=..., offload_state_to_cpu=...)`）を有効化して常駐 VRAM を抑える。SAMURAI fork の `init_state` は両 kwarg を受け取る（レビューで署名確認済み: `samurai/sam2/sam2/sam2_video_predictor.py`）。
+- ハードコードせず **config 駆動**: `config/inference_models.toml` の SAMURAI tracker entry（`samurai_hiera_l` / `samurai_hiera_b_plus`）にのみ `offload_video_to_cpu = true` / `offload_state_to_cpu = true` を追加。標準 SAM2 entry（`sam2_hiera_l` / `sam2_hiera_b_plus`）は無変更で動作実績のある経路を保つ。
+- `SAM2VideoPropagator.__init__` に `offload_video_to_cpu: bool = False` / `offload_state_to_cpu: bool = False`（既定 False=現状維持）を追加し、`run` の `init_state` 呼び出しに転送。`get_video_pipeline` が tracker entry の `.get("offload_video_to_cpu", False)` 等を読んで propagator に渡す（非 SAMURAI entry は既定 False で無影響）。
+- 回帰テスト `tests/unit/test_video_pipeline_wiring.py`（4 件）: 既定で offload 無効 / offload 有効時に `init_state` へ kwargs が届く / SAMURAI registry entry のみ offload 有効・標準 SAM2 は無効 / `get_video_pipeline` が offload 設定を読む。fake predictor の `init_state` を `**kwargs` 受け入れに更新。
+
+**再発防止**:
+- 低 VRAM GPU での長尺・双方向動画伝搬は **CPU offload を前提**にする。stall（stdout が `1/N` で凍結・例外なし）は OOM 例外を投げ切れないメモリ枯渇のサイン。一次情報は Colab stdout（`propagate in video` が進むか止まるか）。
+- offload はモデルパラメータではなく実行環境向けの config。GPU メモリに余裕がある環境（標準 SAM2 / 大容量 VRAM）では無効のままにして I/O オーバーヘッドを避ける。
+- offload でも解消しない場合の follow-up 候補（本タスク未実施）: ① SAMURAI の KF 状態が cache されたモデルに残り pass/run 間でリセットされない（正確性懸念）, ② 双方向 + SAMURAI は reverse pass が forward の KF 状態を流用する点が意味的に疑問。
+- 実機 Colab T4 での stall 解消はユーザー要確認（ローカル .venv は torch/sam2/GPU 無しのため配線検証に留まり、freeze 自体は再現不能）。
+
+
+
+
+### [ERR050] SAMURAI 動画伝搬の VRAM 枯渇 follow-up（autocast fp16 / 双方向自動 OFF / 起点先頭 / 推奨設定明記）
+
+| 項目 | 内容 |
+|------|------|
+| **深刻度** | High |
+| **頻度** | Colab T4(16GB) 等で SAMURAI tracker を使う時（ERR049 と同条件） |
+| **初回発生日** | 2026-06-22 |
+| **関連ファイル** | `pipelines/components/video_model_components.py`（`SAM2VideoPropagator.__init__` / `_autocast_context` / `run`）, `config/inference_models.toml`（tracker entry）, `gradio_app_sam2_transparent_BG_haystack_for_Movie.py`（`get_video_pipeline` / `update_bidirectional_for_tracker` / 冒頭 Markdown / info 文言）, `Sam2_Transparent_Background_Haystack_for_Movie.py`（先頭セル） |
+
+**エラー内容**:
+ERR049（CPU offload）後も SAMURAI 動画伝搬の VRAM が逼迫しうる。SAMURAI 本家の推論スクリプト（`samurai/scripts/main_inference.py`）は ① `torch.autocast("cuda", dtype=float16)` で伝搬、② 起点フレーム 0、③ forward-only（reverse を使わない）を前提とするが、本リポジトリの propagator は autocast 未適用（fp32）で VRAM を余計に使い、UI は SAMURAI でも双方向伝搬 ON を許していた（逆走は KF が破綻し per-frame memory も 2 倍）。
+
+**原因**:
+- 伝搬を fp32 で実行 → SAMURAI 本家比で VRAM 消費が大きい。
+- 双方向伝搬（reverse pass）は SAMURAI の Kalman filter の速度ベクトルが反転し追跡が崩れる上、2 pass 分の常駐メモリが積み上がり ERR049 の stall を誘発する anti-pattern。
+- 末尾起点フレームは forward-only の SAMURAI で逆走を強い、同様に stall を誘発しうる。
+
+**対処法（samurai/ は変更しない）**:
+- **autocast fp16（config 駆動）**: `SAM2VideoPropagator.__init__` に `autocast_dtype: str | None = "float16"` と helper `_autocast_context` を追加。`run` の `with torch.inference_mode():` を `with torch.inference_mode(), self._autocast_context(torch):` に変更。autocast は `device == "cuda"` かつ dtype が `None/""/"none"` 以外のときだけ適用し、それ以外は `contextlib.nullcontext()` で既存挙動を保つ。`float16`/`bfloat16` を map。`get_video_pipeline` が tracker entry の `.get("autocast_dtype", "none")` を渡す。
+- **標準 SAM2 経路は無変更**: 標準 SAM2 entry（`sam2_hiera_l` / `sam2_hiera_b_plus`）は `autocast_dtype = "none"`（fp32 維持）。SAMURAI entry（`samurai_hiera_l` / `samurai_hiera_b_plus`）のみ `autocast_dtype = "float16"`。実績ある標準経路の数値挙動を一切変えない（レビュー指摘反映）。
+- **双方向自動 OFF（config 駆動）**: tracker entry に `supports_bidirectional`（標準 SAM2=true / SAMURAI=false）を追加。`update_bidirectional_for_tracker` を追加し `tracker_model.change(..., outputs=[bidirectional])` で配線。SAMURAI 選択時は `gr.update(value=False, interactive=False)` で双方向 checkbox を自動 OFF・無効化、標準 SAM2 は `interactive=True`。未知 id は `KeyError` を捕捉し安全側（`interactive=True`）に倒す（握り潰しではなく明示）。
+- **起点フレーム先頭**: `prompt_frame_idx` は既定 `value=0`（先頭）のまま。info 文言を「SAMURAI は forward-only なので 0（先頭）推奨」に強化。
+- **推奨設定の明記**: Gradio 冒頭（タイトル直後の最上部 Markdown）と notebook 正本 `.py` の先頭セルに、SAMURAI 推奨設定（双方向 OFF / 起点 0 / offload / autocast fp16 / 初回 30 frame）を表で明記。`.ipynb` は jupytext で再生成。
+- 回帰テスト `tests/unit/test_video_pipeline_wiring.py`（10 件追加）: autocast 既定 float16 / CPU は nullcontext / `none` で cuda でも無効 / cuda+float16 で `torch.autocast("cuda", dtype=float16)` / registry の autocast・supports_bidirectional フラグ（標準 SAM2 は autocast none・双方向 true、SAMURAI は float16・双方向 false） / app の autocast 配線 / SAMURAI 双方向自動 OFF 挙動 / change 配線 / 推奨設定 doc の存在。
+
+**再発防止**:
+- SAMURAI は forward-only（KF motion model）。**逆方向・双方向伝搬は使わない**。UI は registry の `supports_bidirectional` を見て自動制御する（tracker 追加時もハードコード不要）。
+- 低 VRAM GPU での SAM2/SAMURAI 推論は autocast fp16/bf16 が前提（SAM2 本家・SAMURAI 本家とも mixed precision）。本リポジトリでは安全のため標準 SAM2 経路は `none`（fp32 維持）、SAMURAI のみ fp16 を既定にし、いずれも config で切替可。
+- 実機 Colab T4 での stall 解消・出力品質はユーザー要確認（ローカル .venv は torch/sam2/GPU 無しのため配線・契約検証に留まり、伝搬の実挙動・VRAM 実測は再現不能）。
+
+
+
+
+### [ERR051] SAMURAI で複数オブジェクト指定時に伝搬が `Boolean value of Tensor ... ambiguous` で落ちる
+
+| 項目 | 内容 |
+|------|------|
+| **深刻度** | High |
+| **頻度** | SAMURAI tracker を選び、複数 box（複数オブジェクト）を指定して動画処理した時 |
+| **初回発生日** | 2026-06-22 |
+| **関連ファイル** | `pipelines/components/video_model_components.py`（`SAM2VideoPropagator.__init__` / `run`）, `config/inference_models.toml`（tracker entry）, `gradio_app_sam2_transparent_BG_haystack_for_Movie.py`（`get_video_pipeline` / 冒頭 Markdown）, `Sam2_Transparent_Background_Haystack_for_Movie.py`（先頭セル）, （原因箇所＝変更不可）`samurai/sam2/sam2/modeling/sam2_base.py::_forward_sam_heads` |
+
+**エラー内容**:
+SAMURAI tracker で複数 box を指定して動画背景除去を実行すると、伝搬の最初のフレームで失敗する。
+```
+File ".../sam2/modeling/sam2_base.py", line 451, in _forward_sam_heads
+    if ious[0][best_iou_inds] > self.stable_ious_threshold:
+RuntimeError: Boolean value of Tensor with more than one value is ambiguous
+```
+Haystack 経由で `Component 'sam2_video_propagator' (SAM2VideoPropagator)` が失敗し、`gr.Error` に伝搬する。
+
+**原因**:
+- SAMURAI fork の `_forward_sam_heads` は **単一オブジェクト（バッチ B=1）前提**で書かれている。`best_iou_inds = torch.argmax(ious, dim=-1)` は形状 `[B]`、`ious[0]` は `[num_masks]`。`ious[0][best_iou_inds]` は `[B]` 形状になり、B≥2（複数オブジェクト）だと多要素テンソルになって `if tensor > threshold` の boolean 評価が曖昧になる。
+- SAMURAI は Kalman filter の motion model（`kf_mean` / `stable_frames` 等）を**モデルインスタンスで共有**するため、そもそも複数オブジェクト同時追跡を想定していない（単一対象追跡専用）。
+- 本リポジトリの propagator は `boxes` を渡すと obj_id 1..N を登録する複合対象 union 配線を持つため、SAMURAI と複数 box を組み合わせると上記 B≥2 に到達する。
+
+**対処法（samurai/ は変更しない）**:
+- **config 駆動の事前ガード**: tracker entry に `single_object_only`（SAMURAI=true / 標準 SAM2=false）を追加。`SAM2VideoPropagator.__init__` に `single_object_only: bool = False` を追加し保持。`run` の冒頭バリデーション直後（`warm_up` より前＝fail-fast）で `requested_object_count = len(boxes) if boxes else 1` を計算し、`self.single_object_only and requested_object_count > 1` のとき actionable な `ValueError`（「単一オブジェクト専用です。box を 1 つに減らすか標準 SAM2 tracker に切り替えてください」）を raise。GPU 確保・モデル build 前に止まる。
+- `get_video_pipeline` が tracker entry の `.get("single_object_only", False)` を propagator へ渡す（既定 False で後方互換）。
+- **推奨設定の明記**: Gradio 冒頭の SAMURAI 推奨設定 Markdown 表と notebook 正本 `.py` 先頭セルの表に「対象オブジェクト数＝1 個のみ（複数は標準 SAM2 へ）」行を追加。`.ipynb` は jupytext 再生成。
+- 回帰テスト `tests/unit/test_video_pipeline_wiring.py`（4 件追加）: 複数 box で `ValueError` かつ `warm_up` 未到達（`_video_predictor is None`）/ 単一 box は `single_object_only=True` でも正常 / registry の `single_object_only`（SAMURAI=True・標準=False）/ app の配線。
+
+**再発防止**:
+- SAMURAI は単一対象追跡専用。複数オブジェクトを切り抜く場合は標準 SAM2 tracker（`INFERENCE_TRACKER_VARIANT=sam2_facebook`）を使う。
+- tracker ごとの能力差（forward-only / 単一オブジェクト / autocast）は `config/inference_models.toml` のフラグ（`supports_bidirectional` / `single_object_only` / `autocast_dtype`）で宣言し、propagator・UI はそれを見て自動制御する（tracker 追加時もハードコード不要）。
+- vendored fork（samurai/）のバグは fork を変更せず、本リポジトリ側で「能力外の入力を事前に actionable に拒否する」方針で回避する。
+- 実機 Colab での挙動はユーザー要確認（ローカル .venv は torch/sam2/GPU 無しのため、ガードの fail-fast 配線・契約検証に留まる）。
+
+
+### [ERR052] 新規 Gradio アプリ起動時の `ImportError`（pipeline ビルダーの export 元取り違え）と config セクション取り違えで設定が黙殺される
+
+| 項目 | 内容 |
+|------|------|
+| **深刻度** | Medium |
+| **頻度** | 既存パイプライン/設定を参考に新規 Gradio アプリ・Component を追加した時 |
+| **初回発生日** | 2026-06-23（ルートA案 動画αマット新規実装中） |
+| **関連ファイル** | `gradio_app_sam2_ben2_route_a_for_Movie.py`, `pipelines/route_a_video_pipeline.py`, `pipelines/sam2_tb_video_pipeline.py`, `config/route_a.toml` |
+
+**エラー内容**:
+1. 新規 `gradio_app_sam2_ben2_route_a_for_Movie.py` の `--help` smoke で
+   `ImportError: cannot import name 'build_video_reader_pipeline' from 'pipelines.route_a_video_pipeline'`。
+2. サブエージェントレビュー指摘（M-1）: UI 既定値 `refine_foreground` を `config/route_a.toml` の `[composite]`
+   セクションから取得していたが、実際の定義は `[alpha]` セクション。`.get(..., False)` が常に False に
+   フォールバックし、`[alpha].refine_foreground = true` を設定しても UI に反映されない（dead config）。
+
+**原因**:
+1. `build_video_reader_pipeline` は `pipelines/sam2_tb_video_pipeline.py` で定義されており、新規
+   `route_a_video_pipeline.py` には存在しない。「参考元が同名関数を別モジュールで持つ」ことを確認せず、
+   新規モジュールから import しようとした。
+2. config の TOML セクション構造（`[alpha]` / `[blur_guide]` / `[composite]`）を UI 側ヘルパ（`_composite_defaults()`）
+   と取り違えた。キー名だけ見て取得元セクションを誤った。
+
+**対処法**:
+1. import 元を実定義モジュールに修正: `from pipelines.sam2_tb_video_pipeline import build_video_reader_pipeline`。
+   既存ビルダーは re-export せず、定義モジュールから直接 import する。
+2. `_alpha_defaults()`（`[alpha]` を返す）を追加し、`refine_foreground` 既定はそこから取得。BEN2 のみタブの
+   既定も config 化（ハードコード `value=False` を撤去）。
+
+**再発防止**:
+- 既存資産を参考に新規ファイルを作る時は、参照する関数/定数の **実定義モジュール** を grep で確認してから import する（同名再 export を仮定しない）。
+- config から既定値を取得する時は、キー名だけでなく **取得元セクション** が TOML 定義と一致するか確認する。設定が `.get(default)` で黙って握りつぶされていないか、レビューで「設定値が実際に画面/挙動へ反映されるか」を確認する。
+- 新規 Gradio アプリは作成直後に `get_errors` + `--help` smoke を必ず通し、import/構築エラーを早期に検出する。
+
+
+
+
 
 | 項目 | 内容 |
 |------|------|
@@ -1305,6 +1608,67 @@ hydra.errors.MissingConfigException: Cannot find primary config 'configs/samurai
 - 回帰テスト `tests/unit/test_transparent_bg_mask_guard.py`（mask 形状反映 / mask 未指定の後方互換 / SAM2GuardFilter 二重適用の冪等 / guard 無効化で従来挙動）を追加。
 
 
+
+### [ERR053] RouteA Movie UI で prompt の個別削除ができず調整反復が困難、かつ prompt 適用の可視化不足で「点が伝わっていない」と誤認しやすい
+
+| 項目 | 内容 |
+|------|------|
+| **深刻度** | Medium |
+| **頻度** | prompt 微調整（bbox/point を多数打って試行錯誤）時に発生 |
+| **初回発生日** | 2026-06-23 |
+| **関連ファイル** | `gradio_app_sam2_ben2_route_a_for_Movie.py`, `pipelines/components/ui_helpers.py`, `Sam2_BEN2_RouteA_for_Movie.py` |
+
+**エラー内容**:
+- 既存 UI は `Prompt をクリア`（全消し）しかなく、選択した bbox や point（positive/negative）だけを削除できなかった。
+- そのため prompt 調整中に意図しない点/箱が残りやすく、実行結果のちらつき原因を切り分けにくい。
+- 実際には points/labels は SAM2 へ渡っていたが、UI 上で割当・件数が見えず「点が伝わっていない」と判断されやすかった。
+
+**原因**:
+- prompt state（`points`/`labels`/`box`/`boxes`）の編集 API が「追加」「全クリア」に偏っており、個別削除が無かった。
+- 実行 status に prompt 反映の診断情報（pos/neg 件数、box 件数、複数 box 時の point 割当）が無く、入力が下流へ届いたか即時確認できなかった。
+
+**対処法**:
+- `ui_helpers.py` に個別削除 API を追加:
+    - `build_prompt_selection_choices(prompt_state)`
+    - `remove_selected_points(prompt_state, selected_labels)`
+    - `remove_selected_boxes(prompt_state, selected_labels)`
+- RouteA Gradio に「Prompt 編集（個別削除）」Accordion を追加し、選択 point/bbox を個別削除可能にした。
+- prompt 更新イベント（click/detect/apply/clear/frame切替）ごとに削除候補 UI を同期。
+- run status に prompt デバッグ情報（point pos/neg 件数、manual/union box 件数、複数 box 時の point assignment）と flicker ヒント（標準 SAM2 の双方向 ON、難シーンは per_object）を表示。
+
+**再発防止**:
+- Prompt UI には「追加」「全消し」だけでなく「個別削除」を最初から用意する。
+- 追跡結果が不安定な報告を受けたときは、まず入力反映可視化（件数/割当）を status へ出し、入力欠落とモデル限界（伝播方向・合成モード依存）を切り分ける。
+- notebook 手順にも削除機能とちらつき対策（標準 SAM2 + 双方向 ON / per_object）を明記して誤操作を減らす。
+
+
+### [ERR054] RouteA で「overlay が 検出→ID追跡(MOT)→SAM2.1 を通らない」「ポジ点でちらつきが変わらない＝伝わっていない」と誤認する（実は設計どおり）
+
+| 項目 | 内容 |
+|------|------|
+| **深刻度** | Medium |
+| **頻度** | RouteA でちらつきを point で抑えようとしたとき |
+| **初回発生日** | 2026-06-23 |
+| **関連ファイル** | `gradio_app_sam2_ben2_route_a_for_Movie.py`, `pipelines/route_a_video_pipeline.py`, `pipelines/components/ben2_components.py`, `pipelines/components/video_model_components.py`, `計画書/2026-06-22_動画αマット_ルートA案_ブラー誘導_仕様書.md` |
+
+**エラー内容**:
+- ユーザー報告: 「tracking overlay が 検出(RF-DETR)→ID追跡(ByteTrack/BoT-SORT)→SAM2.1 の経路を通っていないのでは」「ちらつき箇所にポジティブ点を打っても変わらない＝明らかに prompt が伝わっていない」。
+
+**原因（コード追跡で確認）**:
+1. **MOT 層は未実装**: 現実装の RouteA pipeline は `VideoReader → SAM2VideoPropagator → OwnershipResolver → BEN2RouteAVideoExtractor → VideoWriter/FrameSequenceWriter/TrackingOverlayWriter`。テキスト検出は GroundingDINO で、RF-DETR も ByteTrack/BoT-SORT(MOT) も存在しない。仕様書 line10 の「RF-DETR→ByteTrack/BoT-SORT→SAM2.1」は**設計意図（要件定義 §10.1）であり未実装**。spec と impl の乖離であってバグではない。
+2. **point は SAM2 へ確実に渡っている**: `video_model_components.py` の `SAM2VideoPropagator.run` で、boxes 経路は各 point を最近傍 box へ同梱（L547-554）、単一経路は points/labels を `add_new_points_or_box` に追加（L557-562）。`TrackingOverlayWriter` は point を反映した SAM2 union soft mask（`frame_masks`）を描画する。よって overlay マスクは point を反映する。
+3. **ちらつきが point で変わらない真因**: RouteA では SAM2 マスクは「背景ブラーのゲート G」生成にしか使われない。`gate_alpha=OFF`（既定）では**最終 α を BEN2 が単独生成**する（BEN2 はマスク入力ポートを持たない＝仕様 A-2）。よって point → union マスク微修正 → dilation_px(=24) 膨張で吸収 → BEN2 入力ほぼ不変 → 最終 α/ちらつき不変。これは設計どおりで配線欠落ではない。ちらつきの主因は BEN2 saliency の不安定性。
+
+**対処法**:
+- `run_route_a_background_removal` の実行 status に診断を追加（`points and not gate_alpha` のとき）:
+    - 「point/SAM2 マスクは現在『背景ブラーの範囲』にのみ使われ、最終 α は BEN2 が単独生成。point で直接ちらつきを抑えるには『ゲートでαを制限（gate_alpha）』を ON に」
+    - 「Tracking Overlay は point を反映した SAM2 マスクを描く。point 追加で overlay が変われば SAM2 へは伝達済み＝ちらつきは BEN2 側要因」
+- これにより「入力欠落」と「RouteA アーキ由来（α は BEN2 単独）」を切り分けられる。
+
+**再発防止**:
+- RouteA は「マスク注入」ではなく「入力画像加工で間接誘導」する設計（仕様 A-2）。SAM2 マスク/point は α を直接拘束しない（gate_alpha=ON または per_object で初めて α へ波及）。
+- 仕様書の検出→MOT→SAM2.1 は将来アーキの設計意図。現実装は GroundingDINO→SAM2 で MOT 層は無いことを混同しない。
+- 「prompt が伝わらない」報告時は、まず overlay（SAM2 マスク）で入力反映を確認し、α 段（BEN2）の挙動と切り分ける。
 
 
 ### [ERR040] UI ファイルが未コミットの作業ツリー変更で過去版へ巻き戻り、復元中の git stash で全作業を退避してしまう
