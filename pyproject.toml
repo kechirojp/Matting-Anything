@@ -1,0 +1,69 @@
+[project]
+name = "matting-anything-local"
+version = "0.1.0"
+description = "ローカル RTX 4090 推論用環境（RouteA: SAM2 + BEN2 / SAM2 + transparent-background）。gradio.live トンネルを使わずローカル直結で動かすための uv プロジェクト。"
+requires-python = ">=3.11,<3.12"
+
+dependencies = [
+    # --- Web UI / パイプライン基盤 ---
+    "gradio==5.9.1",
+    "gradio-client==1.5.2",
+    "haystack-ai==2.29.0",
+    # --- コア依存（requirements.txt 由来）---
+    "addict",
+    "diffusers",
+    "huggingface_hub",
+    "imageio[ffmpeg]",
+    "jupytext",
+    "numpy",
+    "Pillow",
+    "PyYAML",
+    "requests",
+    "setuptools",
+    "supervision",
+    "termcolor",
+    "transformers>=4.26.0",
+    "yapf",
+    "scipy",
+    "easydict",
+    "toml",
+    "tensorboardX",
+    "timm",
+    "scikit-image",
+    "opencv-python",
+    "pycocotools",
+    "matplotlib",
+    # --- 推論本体: torch は cu124 index から ---
+    "torch>=2.3.1",
+    "torchvision",
+    # --- SAM2 / SAMURAI 依存（fork が要求）---
+    "hydra-core>=1.3.2",
+    "iopath>=0.1.10",
+    "tqdm",
+    "loguru",
+    # --- 背景透過モデル（将来本格使用予定）---
+    "transparent-background",
+    # --- RouteA 背景透過モデル ---
+    "ben2",
+]
+
+[tool.uv]
+# このリポジトリ自身はパッケージではなく、依存管理のみに使う。
+package = false
+
+[tool.uv.sources]
+# torch / torchvision は CUDA 12.4 ビルドを PyTorch 公式 index から取得する。
+torch = { index = "pytorch-cu124" }
+torchvision = { index = "pytorch-cu124" }
+# BEN2 は PyPI 未配布のため git から導入。重みは初回推論時に HF から自動取得される。
+ben2 = { git = "https://github.com/PramaLLC/BEN2.git" }
+
+[[tool.uv.index]]
+name = "pytorch-cu124"
+url = "https://download.pytorch.org/whl/cu124"
+explicit = true
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]

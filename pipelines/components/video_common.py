@@ -9,6 +9,8 @@ import cv2
 import numpy as np
 from haystack import component
 
+from .common import imwrite_unicode
+
 
 VALID_OUTPUT_MODES = {"video", "sequence", "both"}
 
@@ -165,7 +167,7 @@ def write_png_frame(path: Path, frame: np.ndarray) -> None:
         image_to_write = cv2.cvtColor(frame_array, cv2.COLOR_RGBA2BGRA)
     else:
         raise ValueError(f"PNG 保存に未対応の frame shape です: {frame_array.shape}")
-    if not cv2.imwrite(str(path), image_to_write):
+    if not imwrite_unicode(path, image_to_write):
         raise RuntimeError(f"PNG 保存に失敗しました: {path}")
 
 

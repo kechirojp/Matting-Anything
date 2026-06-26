@@ -7,6 +7,7 @@ import datetime
 import os
 import shutil
 import tempfile
+import threading
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -118,6 +119,83 @@ class _ProgressKeepAlive:
         if force or is_boundary or (now - self._last_emit) >= self._min_interval:
             _notify_progress(self._progress_callback, self._stage, fraction, description)
             self._last_emit = now
+
+
+def run_with_progress_keepalive(
+    work: Callable[[], Any],
+    progress_callback: ProgressCallback | None,
+    stage: str,
+    *,
+    fraction: float,
+    description: str,
+    min_interval_sec: float = _PROGRESS_KEEPALIVE_SEC,
+    clock: Callable[[], float] = time.monotonic,
+) -> Any:
+    """ループの無い単一ブロッキング処理 ``work`` を実行しつつ keep-alive を送る。
+
+    モデルの初回ダウンロード/ロードのような「ループを持たない 1 回のブロッキング
+    呼び出し」は ``_ProgressKeepAlive``（ループ内で ``maybe`` を呼ぶ前提）では覆えない。
+    その間 SSE が無通信になり Colab / gradio.live の共有トンネルが idle 切断し、
+    ブラウザが全出力 "Error" を表示する一方でサーバ処理は継続する（ERR055=ERR048
+    follow-up）。本ヘルパは ``work`` をワーカースレッドで実行し、呼び出し側（Gradio の
+    SSE generator）スレッドから ``min_interval_sec`` ごとに ``_notify_progress`` を
+    送り続けて接続を保つ。``work`` が送出した例外は握り潰さず呼び出し側へ再送出する。
+
+    keep-alive は毎回 **ユニークなペイロード**（説明文に経過秒、fraction に微小な単調
+    nudge）を送る。Gradio / gradio.live は同一内容の進捗更新を SSE に流さず coalesce する
+    ことがあり、固定値を送り続けると実際のワイヤ通信が発生せず idle 切断される（ERR056=
+    ERR055 follow-up: ループ版 ``_ProgressKeepAlive`` は frame 番号で payload が毎回変わる
+    ため効くが、単一ブロッキング版で固定値を送ると効かない、の根治）。
+
+    Args:
+        work: 実行する引数なしのブロッキング callable（戻り値はそのまま返す）。
+        progress_callback: Gradio へ進捗を渡すコールバック（None なら work を直接実行）。
+        stage: 進捗 stage 名。
+        fraction: keep-alive で送る進捗割合の基準値（0.0〜1.0）。
+        description: keep-alive で送る説明文の基準テキスト（経過秒を付加して毎回変化させる）。
+        min_interval_sec: keep-alive を送る最小間隔（秒）。
+        clock: 単調増加時刻を返す関数（経過秒算出・テスト用に注入可能）。
+
+    Returns:
+        ``work()`` の戻り値。
+
+    Raises:
+        Exception: ``work`` が送出した例外（Exception サブクラス）をそのまま再送出する。
+    """
+    if progress_callback is None:
+        return work()
+
+    result: dict[str, Any] = {}
+    error: dict[str, Exception] = {}
+
+    def _runner() -> None:
+        try:
+            result["value"] = work()
+        except Exception as exc:  # noqa: BLE001 - 呼び出し側スレッドへ確実に伝播させる
+            error["value"] = exc
+
+    interval = max(float(min_interval_sec), 0.05)
+    thread = threading.Thread(target=_runner, name=f"keepalive-{stage}", daemon=True)
+    thread.start()
+    start = clock()
+    tick = 0
+    base_fraction = min(max(float(fraction), 0.0), 1.0)
+    while thread.is_alive():
+        thread.join(timeout=interval)
+        if not thread.is_alive():
+            break
+        tick += 1
+        elapsed = max(0, int(clock() - start))
+        # 同一ペイロードの coalesce を避けるため、経過秒で説明文を毎回変化させる。
+        varied_description = f"{description}（接続維持中・経過 {elapsed}s）"
+        # fraction も微小に単調増加させる（0.0009 上限の nudge で進捗バーは実質不動だが
+        # ペイロードは毎回変化する）。base を超えて stage 範囲を侵食しないよう上限を設ける。
+        varied_fraction = min(base_fraction + min(tick, 9) * 1e-4, base_fraction + 9e-4, 1.0)
+        _notify_progress(progress_callback, stage, varied_fraction, varied_description)
+
+    if "value" in error:
+        raise error["value"]
+    return result.get("value")
 
 
 class _OpenCVFrameVideoWriter:

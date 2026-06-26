@@ -20,6 +20,7 @@ BOX_CHOICE_MANUAL = "box:manual"
 BOX_CHOICE_UNION_PREFIX = "box:u#"
 
 
+
 def empty_prompt_state() -> dict[str, object]:
     """SAM2 prompt の UI state を初期化する。"""
     return {

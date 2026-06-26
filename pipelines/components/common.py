@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any, Sequence
 
 import cv2
@@ -9,6 +10,57 @@ import numpy as np
 from haystack import component
 from PIL import Image
 from scipy import ndimage
+
+
+def imread_unicode(path: str | Path, flags: int = cv2.IMREAD_COLOR) -> np.ndarray | None:
+    """非ASCII(日本語)パスでも読み込める ``cv2.imread`` 互換関数。
+
+    Windows の ``cv2.imread`` は ANSI codepage でファイルパスを解釈するため、
+    ``J:\\マイドライブ\\...`` のような非ASCIIパスでは ``None`` を返す（ERR061）。
+    ``np.fromfile`` でバイト列を読み出し ``cv2.imdecode`` で復号して回避する。
+
+    Args:
+        path: 読み込む画像ファイルパス。
+        flags: ``cv2.imdecode`` に渡すフラグ。
+
+    Returns:
+        復号した ndarray。読み込み失敗時は ``None``。
+
+    Raises:
+        FileNotFoundError: ``path`` が存在しない場合（``cv2.imread`` は ``None`` を返すが
+            本関数は ``np.fromfile`` の振る舞いに従う。呼び出し側で存在保証すること）。
+    """
+    data = np.fromfile(str(path), dtype=np.uint8)
+    if data.size == 0:
+        return None
+    return cv2.imdecode(data, flags)
+
+
+def imwrite_unicode(path: str | Path, image: np.ndarray) -> bool:
+    """非ASCII(日本語)パスでも保存できる ``cv2.imwrite`` 互換関数。
+
+    Windows の ``cv2.imwrite`` は非ASCIIパスで ``False`` を返し保存に失敗する（ERR061）。
+    ``cv2.imencode`` でバイト列に符号化し ``Path.write_bytes`` で書き出して回避する。
+
+    Args:
+        path: 保存先パス。拡張子から encoder を決定する（既定は ``.png``）。
+        image: 保存する BGR/グレースケール ndarray。
+
+    Returns:
+        保存に成功したら ``True``、符号化に失敗したら ``False``。
+
+    Raises:
+        FileNotFoundError: ``path`` の親ディレクトリが存在しない場合（``cv2.imwrite`` は
+            ``False`` を返すが本関数は ``Path.write_bytes`` の振る舞いに従う。
+            呼び出し側で事前に ``mkdir(parents=True, exist_ok=True)`` すること）。
+    """
+    path_obj = Path(path)
+    suffix = path_obj.suffix or ".png"
+    success, buffer = cv2.imencode(suffix, image)
+    if not success:
+        return False
+    path_obj.write_bytes(buffer.tobytes())
+    return True
 
 
 def ensure_rgb_array(image: dict[str, Any] | np.ndarray | Image.Image) -> np.ndarray:

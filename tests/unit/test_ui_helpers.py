@@ -144,3 +144,4 @@ def test_remove_selected_boxes_handles_manual_and_union() -> None:
     assert updated["box"] is None
     assert updated["box_buffer"] == []
     assert updated["boxes"] == [[10, 10, 20, 20]]
+

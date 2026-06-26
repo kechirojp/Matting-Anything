@@ -5,6 +5,7 @@ from haystack import Pipeline
 from pipelines.route_a_video_pipeline import (
     build_ben2_route_a_only_video_pipeline,
     build_sam2_ben2_route_a_pipeline,
+    warm_up_ben2_in_pipelines,
 )
 
 
@@ -60,3 +61,60 @@ def test_route_a_pipeline_accepts_injected_extractor() -> None:
 
     injected = pipeline.get_component("ben2_route_a_video")
     assert injected is extractor
+
+
+class _RecordingExtractor:
+    """warm_up 呼び出しを記録するダミー extractor。"""
+
+    def __init__(self, *, fail: bool = False) -> None:
+        self.warm_up_calls = 0
+        self.fail = fail
+
+    def warm_up(self) -> None:
+        self.warm_up_calls += 1
+        if self.fail:
+            raise RuntimeError("ben2 warm-up failed")
+
+
+class _FakeBen2Component:
+    def __init__(self, extractor: _RecordingExtractor) -> None:
+        self.extractor = extractor
+
+
+class _FakePipeline:
+    """``get_component('ben2_route_a_video')`` だけを満たす最小ダミー Pipeline。"""
+
+    def __init__(self, extractor: _RecordingExtractor) -> None:
+        self._component = _FakeBen2Component(extractor)
+
+    def get_component(self, name: str) -> _FakeBen2Component:
+        assert name == "ben2_route_a_video"
+        return self._component
+
+
+def test_warm_up_ben2_in_pipelines_prewarms_all_extractors() -> None:
+    """起動前事前ロードは渡された全 Pipeline の BEN2 extractor を warm_up する。"""
+    extractors = [_RecordingExtractor(), _RecordingExtractor()]
+    pipelines = [_FakePipeline(e) for e in extractors]
+    logs: list[str] = []
+
+    warmed = warm_up_ben2_in_pipelines(pipelines, log=logs.append)
+
+    assert warmed == 2
+    assert all(e.warm_up_calls == 1 for e in extractors)
+    assert any("完了" in line for line in logs)
+
+
+def test_warm_up_ben2_in_pipelines_continues_and_logs_on_failure() -> None:
+    """1 つの warm_up が失敗しても握り潰さず通知し、残りの事前ロードを続行する。"""
+    failing = _RecordingExtractor(fail=True)
+    healthy = _RecordingExtractor()
+    pipelines = [_FakePipeline(failing), _FakePipeline(healthy)]
+    logs: list[str] = []
+
+    warmed = warm_up_ben2_in_pipelines(pipelines, log=logs.append)
+
+    assert warmed == 1  # healthy のみ成功
+    assert failing.warm_up_calls == 1
+    assert healthy.warm_up_calls == 1  # 失敗後も次を続行
+    assert any("失敗" in line for line in logs)

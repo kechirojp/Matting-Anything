@@ -31,7 +31,7 @@ except ModuleNotFoundError:  # Python < 3.11
 _DEFAULT_ROUTE_A_CONFIG: dict[str, dict[str, Any]] = {
     "alpha": {
         "ben2_repo_id": "PramaLLC/BEN2",
-        "ben2_checkpoint_path": "",
+        "ben2_checkpoint_path": "checkpoints/BEN2",
         "refine_foreground": False,
     },
     "blur_guide": {

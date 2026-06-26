@@ -17,8 +17,9 @@
 [alpha]
 # BEN2 base の Hugging Face repo_id。BEN_Base.from_pretrained() がここから重みを取得します。
 ben2_repo_id = "PramaLLC/BEN2"
-# ローカル重みパス（指定時は loadcheckpoints で読み込み、未指定/空なら from_pretrained を使う）。
-ben2_checkpoint_path = ""
+# ローカル重みパス（既定: checkpoints/BEN2）。存在すればローカル重みを優先し、
+# 無ければ Hugging Face から取得してこのディレクトリへ永続化する。
+ben2_checkpoint_path = "checkpoints/BEN2"
 # 毛先などの境界を精緻化する後処理。True は精度↑だが推論時間↑（既定 False）。
 refine_foreground = false
 

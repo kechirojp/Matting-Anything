@@ -46,6 +46,7 @@ from .video_model_components import (
     _OpenCVFrameVideoWriter,
     _ProgressKeepAlive,
     _resolve_output_dir,
+    run_with_progress_keepalive,
 )
 
 
@@ -57,7 +58,9 @@ class BEN2Extractor:
 
     Args:
         repo_id: BEN2 base の Hugging Face repo_id（``from_pretrained`` 用）。
-        checkpoint_path: ローカル重みパス。非空なら ``loadcheckpoints`` で読み込む。
+        checkpoint_path: ローカル重みパス（ディレクトリ or ``.pth`` ファイル）。
+            指定先に重みが存在すれば ``loadcheckpoints`` で読み込む。
+            存在しなければ同じ場所へ download して永続化し、以後はローカルを使う。
         device: 推論デバイス。None なら環境から推定する。
     """
 
@@ -68,9 +71,89 @@ class BEN2Extractor:
         device: str | None = None,
     ) -> None:
         self.repo_id = repo_id
+        self.project_root = Path(__file__).resolve().parents[2]
         self.checkpoint_path = checkpoint_path or ""
         self.device = device or resolve_ben2_device()
         self._model: Any | None = None
+
+    def _resolve_checkpoint_target(self) -> Path:
+        """BEN2 チェックポイントのローカル保存先を解決する。"""
+        if not self.checkpoint_path:
+            return self.project_root / "checkpoints" / "BEN2"
+        target = Path(self.checkpoint_path)
+        if not target.is_absolute():
+            target = self.project_root / target
+        return target
+
+    @staticmethod
+    def _has_local_checkpoint(target: Path) -> bool:
+        """読み込み可能なローカル重み（.pth）が存在するかを返す。"""
+        if target.is_file():
+            return target.suffix.lower() == ".pth"
+        if target.is_dir():
+            # HF snapshot の .cache/ 内 blob を除外し、_resolve_loadable_checkpoint と探索条件を揃える。
+            return any(
+                path.suffix.lower() == ".pth"
+                for path in target.rglob("*.pth")
+                if ".cache" not in path.parts
+            )
+        return False
+
+    def _download_checkpoint_to_local(self, target: Path) -> Path:
+        """ローカル保存先へ BEN2 重みを download し、読み込み先パスを返す。"""
+        from huggingface_hub import snapshot_download
+
+        download_dir = target.parent if target.suffix.lower() == ".pth" else target
+        download_dir.mkdir(parents=True, exist_ok=True)
+        snapshot_download(
+            repo_id=self.repo_id,
+            local_dir=str(download_dir),
+            local_dir_use_symlinks=False,
+            resume_download=True,
+        )
+        if target.suffix.lower() == ".pth" and not target.exists():
+            candidates = sorted(p for p in download_dir.rglob("*.pth") if ".cache" not in p.parts)
+            if candidates:
+                return candidates[0]
+        if target.suffix.lower() == ".pth" and not target.exists():
+            raise RuntimeError(
+                f"BEN2 checkpoint の download は完了しましたが .pth が見つかりません: target={target}, dir={download_dir}"
+            )
+        if target.is_dir() and not self._has_local_checkpoint(target):
+            raise RuntimeError(
+                f"BEN2 checkpoint の download 後も .pth が見つかりません: dir={target}"
+            )
+        return target
+
+    @staticmethod
+    def _resolve_loadable_checkpoint(target: Path) -> Path:
+        """``loadcheckpoints``（内部で ``torch.load``）に渡せる .pth ファイルへ解決する。
+
+        ``target`` がディレクトリの場合は中の .pth を返す。ディレクトリをそのまま
+        ``torch.load`` に渡すと Windows / Google Drive FUSE 上で
+        ``[Errno 13] Permission denied`` になるため、必ずファイルへ解決する。
+
+        Args:
+            target: .pth ファイル、またはそれを含むディレクトリ。
+
+        Returns:
+            読み込み可能な .pth ファイルの絶対パス。
+
+        Raises:
+            RuntimeError: .pth ファイルが見つからない場合。
+        """
+        if target.is_file() and target.suffix.lower() == ".pth":
+            return target
+        if target.is_dir():
+            direct = sorted(target.glob("*.pth"))
+            if direct:
+                return direct[0]
+            nested = sorted(p for p in target.rglob("*.pth") if ".cache" not in p.parts)
+            if nested:
+                return nested[0]
+        raise RuntimeError(
+            f"BEN2 checkpoint の .pth ファイルが見つかりません: target={target}"
+        )
 
     def warm_up(self) -> None:
         """BEN2 base を遅延・冪等に初期化する（import 時には触らない）。"""
@@ -79,11 +162,12 @@ class BEN2Extractor:
         require_gpu_for_heavy_inference(self.__class__.__name__, self.device)
         from ben2 import BEN_Base
 
-        if self.checkpoint_path and Path(self.checkpoint_path).exists():
-            model = BEN_Base()
-            model.loadcheckpoints(self.checkpoint_path)
-        else:
-            model = BEN_Base.from_pretrained(self.repo_id)
+        checkpoint_target = self._resolve_checkpoint_target()
+        if not self._has_local_checkpoint(checkpoint_target):
+            checkpoint_target = self._download_checkpoint_to_local(checkpoint_target)
+        checkpoint_file = self._resolve_loadable_checkpoint(checkpoint_target)
+        model = BEN_Base()
+        model.loadcheckpoints(str(checkpoint_file))
         model.to(self.device).eval()
         self._model = model
 
@@ -274,6 +358,27 @@ class BEN2RouteAVideoExtractor:
         used_rgba_codec: str | None = None
         total_frames = max(len(frames), 1)
         _notify_progress(progress_callback, "ben2_route_a", 0.0, "BEN2（ルートA）を初期化しています")
+        # ERR055(=ERR048 follow-up): BEN2 モデルロードを per-frame ループの外で先に済ませる。
+        # warm_up() は遅延ロード（infer_alpha 内の初回で重い from_pretrained を実行）かつ、
+        # その中身は「約380MB の model.safetensors を 1 回の from_pretrained で取得する単一
+        # ブロッキング呼び出し」でループを持たない。先読みするだけではこのダウンロード自体が
+        # 無通信になり、propagation 完了後に gradio.live/Colab の SSE が idle 切断される
+        # （UI 全出力 Error・バックエンドは継続）。ループ前提の _ProgressKeepAlive では覆えない
+        # ため、別スレッドで warm_up を走らせ呼び出し側から一定間隔で keep-alive を送る
+        # run_with_progress_keepalive でダウンロード/ロード区間を覆う。
+        run_with_progress_keepalive(
+            self.extractor.warm_up,
+            progress_callback,
+            "ben2_route_a",
+            fraction=0.01,
+            description="BEN2 モデルを読み込んでいます（初回は約380MBダウンロード・数分かかる場合があります）",
+        )
+        _notify_progress(
+            progress_callback,
+            "ben2_route_a",
+            0.02,
+            "BEN2 モデルの読み込みが完了しました。frame 処理を開始します",
+        )
         ben2_keepalive = _ProgressKeepAlive(progress_callback, "ben2_route_a")
         try:
             for local_index, frame in enumerate(frames):

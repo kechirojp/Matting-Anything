@@ -24,9 +24,34 @@ from pipelines.components.common import (
 )
 from pipelines.components.common import (
     assign_points_to_boxes,
+    imread_unicode,
+    imwrite_unicode,
     soft_probability_guard,
     stable_sigmoid,
 )
+
+
+def test_imwrite_unicode_writes_png_to_non_ascii_path(tmp_path) -> None:
+    """ERR061: 日本語(非ASCII)パスでも PNG を保存できる（cv2.imwrite は False を返す）。"""
+    target = tmp_path / "マイドライブ" / "frame_000000.png"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    image = np.zeros((4, 4, 3), dtype=np.uint8)
+    image[0, 0] = (10, 20, 30)
+
+    assert imwrite_unicode(target, image) is True
+    assert target.exists() and target.stat().st_size > 0
+
+
+def test_imread_unicode_reads_png_from_non_ascii_path(tmp_path) -> None:
+    """ERR061: 日本語(非ASCII)パスでも画像を読み込める（cv2.imread は None を返す）。"""
+    target = tmp_path / "マイドライブ" / "bg.png"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    image = np.full((4, 4, 3), 128, dtype=np.uint8)
+    assert imwrite_unicode(target, image) is True
+
+    loaded = imread_unicode(target)
+    assert loaded is not None
+    assert loaded.shape == (4, 4, 3)
 
 
 def test_assign_points_to_boxes_assigns_each_point_to_nearest_box() -> None:

@@ -733,8 +733,8 @@ with gr.Blocks(title="SAM2 + Transparent Background Haystack for Movie") as demo
                         info="検出 box と text 語句の一致しきい値（0.05〜0.95、単位なし）。高いほど語句との合致を厳しく要求する。目安 0.25。",
                     )
                     text_top_k = gr.Slider(
-                        1, 10, value=5, step=1, label="候補数 top-k",
-                        info="保持する検出 box の最大個数（個数、整数）。スコア上位から K 個まで表示し、最上位を SAM2 prompt にコピーする。目安 5。",
+                        1, 20, value=20, step=1, label="候補数 top-k",
+                        info="保持する検出 box の最大個数（個数、整数）。スコア上位から K 個まで表示し、最上位を SAM2 prompt にコピーする。目安 20。",
                     )
                 detect_text_btn = gr.Button("Text Prompt から bbox を検出")
                 detected_boxes = gr.Dataframe(

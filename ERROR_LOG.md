@@ -32,6 +32,102 @@
 
 ## エラー一覧
 
+### [ERR061] Windows の非ASCII（日本語）パスで `cv2.imwrite` / `cv2.imread` が無言失敗し `PNG 保存に失敗しました`（overlay frame_000000.png）
+
+| 項目 | 内容 |
+|------|------|
+| **深刻度** | High |
+| **頻度** | RouteA 動画アプリの最終 overlay/連番 PNG 出力時に必発（`J:\マイドライブ\...` 上） |
+| **初回発生日** | 2026-06-26 |
+| **関連ファイル** | `pipelines/components/common.py`（新規 `imread_unicode` / `imwrite_unicode`）, `pipelines/components/video_common.py`（`write_png_frame`）, `pipelines/components/model_components.py`（背景読み込み）, `tests/unit/test_common_components.py`, `tests/unit/test_video_common_components.py` |
+
+**エラー内容**:
+- `Component name: 'tracking_overlay' / Component type: 'TrackingOverlayWriter' / Error: PNG 保存に失敗しました: J:\マイドライブ\AI_picasso\Matting-Anything\outputs\20260626_120803\sequence\overlay\frame_000000.png`
+- パイプライン本体は ~298.8s で成功するが、最終段の追跡確認用 overlay PNG を 1 枚目 `frame_000000.png` で保存できず `gr.Error` で表面化。
+
+**原因**:
+- OpenCV の `cv2.imwrite` / `cv2.imread` は Windows で **ANSI codepage** を使ってファイルパスを解釈するため、`J:\マイドライブ\...`（「マイドライブ」が非ASCII）のような日本語パスを開けない。
+- `cv2.imwrite` は例外ではなく **`False`** を返す（無言失敗）→ `write_png_frame` が `RuntimeError("PNG 保存に失敗しました")` を送出。`cv2.imread` は **`None`** を返す。
+- 実機検証で確定: 同一日本語パスへ `cv2.imwrite`→`False`/ファイル未生成、`cv2.imencode`+`write_bytes`→成功。`cv2.imread`→`None`。
+- 一方 `cv2.VideoWriter` は FFmpeg backend のため日本語パスでも `isOpened()=True` で書き込み成功（検証済み）。SAM2 一時 JPEG は `tempfile.TemporaryDirectory`（ASCII の `%TEMP%`）配下なので無影響。
+
+**対処法**:
+- `pipelines/components/common.py` に Unicode 安全な代替を追加:
+  - `imwrite_unicode(path, image)`: `cv2.imencode(suffix, image)` → `Path.write_bytes`。`cv2.imwrite` 互換の bool を返す。
+  - `imread_unicode(path, flags)`: `np.fromfile` → `cv2.imdecode`。失敗時 `None`。
+- `write_png_frame` を `imwrite_unicode` 使用に変更（`RuntimeError("PNG 保存に失敗しました: ...")` の契約は維持）。
+- `model_components.py` の背景読み込み `cv2.imread` を `imread_unicode` + None チェック（`ValueError("背景画像を読み込めませんでした: ...")`）に変更。
+
+**再発防止**:
+- 出力/入力パスへ書き読みする `cv2.imwrite` / `cv2.imread` は原則 `imwrite_unicode` / `imread_unicode` を使う（非ASCIIパス耐性）。
+- `cv2.VideoWriter` は据え置きで可（FFmpeg backend で非ASCII対応）。ただし Windows ユーザ名が非ASCIIだと `%TEMP%` 経由の一時書き込みが将来失敗し得る点に留意。
+- 根本的にはローカルの ASCII パス（例 `C:\dev\...`）へ移すと本クラスの問題と Drive の遅い I/O を同時に回避できる。
+
+**備考**:
+- TDD: RED（非ASCIIパスで write/read 失敗）→ GREEN。新規テスト 3 件 + 変更モジュール 32 件 pass。サブエージェントレビュー APPROVED。
+
+### [ERR060] BEN2 ロードで `loadcheckpoints` にディレクトリを渡し `[Errno 13] Permission denied: 'checkpoints\BEN2'`（DL は成功するがロードで失敗）
+
+| 項目 | 内容 |
+|------|------|
+| **深刻度** | High |
+| **頻度** | RouteA 動画アプリ起動・推論時に必発（ローカル RTX 4090 / Google Drive 上） |
+| **初回発生日** | 2026-06-25 |
+| **関連ファイル** | `pipelines/components/ben2_components.py`（`BEN2Extractor.warm_up` / 新規 `_resolve_loadable_checkpoint`）, `tests/unit/test_ben2_components.py` |
+
+**エラー内容**:
+- `[prewarm] BEN2 事前ロードに失敗しました（#0・リクエスト時に再試行します）: [Errno 13] Permission denied: 'J:\\マイドライブ\\AI_picasso\\Matting-Anything\\checkpoints\\BEN2'`
+- `snapshot_download` は `Download complete: 1.76G/1.76G` と完走しているのに、その直後のモデルロードで `Permission denied` がディレクトリパスに対して発生。prewarm が #0/#1 と失敗し、リクエスト時も同じ例外が `gr.Error` で表面化。
+
+**原因**:
+- `BEN_Base.loadcheckpoints(model_path)` の実装は `torch.load(model_path, ..., weights_only=True)`。すなわち **`.pth` ファイルパス**を要求する。
+- 一方 `BEN2Extractor.warm_up` は `_resolve_checkpoint_target()` が返す **ディレクトリ** `checkpoints/BEN2`（config 既定 `ben2_checkpoint_path`）を、ローカル既存経路でも DL 経路でもそのまま `loadcheckpoints(str(checkpoint_target))` に渡していた。
+- Windows / Google Drive FUSE 上で `torch.load(<ディレクトリ>)` は `open(<dir>)` を試み `[Errno 13] Permission denied`（ディレクトリをファイルとして開けない）になる。DL の成否とは無関係で、ロードのパス解決が誤っていたのが根本原因。
+- 補足: ログの「再 DL」は初回でディレクトリが空だったための正常動作。`.pth`（実体は `BEN2_Base.pth`）が揃った 2 回目以降は `_has_local_checkpoint` が検出し DL をスキップする。
+
+**対処法**:
+- `BEN2Extractor._resolve_loadable_checkpoint(target)` を追加。`target` が `.pth` ファイルならそのまま、ディレクトリなら中の `*.pth`（まず直下 `glob`、無ければ `.cache` を除外した `rglob`）を解決して返す。見つからなければ `RuntimeError`。
+- `warm_up` で DL/既存判定の後に `checkpoint_file = self._resolve_loadable_checkpoint(checkpoint_target)` を挟み、`loadcheckpoints(str(checkpoint_file))` には**必ず `.pth` ファイル**を渡す。
+- TDD: 誤った契約（`load_path == str(ckpt_dir)`）を固定化していた `test_ben2_extractor_uses_local_checkpoint_without_download` を `str(ckpt_dir / "ckpt_base.pth")` 期待へ修正（RED→GREEN）。
+- 検証: `pytest tests\unit\test_ben2_components.py -q` 9 passed、非 integration **281 passed / 3 deselected**、`get_errors` 0。
+
+**再発防止**:
+- `torch.load` 系ローダへ渡すパスは**必ずファイルへ解決**する。ディレクトリのまま渡さない（特に Google Drive FUSE / Windows では `Permission denied` で表面化し原因が分かりにくい）。
+- 自動 DL 後は「期待する成果物（`.pth`）が存在するか」をファイル単位で検証してからロードする。「DL 成功」と「ロード可能」は別事象。
+- 配布物のファイル名は変わり得る（`BEN2_Base.pth` 等）ため、固定名ではなく `*.pth` 探索で解決する。
+
+
+
+| 項目 | 内容 |
+|------|------|
+| **深刻度** | Medium |
+| **頻度** | 一度のみ（uv 移行の手順として記録） |
+| **初回発生日** | 2026-06-24 |
+| **関連ファイル** | `pyproject.toml`（新規）, `.python-version`（新規）, `samurai/sam2/setup.py`, `/memories/repo/env-uv-local.md` |
+
+**背景（ERR058 の接続層別解の実装）**:
+ERR058 で確定した根治方針＝「Colab/gradio.live トンネルをやめてローカル RTX 4090 で `--share` なし `127.0.0.1` 直結」を実運用するため、リポジトリ規約の `.venv+pip` から **uv へ全面移行**（ユーザー選択肢 B、transparent-background も将来利用するため同梱）。
+
+**遭遇したエラーと原因**:
+1. `uv pip install -e samurai/sam2` が **グローバル uv 管理 Python**（externally managed）を既定で選び失敗。
+2. `samurai/sam2/setup.py` は **import 時に torch を参照**するため、build isolation 有効だとビルド環境に torch が無く失敗。
+3. `samurai/sam2` の CUDA 拡張（`connected_components` 等）は nvcc を要し、不要（optional）。
+
+**対処法（uv 環境構築手順）**:
+- `pyproject.toml`（`package = false`）に依存を集約。torch/torchvision は `[tool.uv.sources]` で index `pytorch-cu124`（`https://download.pytorch.org/whl/cu124`）へ、ben2 は git 直指定。`.python-version = "3.11"`、`requires-python = ">=3.11,<3.12"`。
+- `uv sync` でコア依存を導入（torch 2.6.0+cu124 / torchvision 0.21.0+cu124 / transparent-background 1.3.4 / ben2 / 他）。
+- **SAM-2 のみ別途**: `$env:SAM2_BUILD_CUDA="0"; uv pip install --python .venv\Scripts\python.exe --no-build-isolation -e samurai/sam2`。`--python` で**プロジェクト .venv** を明示（externally managed 回避）、`--no-build-isolation` で torch 参照を解決、`SAM2_BUILD_CUDA=0` で nvcc 拡張をスキップ（optional）。
+- pytest は dev 依存: `uv add --dev pytest`。
+- **検証（全て PASS）**: `torch.cuda.is_available()=True` / device "NVIDIA GeForce RTX 4090"、`import sam2 / transparent_background / ben2 / gradio(5.9.1) / haystack` OK、両 RouteA・tb 動画アプリ `--help` 正常、**非 integration 278 passed / 3 deselected**。
+
+**再発防止**:
+- uv プロジェクトで **editable + setup.py が torch を import する**パッケージは `--no-build-isolation` 必須。さらに `uv pip install` は `--python .venv\Scripts\python.exe` でプロジェクト環境を明示しないとグローバル環境を掴む。
+- CUDA 拡張ビルドが optional なものは環境変数（ここでは `SAM2_BUILD_CUDA=0`）で切ってビルド時間と nvcc 依存を回避。
+- ローカル起動は `--share` を付けない（`server_name` 既定 127.0.0.1）＝トンネルが無く ERR048-058 の SSE 切断クラスが原理的に発生しない。
+- GroundingDINO の custom CUDA ops は未導入のまま（テキストプロンプト検出時のみ必要・optional）。RouteA を手動 bbox/point で使う分には不要。
+- `flet` 由来の `UserWarning`（transparent-background GUI モード）は無害。
+- 詳細手順は repo memory `/memories/repo/env-uv-local.md` を参照。
+
 ### [ERR-VID-GUARD] 動画背景除去：人物マスクが半透明化する（guard が内部を削る）【Phase1 修正済】
 
 | 項目 | 内容 |
@@ -1669,6 +1765,148 @@ Haystack 経由で `Component 'sam2_video_propagator' (SAM2VideoPropagator)` が
 - RouteA は「マスク注入」ではなく「入力画像加工で間接誘導」する設計（仕様 A-2）。SAM2 マスク/point は α を直接拘束しない（gate_alpha=ON または per_object で初めて α へ波及）。
 - 仕様書の検出→MOT→SAM2.1 は将来アーキの設計意図。現実装は GroundingDINO→SAM2 で MOT 層は無いことを混同しない。
 - 「prompt が伝わらない」報告時は、まず overlay（SAM2 マスク）で入力反映を確認し、α 段（BEN2）の挙動と切り分ける。
+
+
+### [ERR055] RouteA 動画で SAM2 伝搬完了後に BEN2 の遅延モデルロードで無通信になり SSE が idle 切断され全出力「Error」（ERR048 follow-up）
+
+| 項目 | 内容 |
+|------|------|
+| **深刻度** | High |
+| **頻度** | RouteA Movie app を Colab/gradio.live で実行し、SAM2 伝搬完了→BEN2 初回処理に移る時 |
+| **初回発生日** | 2026-06-23 |
+| **関連ファイル** | `pipelines/components/ben2_components.py`（`BEN2RouteAVideoExtractor.run` / `BEN2Extractor.warm_up` / `infer_alpha`）, `gradio_app_sam2_ben2_route_a_for_Movie.py`, `Sam2_BEN2_RouteA_for_Movie.ipynb` |
+
+**エラー内容**:
+UI 出力欄が**全て "Error" 表示**になる一方、バックエンド stdout は処理継続のログを出す（ERR048 と同じ idle 切断シグネチャ）。ログ上は SAM2 `propagate in video 100% 98/98` まで到達してから Error が顕在化する（＝伝搬中は keep-alive が効いており、エラーは伝搬完了後）。
+
+**原因（コード追跡で確認）**:
+- ERR048 の `_ProgressKeepAlive` は SAM2 伝搬ループを覆うので伝搬中は SSE が維持される（ログが 98/98 まで進むのが傍証）。
+- しかし `BEN2RouteAVideoExtractor.run` は per-frame ループ内の最初の `infer_alpha` で初めて `BEN2Extractor.warm_up()`（`BEN_Base.from_pretrained` 等の重いモデルロード）が走る**遅延ロード**だった。keep-alive 通知はループ末尾でしか発火しないため、伝搬完了 → OwnershipResolver → BEN2 初回 frame のモデルロード区間が**無通信ギャップ**になり、その間に Colab/gradio.live の SSE が idle 切断される。
+- なお `SAM2VideoPropagator.run` の `gathered_any=False`（対象ロスト frame）で `continue` が keep-alive を飛ばす経路も理論上あるが、実際の SAM2 `propagate_in_video` は登録済み全 obj_id を毎 frame 返すため `gathered_any` はほぼ常に True。今回の事象（伝搬は 100% 完走）の真因ではないため対象外とした。
+
+**対処法（新規機構を足さず既存 keep-alive を使う）**:
+- `BEN2RouteAVideoExtractor.run` の per-frame ループ**前**に、SAM2 propagator が `warm_up`/`init_state` を `_notify_progress` で前後に挟むのと同じパターンで、BEN2 モデルロードを先出しして区間を進捗通知で覆う:
+    - `_notify_progress(..., 0.0, "BEN2（ルートA）を初期化しています")`
+    - `self.extractor.warm_up()`（先出しロード。`warm_up` は `if self._model is not None: return` で冪等なので `infer_alpha` 内の遅延ロードと二重にならない）
+    - `_notify_progress(..., 0.02, "BEN2 モデルの読み込みが完了しました。frame 処理を開始します")`
+    - その後に `ben2_keepalive = _ProgressKeepAlive(...)` を生成しループへ。
+- 背景スレッド等の新規無通信対策は追加しない（ERR048 の `_ProgressKeepAlive` をそのまま活用）。
+- RED→GREEN: `tests/unit/test_ben2_components.py::test_run_warms_up_ben2_before_first_frame`（`_OrderRecordingExtractor` で「warm_up が infer より先・ループ前に呼ばれる」ことを順序検証）。非 integration 全体 256 passed、両 movie app `--help` smoke OK。
+
+**再発防止**:
+- 重いモデルロードを伴う Component は、長時間処理（伝搬等）の直後に来る場合でも **per-frame ループ内の遅延ロードに任せない**。ループ前に先出しし、前後を `_notify_progress` で覆って keep-alive 区間に含める（SAM2 propagator の `warm_up`/`init_state` と同方針）。
+- ERR048 の keep-alive は「ループの中」しか守らない。ループ**前後**の単発ブロッキング（モデルロード・init_state 等）も無通信ギャップになり得るので明示的に通知で挟む。
+- 実機 Colab での SSE 維持はユーザー要確認（ローカル .venv は torch/sam2/GPU 無しのためロジック検証に留まる。ERR035 同様 UI 実起動検証は環境依存）。
+
+**追補（2026-06-24・先出しだけでは不十分だった真因と恒久対処）**:
+- 新ログ `エラーログ/エラーログ_23.md` で、SAM2 伝搬 100% 完走の**後**に BEN2 の `model.safetensors: 0% 0.00/381M` が出てログが途切れることを確認。bert-base-uncased（440M）は**起動時**（SSE 出力ストリーム開始前）に DL されるため切断しないが、BEN2 の約380MB は**ラン中**に DL される。
+- 真因の核心: BEN2 の `BEN_Base.from_pretrained` は**ループを持たない 1 回のブロッキング DL**。`warm_up` を先出ししても DL 自体が無通信になる。`_ProgressKeepAlive` は「ループ内で `maybe` を呼ぶ」前提のため、**ループの無い単一ブロッキング呼び出しは原理的に覆えない**（先出し（ERR055 初版）は構造改善だが不十分だった）。
+- 恒久対処（既存 primitive を再利用、新フレームワークは追加しない）: `pipelines/components/video_model_components.py` に `run_with_progress_keepalive(work, progress_callback, stage, *, fraction, description, min_interval_sec=_PROGRESS_KEEPALIVE_SEC)` を追加。`work`（=`extractor.warm_up`）をデーモンスレッドで実行し、呼び出し側（Gradio の SSE generator）スレッドから `min_interval_sec` ごとに**既存の** `_notify_progress` を送り続けて接続を保つ。`work` の例外は握り潰さず（`try/except: pass` 禁止）呼び出し側へ再送出する。`BEN2RouteAVideoExtractor.run` の素の `self.extractor.warm_up()` をこのヘルパ経由に置換。
+- RED→GREEN: `tests/unit/test_video_pipeline_wiring.py`（`test_run_with_progress_keepalive_pumps_during_blocking_work` / `_reraises_work_error` / `_no_callback_runs_directly`）と `tests/unit/test_ben2_components.py::test_run_routes_warmup_through_progress_keepalive`。非 integration 全体 **260 passed / 1 skipped**、両 movie app `--help` smoke OK、サブエージェントレビュー済み（docstring の Raises を実装（`Exception` 捕捉）に整合）。
+- 教訓: keep-alive ギャップは「ループ内ギャップ」(`_ProgressKeepAlive` で対応)と「単一ブロッキング呼び出しギャップ」（`run_with_progress_keepalive` のスレッドポンプで対応）に区別する。モデル DL/ロードは後者。
+- 類似リスク（要監視）: `TransparentBGVideoExtractor` の初回フレーム内モデルロードも理論上は同じ単一ブロッキングギャップだが、対象モデルが小さく/キャッシュ済みのため現状ユーザー環境では顕在化せず。`run_with_progress_keepalive` は再利用可能なので、新規 Colab 等で顕在化した場合は同様に適用する。実機 SSE 維持はユーザー要確認（ERR035）。
+
+
+### [ERR056] `run_with_progress_keepalive` が固定ペイロードを送り続け Gradio/gradio.live に coalesce され BEN2 DL 中に再び SSE idle 切断（ERR055 follow-up）
+
+| 項目 | 内容 |
+|------|------|
+| **深刻度** | High |
+| **頻度** | RouteA Movie app を Colab/gradio.live で実行し、SAM2 伝搬完了→BEN2 初回 `from_pretrained` の約380MB DL に入る時 |
+| **初回発生日** | 2026-06-24 |
+| **関連ファイル** | `pipelines/components/video_model_components.py`（`run_with_progress_keepalive`）, `pipelines/components/ben2_components.py`, `gradio_app_sam2_ben2_route_a_for_Movie.py`, `Sam2_BEN2_RouteA_for_Movie.ipynb` |
+
+**エラー内容**:
+ERR055 の恒久対処（`run_with_progress_keepalive` で `warm_up` をスレッドポンプ化）を入れた**後も**、新ログ `エラーログ/エラーログ_24.md` で UI が全出力「Error」を表示する一方サーバは継続。ログは BEN2 `config.json: 100% 124/124`（warm_up の DL 開始＝約380MB の `model.safetensors` DL 直前）で途切れる。SAM2 伝搬（forward 30/30、reverse 0it は双方向 ON の正常挙動）は完走済み。
+
+**原因（ERR055 修正と ERR048 修正の差分から特定）**:
+- ERR048 のループ版 `_ProgressKeepAlive.maybe` が効くのは、frame 番号で `(fraction, description)` ペイロードが**毎回変わる**から。Gradio/gradio.live は**同一内容の進捗更新を SSE に流さず coalesce する**ため、内容が変わらないと実ワイヤ通信が発生しない。
+- ERR055 で追加した `run_with_progress_keepalive` は、ブロッキング中**毎回固定の `(fraction, description)`** を送っていた。スレッドポンプは回っていたが、固定ペイロードが coalesce され**ワイヤ上は無通信**になり、約380MB DL の長時間ブロッキング中に idle 切断が再発した。
+
+**対処法（既存ヘルパ内で完結。新機構は足さない）**:
+- `run_with_progress_keepalive` のループで keep-alive を**毎回ユニークなペイロード**にする:
+    - 説明文に経過秒を付加（`f"{description}（接続維持中・経過 {elapsed}s）"`）。本番 `min_interval_sec=2.0` なら各 tick で経過秒が必ず +2s され description が常に変化する。
+    - fraction を `min(base + min(tick,9)*1e-4, base+9e-4, 1.0)` で微小に単調増加（進捗バーは実質不動・上限 9e-4 で stage 範囲を侵食しない）。
+- 併せて `thread.join(timeout=interval)` 後に `if not thread.is_alive(): break` を追加し、work 完了後の余分な通知を抑止。
+- テスト注入用に `clock: Callable[[], float] = time.monotonic` を追加。例外再送出（`raise error["value"]`）と `progress_callback is None` 直接実行パスは不変。
+- RED→GREEN: `tests/unit/test_video_pipeline_wiring.py::test_run_with_progress_keepalive_sends_unique_payload_each_tick`（連続 keep-alive が異なるペイロードであることを検証）を追加。既存3 keep-alive テスト維持。非 integration 全体 **261 passed / 1 skipped**、RouteA movie app `--help` smoke OK、`get_errors` クリーン、サブエージェントレビュー済み（重大問題なし）。
+
+**再発防止**:
+- keep-alive は「スレッドが回っていること」ではなく「**ワイヤ上で内容が毎回変わること**」で初めて有効。Gradio/gradio.live は同一進捗ペイロードを coalesce するため、固定値の周期送信は idle 切断対策にならない。
+- ループ版 keep-alive（`_ProgressKeepAlive`）は frame 番号で payload が自然に変わるため効く。単一ブロッキング版（`run_with_progress_keepalive`）は**明示的にペイロードを変化させる**必要がある。
+- sub-second の極小 `min_interval_sec` だと経過秒が同一・fraction も上限張り付きで稀に連続同一ペイロードになり得るが、本番 interval=2.0s では各 tick で経過秒が +2s されるため実害なし（テストは 0.05s でも先頭 tick の fraction 変化で payload が変わる）。
+- 実機 Colab での SSE 維持は最終的にユーザー要確認（ローカル .venv は torch/sam2/BEN2/GPU 無しのためロジック検証に留まる。ERR035）。
+
+
+### [ERR057] BEN2 約380MB DL が HF レート制限で低速化しリクエスト処理中の長時間 DL で SSE idle 切断→全出力「Error」（ERR055/ERR056 follow-up・起動前事前ロードで根治）
+
+| 項目 | 内容 |
+|------|------|
+| **深刻度** | High |
+| **頻度** | RouteA Movie app を Colab/gradio.live で実行し、SAM2 伝搬完了→BEN2 初回 `from_pretrained` の約380MB DL に入る時（特に HF キャッシュ未生成の初回ラン） |
+| **初回発生日** | 2026-06-24 |
+| **関連ファイル** | `pipelines/route_a_video_pipeline.py`（`warm_up_ben2_in_pipelines`）, `gradio_app_sam2_ben2_route_a_for_Movie.py`（`prewarm_ben2_models` / `__main__`）, `pipelines/components/ben2_components.py`, `Sam2_BEN2_RouteA_for_Movie.ipynb` |
+
+**エラー内容**:
+ERR056（keep-alive ユニーク化）の後も UI が全出力「Error」を表示する一方サーバは継続。新ログ `エラーログ/エラーログ_25.md` では前回（`config.json 124/124` で停止）より一歩進み、`model.safetensors: 0% 0.00/381M [00:01<?, ?B/s]`（BEN2 重み DL 開始直後）で停止。
+
+**原因（ログのタイミング精査で特定）**:
+- SAM2 伝搬は 30 frame を **135s（≈4.5s/frame）** かけて完走しており、SSE は 4.5s 間隔の進捗イベントで生存している＝**SSE idle 許容は 4.5s 超**。よって真因は「keep-alive 間隔（2s）が長すぎる」ではない。
+- bert(440M) は同じく**リクエスト処理中**に DL されるが `286MB/s` で一瞬→無事。BEN2(`PramaLLC/BEN2`) の約380MB は `Warning: You are sending unauthenticated requests to the HF Hub`＝**HF 未認証リクエストのレート制限**で `?B/s`（0% のまま）と極端に低速。
+- 核心: **レート制限で長時間化した DL がリクエスト処理中（SSE ストリーム中）に走る**こと自体が問題。DL が分単位に伸びると、keep-alive を入れても free gradio.live トンネル/ブラウザ側の限界を超えて idle 切断される（バックエンドの DL は継続）。keep-alive（ERR055/ERR056）は「ループ内/単一ブロッキングの無通信」は埋めるが、**レート制限された超低速 DL の総所要時間そのもの**は短縮できない。
+
+**対処法（根治: SSE 接続が無い起動前に重みを取得）**:
+- `pipelines/route_a_video_pipeline.py` に純関数 `warm_up_ben2_in_pipelines(pipelines, *, log=print) -> int` を追加。各 Pipeline の `get_component("ben2_route_a_video").extractor.warm_up()` を呼び DL を起動前に完結させる。例外は握り潰さず `log` で通知して次の Pipeline を続行し、成功件数を返す（component 名は定数 `BEN2_COMPONENT_NAME`）。
+- `gradio_app_sam2_ben2_route_a_for_Movie.py` に `prewarm_ben2_models()` を追加し、`__main__` で `parse_args()` の後・`demo.queue()`/`demo.launch()` の**前**に呼ぶ。BEN2 約380MB DL は gradio.live URL 印字前（SSE 接続が無い段階）にセル内で完結し、リクエスト時はキャッシュ済み重みを即時ロードする。`get_route_a_pipeline()`/`get_route_a_only_pipeline()` の**キャッシュ済み実インスタンス**を warm_up するためリクエスト時の再 DL は発生しない。`BEN2Extractor.warm_up` は `if self._model is not None: return` で冪等。
+- GPU/ben2 が無い環境（ローカル）で warm_up が raise しても起動は止めない（リクエスト時の keep-alive[ERR056]がフォールバック）。`--help` は argparse が prewarm 前に exit するため smoke に影響しない。
+- keep-alive（ERR055/ERR056）は撤去せず**フォールバックとして併存**させる（初回キャッシュ生成途中での部分的な無通信を埋める二重防御）。
+- RED→GREEN: `tests/unit/test_route_a_video_pipeline_wiring.py::test_warm_up_ben2_in_pipelines_prewarms_all_extractors`（全 extractor warm_up・成功件数・成功ログ）/ `..._continues_and_logs_on_failure`（1 つ失敗しても握り潰さず通知し残りを続行）。非 integration 全体 **263 passed / 1 skipped**、RouteA app `--help` smoke OK、get_errors=0、サブエージェント(Explore)レビュー **PASS（重大問題なし）**。
+
+**再発防止**:
+- **レート制限され得る重みの DL は「リクエスト処理中（SSE ストリーム中）」に走らせない**。`demo.launch()` の前（SSE 接続が無い段階）に事前ロードしてキャッシュへ取得する。bert が無事なのは「起動時 DL だから」ではなく「速いから」だが、低速 DL を安全にする一般解は「SSE が無い段階で済ませる」こと。
+- keep-alive（無通信ギャップ埋め）と prewarm（長時間 DL を SSE 外へ追い出す）は**別レイヤーの対策**。前者は通信の隙間、後者は総所要時間の置き場所。新規の重い HF DL Component は prewarm 対象に追加する。
+- 同型リスク: `TransparentBGVideoExtractor` も初回 DL があるが現状小/キャッシュ済みで非顕在。新規 Colab で顕在化したら `warm_up_ben2_in_pipelines` と同じ起動前 warm_up を適用する。
+- 任意改善（未対応・スコープ外）: HF_TOKEN 設定でレート制限緩和／起動前 warm_up の config オプト化／複数リクエスト間の GPU unload。
+- 実機 Colab での効果（起動前に DL 完了し、その後のリクエストがエラーなく完走するか）はユーザー要確認（ローカル .venv は torch/sam2/BEN2/GPU 無し。ERR035）。
+
+
+### [ERR058] RouteA 動画で全工程を 1 本の同期リクエスト＝長時間 SSE として gradio.live トンネル越しに保持し続け、SAM2 伝搬完了後（BEN2 抽出/書き出し）で総接続時間上限により切断され全出力「Error」（ERR048-057 の対症療法の限界を非同期ジョブ化で根治）
+
+| 項目 | 内容 |
+|------|------|
+| **深刻度** | High |
+| **頻度** | RouteA Movie app を Colab/gradio.live で実行し、重い処理（SAM2 伝搬＋BEN2 抽出＋書き出しで数分）が 1 リクエスト内を流れ続ける時。停止点は改修ごとに 1 段ずつ前進（DL→伝搬→抽出/書き出し）するが消えない |
+| **初回発生日** | 2026-06-24 |
+| **関連ファイル** | `gradio_app_sam2_ben2_route_a_for_Movie.py`（`run_route_a_background_removal` / `run_route_a_only_background_removal` / 新規 `start_*_job` / `poll_*_job` / `_ProgressBridge`）, 新規 `pipelines/job_manager.py`, `Sam2_BEN2_RouteA_for_Movie.ipynb` |
+
+**エラー内容**:
+ERR057（BEN2 重みの起動前事前ロード）は**有効**だった。新ログ `エラーログ/エラーログ_26.md` では prewarm が完了（`model.safetensors 100% 381M [00:10, 36.5MB/s]`→`[prewarm] BEN2 事前ロードが完了しました（#0）（#1）`）し、public URL 印字後に SAM2 `propagate in video: 100% 30/30 [01:56<00:00, 3.90s/it]`（116s）まで**完走**。ログはその直後で途切れ、UI は全出力「Error」。停止点は ERR057 の DL 段から **SAM2 伝搬の「後」（BEN2 per-frame 抽出 / writer）へ一歩前進**した。
+
+**原因（ERR048→055→056→057 の進行パターンから特定）**:
+- これは **Gradio 単体のバグではない**。3 層の相互作用:
+  1. **Gradio**: 1 予測 = 1 本の長寿命 SSE 接続を全処理時間（数分）占有する。Gradio 公式は「SSE は POST と違いタイムアウトしない」とするが、これは **localhost 直結が前提**。
+  2. **無料 gradio.live FRP トンネル（真因）**: Colab サーバを公開 URL へ中継する無料トンネル。**総接続時間/ライフタイム上限**があり長時間接続を切る。keep-alive は無通信ギャップは埋めても**総処理時間そのもの**は縮められない（ERR057 で実証済）。
+  3. **Colab**: さらにもう 1 段の proxy + リソース制約。
+- ERR048（keep-alive 導入）→ERR055（warm_up スレッドポンプ化）→ERR056（keep-alive ユニーク化）→ERR057（重み起動前 DL）は**いずれも対症療法**で、停止点を 1 段ずつ動かすだけだった。SAM2 伝搬・BEN2 抽出の両方に per-frame keep-alive を入れても消えない＝**「数分の処理を 1 本の同期リクエスト（=長時間 SSE）として壊れやすいトンネル越しに保持する」アーキテクチャ自体**が病巣。
+
+**対処法（根治: 非同期ジョブ化でリクエストを短命化し長時間 SSE を消す）**:
+- 新規 `pipelines/job_manager.py`（stdlib のみ・torch/gradio 非依存）: `JobState`（status running/done/error, fraction, description, result, error）と `JobManager.submit(work)→job_id`（daemon スレッド実行・進捗を JobState へ・**例外は握り潰さず `error` に保持**）/`snapshot(job_id)`（独立コピー）/`cleanup(ttl_sec)`。
+- `gradio_app_sam2_ben2_route_a_for_Movie.py`:
+  - `_ProgressBridge`: `gr.Progress` 互換 `__call__(value, desc=...)` を JobState 進捗へ橋渡し（既存 `build_video_progress_callback` は `progress(value, desc=...)` のみ使用するため、`progress` 引数に渡すだけでコア関数を改変せず再利用できる）。
+  - `start_route_a_job` / `start_route_a_only_job`: fail-fast 検証（動画・prompt 未指定で即 `gr.Error` / ERR037）→`JobManager.submit`→**即座に** `(job_id, 進捗テキスト, gr.Timer(active=True), run_btn 無効化)` を返す（リクエスト <1s）。
+  - `poll_route_a_job` / `poll_route_a_only_job`: `gr.Timer.tick` 束縛。running→進捗テキスト更新・出力据置・Timer 継続。done→出力返却・Timer 停止・ボタン復帰。error→初回 tick で `gr.Error` 通知（握り潰さない / Hard Rule）、`_REPORTED_JOB_ERRORS` で 2 回目以降の多重トーストを抑止し Timer 停止・ボタン復帰。
+  - 配線: `run_btn.click(start_route_a_job, outputs=[job_id_state, run_status, timer, run_btn])` + `timer.tick(poll_route_a_job, inputs=[job_id_state], outputs=[...出力7+timer+btn])`。BEN2 のみタブも同パターン（同 `JobManager` 再利用）。
+  - 進捗表示は `gr.Progress` バー依存をやめ、`run_status`（Markdown）を Timer 毎 tick で**テキスト更新**（`処理中… N%　<stage>`）。トンネル安全。
+- keep-alive（ERR055/056）/prewarm（ERR057）は撤去せず**温存**（`_ProgressBridge` 経由で JobState を更新する内部生存表示として再利用＝二重防御）。
+- RED→GREEN: `tests/unit/test_job_manager.py`（progress 反映・running→done・例外捕捉で握り潰さない・snapshot 不変・fraction クランプ・cleanup）/ `tests/unit/test_route_a_async_wiring.py`（検証 `gr.Error`・job_id 返却・完了出力一致・error 初回 `gr.Error`→2 回目リセット・running 進捗テキスト・BEN2 のみ）。非 integration 全体 **277 passed / 1 skipped**、RouteA app `--help` smoke OK、get_errors=0。
+
+**再発防止**:
+- **数分かかる処理を 1 本の同期 Gradio リクエスト（=長時間 SSE）として走らせない**。submit→`gr.Timer` ポーリングでリクエストを短命化し、トンネルの総接続時間上限に依存しない構造にする。今後の重い動画/バッチ処理 Component はこのジョブモデルに載せる。
+- keep-alive・prewarm は「無通信ギャップ」「長時間 DL の置き場所」を直す別レイヤーで、**アーキテクチャ（1 本の長時間リクエスト）そのものは直さない**。ERR048-057 の「停止点が 1 段ずつ動く」挙動が出たら対症療法を重ねず、リクエスト短命化（非同期）か接続層（localhost 直結/常設ホスト）を疑う。
+- 接続層の別解（本タスク範囲外・補足）: ユーザーはローカル RTX 4090 を保有。`--share` なしで `127.0.0.1` 直結起動すればトンネルが無くなり Gradio SSE は切れない（ERR048-058 の切断クラスが原理的に消滅）。製品級では Colab をサーバにしない（HF Spaces GPU / VM 等の常設ホスト）方が接続層の根治。
+- error 通知は polling 都合で「初回 tick の `gr.Error` + 2 回目の Timer 停止/ボタン復帰」に分割した（raise と Timer/ボタンのリセットは同一 return で両立できないため）。`_REPORTED_JOB_ERRORS` で多重トーストを抑止。
+- **実機での最終確認（ERR035）はユーザー/GPT-5.5 に委譲**: ローカル 4090 もしくは Colab で実起動→run→Timer ポーリングで進捗テキスト更新→完了で出力表示／途中失敗で 1 度だけ赤トースト＋UI 復帰、を Playwright で確認してから「fixed」確定。レビューは GPT-5.5（自前 subagent レビューは実施しない）。
+- transparent_BG 動画アプリ（`gradio_app_sam2_transparent_BG_haystack_for_Movie.py`）は同 `job_manager.py` を流用する fast-follow（本タスク範囲外）。
 
 
 ### [ERR040] UI ファイルが未コミットの作業ツリー変更で過去版へ巻き戻り、復元中の git stash で全作業を退避してしまう

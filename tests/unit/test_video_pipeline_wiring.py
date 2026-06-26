@@ -866,3 +866,133 @@ def test_movie_app_wires_single_object_only_from_tracker_registry() -> None:
     assert 'single_object_only=bool(tracker_entry.get("single_object_only"' in source
 
 
+# ── ERR055: ループの無い単一ブロッキング処理（モデル DL/ロード）中も keep-alive を送る ──
+
+
+def test_run_with_progress_keepalive_pumps_during_blocking_work() -> None:
+    """ブロッキング work の実行中も一定間隔で進捗(keep-alive)を送る。
+
+    BEN2 の初回モデル DL のように「ループの無い 1 回のブロッキング呼び出し」は
+    ``_ProgressKeepAlive``（ループ内で maybe を呼ぶ前提）では覆えず、その間 SSE が
+    無通信になり idle 切断される（ERR055=ERR048 follow-up）。本ヘルパは work を別
+    スレッドで走らせ、呼び出し側から ``min_interval_sec`` ごとに通知を送り接続を保つ。
+    """
+    import threading
+
+    from pipelines.components.video_model_components import run_with_progress_keepalive
+
+    calls: list[tuple[str, float, str]] = []
+    started = threading.Event()
+    release = threading.Event()
+
+    def _blocking_work() -> str:
+        started.set()
+        # 呼び出し側が複数回 keep-alive を送れるよう、解放されるまでブロックする。
+        assert release.wait(2.0), "テスト側が work を解放できなかった"
+        return "loaded"
+
+    def progress_callback(stage: str, fraction: float, description: str) -> None:
+        calls.append((stage, fraction, description))
+        # 2 回 keep-alive を観測したら work を解放して完了させる。
+        if len(calls) >= 2:
+            release.set()
+
+    result = run_with_progress_keepalive(
+        _blocking_work,
+        progress_callback,
+        "ben2_route_a",
+        fraction=0.01,
+        description="BEN2 モデルを読み込んでいます",
+        min_interval_sec=0.05,
+    )
+
+    assert result == "loaded"
+    assert started.is_set()
+    # ブロッキング中に複数回 keep-alive が送られている（無通信ギャップを作らない）。
+    assert len(calls) >= 2, f"keep-alive が十分に送られていない: {calls}"
+    assert all(stage == "ben2_route_a" for stage, _f, _d in calls)
+
+
+def test_run_with_progress_keepalive_sends_unique_payload_each_tick() -> None:
+    """各 keep-alive は毎回ユニークなペイロードを送る（同一値の SSE coalesce を防ぐ）。
+
+    ERR056（ERR055 follow-up）: Gradio / gradio.live は同一内容の進捗更新を SSE に
+    流さず coalesce することがあり、固定 ``(fraction, description)`` を送り続けると
+    実際のワイヤ通信が発生せず idle 切断される。本ヘルパは経過秒を説明文に付加し
+    fraction を微小に単調増加させて、連続する通知が必ず異なるようにする。
+    """
+    import threading
+
+    from pipelines.components.video_model_components import run_with_progress_keepalive
+
+    calls: list[tuple[str, float, str]] = []
+    release = threading.Event()
+
+    def _blocking_work() -> str:
+        assert release.wait(2.0), "テスト側が work を解放できなかった"
+        return "loaded"
+
+    def progress_callback(stage: str, fraction: float, description: str) -> None:
+        calls.append((stage, fraction, description))
+        if len(calls) >= 3:
+            release.set()
+
+    result = run_with_progress_keepalive(
+        _blocking_work,
+        progress_callback,
+        "ben2_route_a",
+        fraction=0.01,
+        description="BEN2 モデルを読み込んでいます",
+        min_interval_sec=0.05,
+    )
+
+    assert result == "loaded"
+    assert len(calls) >= 3, f"keep-alive が十分に送られていない: {calls}"
+    payloads = [(fraction, description) for _stage, fraction, description in calls]
+    # 連続する通知は必ず異なるペイロード（fraction か description のどちらかが変化）。
+    for previous, current in zip(payloads, payloads[1:]):
+        assert previous != current, f"連続する keep-alive が同一ペイロード: {previous!r}"
+    # 説明文に基準テキストを保ったまま経過情報を付加している。
+    assert all("BEN2 モデルを読み込んでいます" in description for _s, _f, description in calls)
+    # fraction は基準値以上で、stage 範囲を侵食しない微小 nudge に収まる。
+    assert all(0.01 <= fraction <= 0.01 + 9e-4 + 1e-9 for _s, fraction, _d in calls)
+
+
+def test_run_with_progress_keepalive_reraises_work_error() -> None:
+    """work が送出した例外は握り潰さず呼び出し側へ再送出する。"""
+    from pipelines.components.video_model_components import run_with_progress_keepalive
+
+    def _failing_work() -> None:
+        raise RuntimeError("load failed")
+
+    raised: list[RuntimeError] = []
+    try:
+        run_with_progress_keepalive(
+            _failing_work,
+            lambda *_: None,
+            "ben2_route_a",
+            fraction=0.0,
+            description="x",
+            min_interval_sec=0.05,
+        )
+    except RuntimeError as exc:
+        raised.append(exc)
+
+    assert raised and str(raised[0]) == "load failed"
+
+
+def test_run_with_progress_keepalive_no_callback_runs_directly() -> None:
+    """progress_callback が None なら work をそのまま実行し戻り値を返す。"""
+    from pipelines.components.video_model_components import run_with_progress_keepalive
+
+    result = run_with_progress_keepalive(
+        lambda: 42,
+        None,
+        "ben2_route_a",
+        fraction=0.0,
+        description="x",
+    )
+
+    assert result == 42
+
+

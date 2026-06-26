@@ -9,6 +9,7 @@ from pipelines.components.video_common import (
     frame_cache_bytes,
     normalize_output_mode,
     sample_frame_indices,
+    write_png_frame,
 )
 
 
@@ -46,3 +47,14 @@ def test_build_frame_mask_sequence_uses_frame_masks_key() -> None:
     assert sequence["frame_indices"] == [3]
     assert sequence["object_ids"] == [1]
     assert sequence["frame_masks"][3].dtype == bool
+
+
+def test_write_png_frame_saves_to_non_ascii_path(tmp_path) -> None:
+    """ERR061: 日本語(非ASCII)パスでも overlay PNG を保存できる。"""
+    target = tmp_path / "マイドライブ" / "overlay" / "frame_000000.png"
+    frame = np.zeros((6, 8, 3), dtype=np.uint8)
+    frame[0, 0] = (255, 128, 64)
+
+    write_png_frame(target, frame)
+
+    assert target.exists() and target.stat().st_size > 0

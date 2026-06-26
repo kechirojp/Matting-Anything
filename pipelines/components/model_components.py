@@ -16,7 +16,7 @@ import numpy as np
 from haystack import component
 from PIL import Image
 
-from .common import build_mask_set, compose_alpha, dilate_binary_mask, ensure_rgb_array, feather_binary_mask, mask_to_bbox, soft_probability_guard
+from .common import build_mask_set, compose_alpha, dilate_binary_mask, ensure_rgb_array, feather_binary_mask, imread_unicode, mask_to_bbox, soft_probability_guard
 
 
 CPU_FALLBACK_ENV_VAR = "MATTING_ANYTHING_ALLOW_CPU"
@@ -308,7 +308,7 @@ class GroundingDINOMultiBoxDetector:
         box_threshold: float = 0.25,
         text_threshold: float = 0.25,
         iou_threshold: float = 0.5,
-        top_k: int = 5,
+        top_k: int = 20,
     ) -> dict[str, Any]:
         if not text_prompt:
             raise ValueError("テキストプロンプトを入力してください。")
@@ -787,7 +787,11 @@ class BackgroundGenerator:
             background_files = [path for path in self.backgrounds_dir.iterdir() if path.is_file()]
             if not background_files:
                 raise ValueError("assets/backgrounds に背景画像がありません。")
-            background = cv2.cvtColor(cv2.imread(str(random.choice(background_files))), cv2.COLOR_BGR2RGB)
+            background_path = random.choice(background_files)
+            background_bgr = imread_unicode(background_path)
+            if background_bgr is None:
+                raise ValueError(f"背景画像を読み込めませんでした: {background_path}")
+            background = cv2.cvtColor(background_bgr, cv2.COLOR_BGR2RGB)
         else:
             if not background_prompt:
                 raise ValueError("背景プロンプトを入力してください。")
