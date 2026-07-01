@@ -12,7 +12,6 @@
 
 from __future__ import annotations
 
-import datetime
 from pathlib import Path
 from typing import Any
 
@@ -36,6 +35,7 @@ from .video_common import (
     composite_alpha_by_ownership,
     normalize_output_mode,
     normalize_rgba_frame,
+    resolve_run_timestamp,
     write_png_frame,
 )
 from .video_model_components import (
@@ -339,13 +339,12 @@ class BEN2RouteAVideoExtractor:
         per_object_logits = (masks or {}).get("per_object_logits", {})
         ownership_by_frame = (masks or {}).get("ownership", {})
         source_indices = list((metadata or {}).get("metadata", {}).get("sampled_frame_indices", range(len(frames))))
-        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        timestamp = resolve_run_timestamp(metadata)
         output_root = self.output_dir / timestamp
         video_dir = output_root / "video"
         sequence_root = output_root / "sequence"
         rgba_dir = sequence_root / "rgba"
         alpha_dir = sequence_root / "alpha"
-        preview_dir = sequence_root / "preview"
         fps = float((metadata or {}).get("fps", 30.0))
         rgba_video_path: Path | None = None
         alpha_video_path: Path | None = None
@@ -444,7 +443,6 @@ class BEN2RouteAVideoExtractor:
                 if normalized_mode in {"sequence", "both"}:
                     write_png_frame(rgba_dir / f"frame_{local_index:06d}.png", rgba_frame)
                     write_png_frame(alpha_dir / f"frame_{local_index:06d}.png", alpha_frame)
-                    write_png_frame(preview_dir / f"frame_{local_index:06d}.png", preview_frame)
                 ben2_keepalive.maybe(
                     local_index,
                     total_frames,
@@ -461,7 +459,7 @@ class BEN2RouteAVideoExtractor:
             "preview_video_path": str(preview_video_path) if preview_video_path else None,
             "rgba_sequence_dir": str(rgba_dir) if normalized_mode in {"sequence", "both"} else None,
             "alpha_sequence_dir": str(alpha_dir) if normalized_mode in {"sequence", "both"} else None,
-            "preview_sequence_dir": str(preview_dir) if normalized_mode in {"sequence", "both"} else None,
+            "preview_sequence_dir": None,
             "sequence_pattern": "frame_{:06d}.png" if normalized_mode in {"sequence", "both"} else None,
             "fps": fps,
             "frame_count": len(frames),

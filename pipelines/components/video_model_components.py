@@ -32,6 +32,7 @@ from .video_common import (
     frame_cache_bytes,
     normalize_output_mode,
     normalize_rgba_frame,
+    resolve_run_timestamp,
     sample_frame_indices,
     write_png_frame,
 )
@@ -423,6 +424,10 @@ class VideoReader:
             frame_count=frame_count or len(frames),
             codec=codec,
             metadata={
+                # run_timestamp は 1 回の実行で全 Writer が共有する出力フォルダ名の起点。
+                # 各 extractor / overlay writer が個別に datetime.now() すると出力が別フォルダに
+                # 割れるため（動画は A フォルダ・overlay は B フォルダ）、ここで一度だけ生成する。
+                "run_timestamp": datetime.datetime.now().strftime("%Y%m%d_%H%M%S"),
                 "sampled_frame_indices": source_indices,
                 "sampled_count": len(frames),
                 "frame_step": int(frame_step),
@@ -888,13 +893,12 @@ class TransparentBGVideoExtractor:
         per_object_logits = (masks or {}).get("per_object_logits", {})
         ownership_by_frame = (masks or {}).get("ownership", {})
         source_indices = list((metadata or {}).get("metadata", {}).get("sampled_frame_indices", range(len(frames))))
-        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        timestamp = resolve_run_timestamp(metadata)
         output_root = self.output_dir / timestamp
         video_dir = output_root / "video"
         sequence_root = output_root / "sequence"
         rgba_dir = sequence_root / "rgba"
         alpha_dir = sequence_root / "alpha"
-        preview_dir = sequence_root / "preview"
         fps = float((metadata or {}).get("fps", 30.0))
         rgba_video_path: Path | None = None
         alpha_video_path: Path | None = None
@@ -975,7 +979,6 @@ class TransparentBGVideoExtractor:
                 if normalized_mode in {"sequence", "both"}:
                     write_png_frame(rgba_dir / f"frame_{local_index:06d}.png", rgba_frame)
                     write_png_frame(alpha_dir / f"frame_{local_index:06d}.png", alpha_frame)
-                    write_png_frame(preview_dir / f"frame_{local_index:06d}.png", preview_frame)
                 tb_keepalive.maybe(
                     local_index,
                     total_frames,
@@ -992,7 +995,7 @@ class TransparentBGVideoExtractor:
             "preview_video_path": str(preview_video_path) if preview_video_path else None,
             "rgba_sequence_dir": str(rgba_dir) if normalized_mode in {"sequence", "both"} else None,
             "alpha_sequence_dir": str(alpha_dir) if normalized_mode in {"sequence", "both"} else None,
-            "preview_sequence_dir": str(preview_dir) if normalized_mode in {"sequence", "both"} else None,
+            "preview_sequence_dir": None,
             "sequence_pattern": "frame_{:06d}.png" if normalized_mode in {"sequence", "both"} else None,
             "fps": fps,
             "frame_count": len(frames),
@@ -1039,18 +1042,29 @@ class TrackingOverlayWriter:
         masks: dict = None,
         metadata: dict = None,
         enabled: bool = True,
+        output_mode: str = "video",
         progress_callback: ProgressCallback | None = None,
     ) -> dict[str, dict[str, Any]]:
-        """frame ごとに mask overlay を描き、追跡確認用の mp4 / PNG 連番を保存する。"""
+        """frame ごとに mask overlay を描き、追跡確認用の webm / PNG 連番を保存する。
+
+        overlay は成果物 writer と同じ run_timestamp フォルダへ書き出し、``output_mode`` に従って
+        出力形式を揃える。video/both では ``video/tracking_overlay.webm``、sequence/both では
+        ``sequence/overlay/`` を書く。これにより「overlay だけ別タイムスタンプ・別形式に分裂する」
+        不具合（成果物フォルダに overlay が無い／overlay フォルダに成果物が無い）を防ぐ。
+        """
         if not enabled:
             return {"overlay": {"overlay_video_path": None, "frame_count": 0, "enabled": False}}
         if not frames:
             raise ValueError("frames が空です。")
+        normalized_mode = normalize_output_mode(output_mode)
+        write_video = normalized_mode in {"video", "both"}
+        write_sequence = normalized_mode in {"sequence", "both"}
         frame_masks = (masks or {}).get("frame_masks", {})
         object_ids = list((masks or {}).get("object_ids", [1]))
         source_indices = list((metadata or {}).get("metadata", {}).get("sampled_frame_indices", range(len(frames))))
         color = self._OBJECT_COLORS[(int(object_ids[0]) - 1) % len(self._OBJECT_COLORS)] if object_ids else self._OBJECT_COLORS[0]
-        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        # 成果物 writer（extractor）と同一の run_timestamp を共有し、同じ outputs/<ts>/ に集約する。
+        timestamp = resolve_run_timestamp(metadata)
         output_root = self.output_dir / timestamp
         video_dir = output_root / "video"
         overlay_sequence_dir = output_root / "sequence" / "overlay"
@@ -1069,11 +1083,13 @@ class TrackingOverlayWriter:
                     overlay_frame = frame_rgb
                 else:
                     overlay_frame = render_tracking_overlay_frame(frame_rgb, mask, color=color, fill_alpha=self.fill_alpha)
-                if overlay_stream is None:
-                    # overlay は VP9(webm) でブラウザ再生互換にする（mp4v 不可・ERR065）。
-                    overlay_stream = _ImageioWebmVideoWriter(overlay_video_path, overlay_frame, fps)
-                overlay_stream.write(overlay_frame)
-                write_png_frame(overlay_sequence_dir / f"frame_{local_index:06d}.png", overlay_frame)
+                if write_video:
+                    if overlay_stream is None:
+                        # overlay は VP9(webm) でブラウザ再生互換にする（mp4v 不可・ERR065）。
+                        overlay_stream = _ImageioWebmVideoWriter(overlay_video_path, overlay_frame, fps)
+                    overlay_stream.write(overlay_frame)
+                if write_sequence:
+                    write_png_frame(overlay_sequence_dir / f"frame_{local_index:06d}.png", overlay_frame)
                 overlay_keepalive.maybe(
                     local_index,
                     total_frames,
@@ -1086,12 +1102,13 @@ class TrackingOverlayWriter:
                 overlay_stream.close()
         tracker_metadata = {key: (masks or {}).get("metadata", {}).get(key) for key in ("tracker_config", "tracker_checkpoint", "samurai_mode")}
         overlay = {
-            "overlay_video_path": str(overlay_video_path),
-            "overlay_sequence_dir": str(overlay_sequence_dir),
-            "sequence_pattern": "frame_{:06d}.png",
+            "overlay_video_path": str(overlay_video_path) if write_video else None,
+            "overlay_sequence_dir": str(overlay_sequence_dir) if write_sequence else None,
+            "sequence_pattern": "frame_{:06d}.png" if write_sequence else None,
             "fps": fps,
             "frame_count": len(frames),
             "enabled": True,
+            "output_mode": normalized_mode,
             "metadata": {
                 "source": "tracking-overlay",
                 "timestamp": timestamp,
@@ -1322,7 +1339,9 @@ class FrameSequenceWriter:
         rgba_frames = [normalize_rgba_frame(frame) for frame in matte.get("rgba_frames", [])]
         alpha_frames = list(matte.get("alpha_frames", []))
         preview_frames = [ensure_rgb_array(frame) for frame in matte.get("preview_frames", [])]
-        if not rgba_frames and matte.get("rgba_sequence_dir") and matte.get("alpha_sequence_dir") and matte.get("preview_sequence_dir"):
+        # extractor が連番を stream 済みなら（rgba/alpha dir を保持）そのまま透過する。
+        # preview 連番は成果物から除外したため（rgba/alpha のみ）early-return 条件でも要求しない。
+        if not rgba_frames and matte.get("rgba_sequence_dir") and matte.get("alpha_sequence_dir"):
             return {"matte": matte}
         self.output_dir.mkdir(parents=True, exist_ok=True)
         estimated_bytes = sum(frame.nbytes for frame in rgba_frames + alpha_frames + preview_frames)

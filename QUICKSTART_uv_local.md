@@ -6,7 +6,10 @@
 - パッケージ管理: **uv**（このプロジェクトは `.venv + pip` ではなく uv 運用）
 - Python: **3.11**（`.python-version` で固定）
 - torch: **2.6.0+cu124**（CUDA 12.4 ビルド）
-- 同梱モデル: SAM2 / SAMURAI、BEN2（RouteA）、transparent-background
+- 同梱モデル: SAM2 / SAMURAI、GroundingDINO、BEN2、transparent-background
+- 主なアプリ: **`gradio_app_sam2_ben2_tb_hybrid_deva_manual_for_Movie.py`**
+  （DEVA方式 SAM2 + BEN2/TB ハイブリッド動画αマット・手動プロンプト版。
+  詳細は `QUICKSTART_DEVA_BEN2_TB_HYBRID_MANUAL.md` 参照）
 
 ---
 
@@ -61,8 +64,7 @@ uv pip install --python .venv\Scripts\python.exe --no-build-isolation -e samurai
 ### 2-2. アプリ起動スモーク
 
 ```powershell
-.venv\Scripts\python.exe gradio_app_sam2_ben2_route_a_for_Movie.py --help
-.venv\Scripts\python.exe gradio_app_sam2_transparent_BG_haystack_for_Movie.py --help
+.venv\Scripts\python.exe gradio_app_sam2_ben2_tb_hybrid_deva_manual_for_Movie.py --help
 ```
 
 ### 2-3. テスト（非 integration）
@@ -79,14 +81,12 @@ uv pip install --python .venv\Scripts\python.exe --no-build-isolation -e samurai
 既定で `server_name=127.0.0.1` です。
 
 ```powershell
-# RouteA（SAM2 + BEN2）動画版 — port 7862
-.venv\Scripts\python.exe gradio_app_sam2_ben2_route_a_for_Movie.py
-
-# transparent-background 動画版
-.venv\Scripts\python.exe gradio_app_sam2_transparent_BG_haystack_for_Movie.py
+# DEVA方式 SAM2 + BEN2/TB ハイブリッド動画αマット（手動プロンプト版）— 既定 port 7866
+.venv\Scripts\python.exe gradio_app_sam2_ben2_tb_hybrid_deva_manual_for_Movie.py
 ```
 
-ブラウザで表示された `http://127.0.0.1:<port>` を開きます。
+ブラウザで表示された `http://127.0.0.1:<port>` を開きます。詳しい使い方（Canvas での box/point 指定、
+DEVA周期再検出、Alpha合成方式など）は `QUICKSTART_DEVA_BEN2_TB_HYBRID_MANUAL.md` を参照してください。
 
 ### 主な起動オプション
 
@@ -101,11 +101,14 @@ uv pip install --python .venv\Scripts\python.exe --no-build-isolation -e samurai
 
 ## 4. 補足・トラブルシュート
 
-- **GroundingDINO の custom CUDA ops は未導入**です。テキストプロンプト検出時のみ必要（optional）で、
-  手動 bbox / point で使う RouteA には不要です。
+- **GroundingDINO は本アプリで必須**です（DEVA周期再検出・Text Prompt・「Text Prompt から box を自動作成」機能に使用）。
+  CUDA custom ops（`ms_deform_attn`）は未導入でも pure PyTorch フォールバックで動作しますが、
+  検出が遅くなります。高速化したい場合は `BUILD_WITH_CUDA=True` で `GroundingDINO` を
+  ビルドしてください（`INSTALL.md` 参照）。
 - **`flet` の `UserWarning`** は transparent-background の GUI モード由来で無害です。
 - 依存を変えたら再度 `uv sync`。SAM-2 を入れ直す場合は手順 1-2 を再実行（`--no-build-isolation` 必須）。
 - **BEN2 チェックポイントはローカル優先**です。`config/route_a.toml` の `ben2_checkpoint_path`（既定 `checkpoints/BEN2`）に重みがあればそれを使用し、無ければ初回のみ自動ダウンロードして同じ場所へ保存（永続化）します。
+- **transparent-background の重み**（`checkpoints/transparent_BG/`）も初回推論時に自動ダウンロードされます。
 - 詳細な背景・既知の落とし穴は `ERROR_LOG.md` の **ERR058 / ERR059**、設定の正本は `pyproject.toml` を参照。
 
 ---

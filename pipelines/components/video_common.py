@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import datetime
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -13,6 +14,27 @@ from .common import imwrite_unicode
 
 
 VALID_OUTPUT_MODES = {"video", "sequence", "both"}
+
+
+def resolve_run_timestamp(metadata: dict[str, Any] | None) -> str:
+    """1 回の実行で全 Writer が共有する run タイムスタンプ（YYYYmmdd_HHMMSS）を解決する。
+
+    VideoReader が ``metadata["metadata"]["run_timestamp"]`` に一度だけ生成した値を各 Writer
+    （extractor / overlay writer）が共有することで、動画・連番・overlay を同一の
+    ``outputs/<timestamp>/`` 配下へまとめる。metadata に値が無い場合（Component 単体呼び出し
+    やテスト直呼び等）は現在時刻を生成し、後方互換を保つ。
+
+    Args:
+        metadata: VideoReader が返す VideoSource 契約 dict（``metadata`` ネストを持つ）。
+
+    Returns:
+        共有 run タイムスタンプ文字列。
+    """
+    nested = metadata.get("metadata", {}) if isinstance(metadata, dict) else {}
+    stamp = nested.get("run_timestamp") if isinstance(nested, dict) else None
+    if stamp:
+        return str(stamp)
+    return datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 
 
 def normalize_output_mode(output_mode: str) -> str:

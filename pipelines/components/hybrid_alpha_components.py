@@ -7,7 +7,6 @@ DEVA/SAM2 が追跡した人物領域だけを transparent-background に渡し�
 
 from __future__ import annotations
 
-import datetime
 import logging
 import warnings
 from pathlib import Path
@@ -24,7 +23,7 @@ from .ben2_components import BEN2Extractor
 from .common import compose_alpha, ensure_rgb_array, feather_binary_mask
 from .model_components import TransparentBGExtractor, default_device
 from .route_a_common import alpha_to_rgba, load_route_a_config
-from .video_common import normalize_output_mode, normalize_rgba_frame, write_png_frame
+from .video_common import normalize_output_mode, normalize_rgba_frame, resolve_run_timestamp, write_png_frame
 from .video_model_components import (
     ProgressCallback,
     VideoWriter,
@@ -172,13 +171,12 @@ class BEN2TransparentHybridVideoExtractor:
 
         frame_masks = (masks or {}).get("frame_masks", {})
         source_indices = list((metadata or {}).get("metadata", {}).get("sampled_frame_indices", range(len(frames))))
-        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        timestamp = resolve_run_timestamp(metadata)
         output_root = self.output_dir / timestamp
         video_dir = output_root / "video"
         sequence_root = output_root / "sequence"
         rgba_dir = sequence_root / "rgba"
         alpha_dir = sequence_root / "alpha"
-        preview_dir = sequence_root / "preview"
         fps = float((metadata or {}).get("fps", 30.0))
         rgba_video_path: Path | None = None
         alpha_video_path: Path | None = None
@@ -260,7 +258,6 @@ class BEN2TransparentHybridVideoExtractor:
                 if normalized_mode in {"sequence", "both"}:
                     write_png_frame(rgba_dir / f"frame_{local_index:06d}.png", rgba_frame)
                     write_png_frame(alpha_dir / f"frame_{local_index:06d}.png", alpha_frame)
-                    write_png_frame(preview_dir / f"frame_{local_index:06d}.png", preview_frame)
                 keepalive.maybe(
                     local_index,
                     total_frames,
@@ -303,7 +300,7 @@ class BEN2TransparentHybridVideoExtractor:
             "preview_video_path": str(preview_video_path) if preview_video_path else None,
             "rgba_sequence_dir": str(rgba_dir) if normalized_mode in {"sequence", "both"} else None,
             "alpha_sequence_dir": str(alpha_dir) if normalized_mode in {"sequence", "both"} else None,
-            "preview_sequence_dir": str(preview_dir) if normalized_mode in {"sequence", "both"} else None,
+            "preview_sequence_dir": None,
             "sequence_pattern": "frame_{:06d}.png" if normalized_mode in {"sequence", "both"} else None,
             "fps": fps,
             "frame_count": len(frames),

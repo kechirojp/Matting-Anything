@@ -32,6 +32,36 @@
 
 ## エラー一覧
 
+### [ERR069] 動画1回の実行が2つのタイムスタンプフォルダに分裂し、overlay 専用フォルダに成果物（rgba/alpha）が無く、overlay が output_mode を無視して常に webm+PNG 両方を出力
+
+| 項目 | 内容 |
+|------|------|
+| **深刻度** | High |
+| **頻度** | 全動画アプリで overlay ON かつ処理時間が秒跨ぎになると必発 |
+| **初回発生日** | 2026-07-01 |
+| **関連ファイル** | `pipelines/components/video_common.py`, `pipelines/components/video_model_components.py`, `pipelines/components/hybrid_alpha_components.py`, `pipelines/components/ben2_components.py`, 全 5 動画アプリ, `tests/unit/test_tracking_overlay.py` |
+
+**エラー内容**:
+1回の処理で出力が2フォルダに分裂（例 `outputs/20260701_190710/`（成果物）と `outputs/20260701_190932/`（overlay のみ））。overlay 専用フォルダにはマスク確認用データしか無く、お客が必要な成果物（`video/rgba.webm` 等・`sequence/rgba|alpha`）が入っていない。さらに overlay は UI の出力形式（動画/連番/両方）に関係なく常に `video/tracking_overlay.webm` と `sequence/overlay/*.png` の両方を書き出していた。
+
+**原因**:
+- 各 streaming extractor（`TransparentBGVideoExtractor` / `BEN2TransparentHybridVideoExtractor` / `BEN2RouteAVideoExtractor`）と `TrackingOverlayWriter` が**それぞれ独立に `datetime.now()`** を呼んで出力フォルダ名を決めていた。処理が秒を跨ぐと extractor と overlay で異なる秒になり、同一 run が別フォルダに分裂する。
+- `TrackingOverlayWriter` は `enabled` のみで分岐し **`output_mode` を無視**して常に webm+PNG 両方を書いていた（連番モードでも動画を、動画モードでも PNG を出力）。
+
+**対処法（修正＝根治、共有コンポーネント化・後方互換）**:
+1. `video_common.py` に `resolve_run_timestamp(metadata)` を追加。`metadata["metadata"]["run_timestamp"]` があれば共有値を返し、無ければ `datetime.now()` を生成（Component 単体/テスト直呼びの後方互換）。
+2. `VideoReader.run()` が run 開始時に `run_timestamp` を metadata に**1回だけ**注入。以降の全 Writer がこれを共有。
+3. 3 つの extractor は `timestamp = resolve_run_timestamp(metadata)` を使用（自前 `datetime.now()` を撤去、未使用 `import datetime` も削除）。
+4. `TrackingOverlayWriter.run()` に `output_mode` 引数を追加し `resolve_run_timestamp` を使用。video/both のみ `video/tracking_overlay.webm`、sequence/both のみ `sequence/overlay/*.png` を書くよう `output_mode` 準拠に。非該当のパスは `None` を返す。
+5. 連番出力から preview を除外（ユーザ要望）。extractor は sequence モードで `rgba`/`alpha` のみ書き、`preview_sequence_dir=None`。`FrameSequenceWriter` の stream 透過 early-return も preview を要求しないよう修正。
+6. 全 5 動画アプリの `tracking_overlay` 実行入力に `"output_mode": output_mode` を配線。全 pipeline は既に `video_reader.metadata → tracking_overlay.metadata` を接続済み。
+- 目標挙動: **動画**→`<ts>/video/{rgba,alpha,preview,tracking_overlay(ONのみ)}.webm`（連番PNGなし）／**連番**→`<ts>/sequence/{rgba,alpha}/`＋`overlay/`(ONのみ)（動画なし）／**両方**→和集合。全 Writer が単一 `<ts>/` に集約。
+- TDD: `test_tracking_overlay.py` に5テスト追加（共有ts・output_mode video/sequence/both 準拠）。非 integration 全体 **392 passed**（回帰なし）。5 動画アプリ `--help` smoke 成功。サブエージェントレビュー: 指摘0。
+
+**再発防止**: 出力フォルダは「1 run = 1 timestamp」を `VideoReader` が発行し全 Writer が `resolve_run_timestamp` で共有する。overlay を含む全 Writer は `output_mode` に準拠すること（overlay だけ別扱いにしない）。
+
+---
+
 ### [ERR068] DEVA 方式動画アプリで 4K×多対象時に per_object_logits をフル解像度 float32 で全 frame 蓄積し host-RAM 枯渇 → `numpy._ArrayMemoryError`（約7分後クラッシュ）
 
 | 項目 | 内容 |

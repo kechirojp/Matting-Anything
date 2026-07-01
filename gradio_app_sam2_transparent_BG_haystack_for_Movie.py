@@ -487,7 +487,7 @@ def run_video_background_removal(
                 },
                 "video_writer": {"rgba_codec": rgba_codec, "progress_callback": progress_callback},
                 "frame_sequence_writer": {"progress_callback": progress_callback},
-                "tracking_overlay": {"enabled": bool(overlay_enabled), "progress_callback": progress_callback},
+                "tracking_overlay": {"enabled": bool(overlay_enabled), "output_mode": output_mode, "progress_callback": progress_callback},
             },
             include_outputs_from={"video_writer", "frame_sequence_writer", "tracking_overlay"},
         )
