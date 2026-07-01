@@ -18,6 +18,7 @@
 - `outputs/` に git 管理対象ファイルを追加しない。
 - `segment-anything/` と `samurai/` は直接変更しない。
 - `samurai/` 利用時は `INFERENCE_TRACKER_VARIANT` と config 切替で運用する。
+- ハルシネーション防止: わからないことは推測で断定せず、リポジトリ内ファイル（特に `WHITEBOARD.md` / `ERROR_LOG.md` / `REFERENCE.md`）やウェブ検索で裏取りしてから回答・実装する。詳細は `.github/prompts/prevent-hallucination.prompt.md` を参照する。
 
 ## 作業フロー
 
@@ -58,6 +59,7 @@
 13. Haystack Component 境界は安定 I/O 契約で接続する。契約を崩すと配線不整合が連鎖し、バグの温床になる。
 14. SAM2 / GroundingDINO 遅延調査は計測と preflight を先に行う。
 15. UI / 配線の fixed は Playwright 実行時検証後に記録する。
+16. わからないことは推測せず、リポジトリ内ファイルやウェブ検索で裏取りする（`.github/prompts/prevent-hallucination.prompt.md`）。
 
 ## 詳細参照
 

@@ -42,11 +42,10 @@ from .video_model_components import (
     ProgressCallback,
     VideoWriter,
     _ImageioAlphaVideoWriter,
+    _ImageioWebmVideoWriter,
     _notify_progress,
-    _OpenCVFrameVideoWriter,
     _ProgressKeepAlive,
     _resolve_output_dir,
-    run_with_progress_keepalive,
 )
 
 
@@ -352,8 +351,8 @@ class BEN2RouteAVideoExtractor:
         alpha_video_path: Path | None = None
         preview_video_path: Path | None = None
         rgba_stream: _ImageioAlphaVideoWriter | None = None
-        alpha_stream: _OpenCVFrameVideoWriter | None = None
-        preview_stream: _OpenCVFrameVideoWriter | None = None
+        alpha_stream: _ImageioWebmVideoWriter | None = None
+        preview_stream: _ImageioWebmVideoWriter | None = None
         codec_fallback: list[tuple[str, str]] = []
         used_rgba_codec: str | None = None
         total_frames = max(len(frames), 1)
@@ -361,18 +360,16 @@ class BEN2RouteAVideoExtractor:
         # ERR055(=ERR048 follow-up): BEN2 モデルロードを per-frame ループの外で先に済ませる。
         # warm_up() は遅延ロード（infer_alpha 内の初回で重い from_pretrained を実行）かつ、
         # その中身は「約380MB の model.safetensors を 1 回の from_pretrained で取得する単一
-        # ブロッキング呼び出し」でループを持たない。先読みするだけではこのダウンロード自体が
-        # 無通信になり、propagation 完了後に gradio.live/Colab の SSE が idle 切断される
-        # （UI 全出力 Error・バックエンドは継続）。ループ前提の _ProgressKeepAlive では覆えない
-        # ため、別スレッドで warm_up を走らせ呼び出し側から一定間隔で keep-alive を送る
-        # run_with_progress_keepalive でダウンロード/ロード区間を覆う。
-        run_with_progress_keepalive(
-            self.extractor.warm_up,
+        # ブロッキング呼び出し」。ループ外に出すことで初回ロードを 1 区間に閉じ込める。
+        # （Windows local 直結では tunnel SSE idle 切断が無く、かつ非同期ジョブ実行のため
+        #  リクエストをブロックしない。旧 Colab/gradio.live 向け keep-alive ラップは撤去。）
+        _notify_progress(
             progress_callback,
             "ben2_route_a",
-            fraction=0.01,
-            description="BEN2 モデルを読み込んでいます（初回は約380MBダウンロード・数分かかる場合があります）",
+            0.01,
+            "BEN2 モデルを読み込んでいます（初回は約380MBダウンロード・数分かかる場合があります）",
         )
+        self.extractor.warm_up()
         _notify_progress(
             progress_callback,
             "ben2_route_a",
@@ -432,12 +429,12 @@ class BEN2RouteAVideoExtractor:
                         preferred_rgba_codec=rgba_codec,
                     )
                     rgba_video_path = video_dir / f"rgba{spec.suffix}"
-                    alpha_video_path = video_dir / "alpha.mp4"
-                    preview_video_path = video_dir / "preview.mp4"
+                    alpha_video_path = video_dir / "alpha.webm"
+                    preview_video_path = video_dir / "preview.webm"
                     used_rgba_codec = spec.label
                     rgba_stream = _ImageioAlphaVideoWriter(rgba_video_path, rgba_frame, fps, spec)
-                    alpha_stream = _OpenCVFrameVideoWriter(alpha_video_path, alpha_frame, fps, "mp4v", channels=1)
-                    preview_stream = _OpenCVFrameVideoWriter(preview_video_path, preview_frame, fps, "mp4v", channels=3)
+                    alpha_stream = _ImageioWebmVideoWriter(alpha_video_path, alpha_frame, fps)
+                    preview_stream = _ImageioWebmVideoWriter(preview_video_path, preview_frame, fps)
                 if rgba_stream is not None:
                     rgba_stream.write(rgba_frame)
                 if alpha_stream is not None:

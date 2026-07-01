@@ -133,6 +133,11 @@ def run_with_progress_keepalive(
 ) -> Any:
     """ループの無い単一ブロッキング処理 ``work`` を実行しつつ keep-alive を送る。
 
+    NOTE（2026-06-26）: Windows local 直結運用では tunnel/SSE idle 切断が起きないため、
+    BEN2 warm_up を覆っていた本番呼び出し元（``ben2_components`` の warm_up ラップ）は
+    撤去済み。本ヘルパは **Colab/gradio.live 等の共有トンネルで再運用する場合のために
+    温存**しており、現状はユニットテストからのみ参照される。
+
     モデルの初回ダウンロード/ロードのような「ループを持たない 1 回のブロッキング
     呼び出し」は ``_ProgressKeepAlive``（ループ内で ``maybe`` を呼ぶ前提）では覆えない。
     その間 SSE が無通信になり Colab / gradio.live の共有トンネルが idle 切断し、
@@ -306,6 +311,53 @@ class _ImageioAlphaVideoWriter:
         # imageio は RGB order を期待する。normalize_rgba_frame 済みの RGBA をそのまま渡す。
         frame_array = normalize_rgba_frame(frame)
         self._writer.append_data(frame_array)
+
+    def close(self) -> None:
+        self._writer.close()
+
+
+class _ImageioWebmVideoWriter:
+    """imageio+ffmpeg で 1 frame ずつブラウザ再生可能な VP9(webm) を書き出す軽量 writer。
+
+    cv2.VideoWriter の ``'mp4v'``(MPEG-4 Part 2) は Chrome 等の ``<video>`` / ``gr.Video`` で
+    再生できず、出力が「表示されない」ように見える（ERR065）。RGBA(webm/VP9) と同様に
+    alpha / preview / tracking overlay も VP9(yuv420p) / webm で書き出し、全 Chromium 系
+    （Playwright のバンドル Chromium を含む）で再生互換にする。
+
+    grayscale(1ch / 2D) frame は RGB(3ch) に複製し、RGBA(4ch) は先頭 3ch を使って yuv420p
+    互換の 3ch RGB として書き出す。
+    """
+
+    def __init__(self, path: Path, first_frame: np.ndarray, fps: float) -> None:
+        imageio = _require_imageio()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self._path = path
+        # first_frame は形状参照用（cv2 版と同じ契約）。実書き込みは write() で行う。
+        np.asarray(first_frame)
+        self._writer = imageio.get_writer(
+            str(path),
+            format="FFMPEG",
+            mode="I",
+            fps=float(fps),
+            codec="vp9",
+            pixelformat="yuv420p",
+            # RGBA webm と同じく alt-ref を無効化して 1pass streaming を安定させる。
+            # 奇数解像度は macro_block_size=2 で偶数化。
+            output_params=["-auto-alt-ref", "0"],
+            macro_block_size=2,
+        )
+
+    @staticmethod
+    def _to_rgb(frame: np.ndarray) -> np.ndarray:
+        frame_array = np.asarray(frame).astype(np.uint8, copy=False)
+        if frame_array.ndim == 2:
+            return np.repeat(frame_array[:, :, None], 3, axis=2)
+        if frame_array.shape[2] == 4:
+            return frame_array[:, :, :3]
+        return frame_array
+
+    def write(self, frame: np.ndarray) -> None:
+        self._writer.append_data(self._to_rgb(frame))
 
     def close(self) -> None:
         self._writer.close()
@@ -524,6 +576,18 @@ class SAM2VideoPropagator:
         """SAM2 video predictor を遅延・冪等に初期化する。"""
         if self._video_predictor is not None:
             return
+        # tracker checkpoint をモデル build 前に検証する（ERR066）。registry は SAM2.1/SAMURAI の
+        # Large/B+ 計4 tracker を提供するが、B+ 系 checkpoint（sam2.1_hiera_base_plus.pt）が
+        # 未配置のまま選択されると sam2 内部の torch.load が分かりにくい FileNotFoundError で
+        # 落ちる。原因（欠落ファイル）と代替（重みが揃った Large 等）を示す fail-fast にする。
+        checkpoint = Path(self.checkpoint_path)
+        if not checkpoint.is_file():
+            raise RuntimeError(
+                f"トラッカーの checkpoint が見つかりません: {checkpoint}。 "
+                "選択したトラッカーモデルの重みファイルを checkpoints/SAM2/ に配置するか、 "
+                "重みが存在する別のトラッカー（例: SAM2.1 Hiera-Large = sam2.1_hiera_large.pt） "
+                "を選択してください。"
+            )
         require_gpu_for_heavy_inference(self.__class__.__name__, self.device)
         _require_samurai_capable_sam2(self.config_name)
         _ensure_samurai_config_searchpath(self.config_name)
@@ -836,8 +900,8 @@ class TransparentBGVideoExtractor:
         alpha_video_path: Path | None = None
         preview_video_path: Path | None = None
         rgba_stream: _ImageioAlphaVideoWriter | None = None
-        alpha_stream: _OpenCVFrameVideoWriter | None = None
-        preview_stream: _OpenCVFrameVideoWriter | None = None
+        alpha_stream: _ImageioWebmVideoWriter | None = None
+        preview_stream: _ImageioWebmVideoWriter | None = None
         codec_fallback: list[tuple[str, str]] = []
         used_rgba_codec: str | None = None
         total_frames = max(len(frames), 1)
@@ -895,12 +959,13 @@ class TransparentBGVideoExtractor:
                         preferred_rgba_codec=rgba_codec,
                     )
                     rgba_video_path = video_dir / f"rgba{spec.suffix}"
-                    alpha_video_path = video_dir / "alpha.mp4"
-                    preview_video_path = video_dir / "preview.mp4"
+                    alpha_video_path = video_dir / "alpha.webm"
+                    preview_video_path = video_dir / "preview.webm"
                     used_rgba_codec = spec.label
                     rgba_stream = _ImageioAlphaVideoWriter(rgba_video_path, rgba_frame, fps, spec)
-                    alpha_stream = _OpenCVFrameVideoWriter(alpha_video_path, alpha_frame, fps, "mp4v", channels=1)
-                    preview_stream = _OpenCVFrameVideoWriter(preview_video_path, preview_frame, fps, "mp4v", channels=3)
+                    # alpha/preview は VP9(webm) でブラウザ再生互換にする（mp4v 不可・ERR065）。
+                    alpha_stream = _ImageioWebmVideoWriter(alpha_video_path, alpha_frame, fps)
+                    preview_stream = _ImageioWebmVideoWriter(preview_video_path, preview_frame, fps)
                 if rgba_stream is not None:
                     rgba_stream.write(rgba_frame)
                 if alpha_stream is not None:
@@ -990,8 +1055,8 @@ class TrackingOverlayWriter:
         video_dir = output_root / "video"
         overlay_sequence_dir = output_root / "sequence" / "overlay"
         fps = float((metadata or {}).get("fps", 30.0))
-        overlay_video_path = video_dir / "tracking_overlay.mp4"
-        overlay_stream: _OpenCVFrameVideoWriter | None = None
+        overlay_video_path = video_dir / "tracking_overlay.webm"
+        overlay_stream: _ImageioWebmVideoWriter | None = None
         total_frames = max(len(frames), 1)
         _notify_progress(progress_callback, "tracking_overlay", 0.0, "追跡確認用 overlay を生成しています")
         overlay_keepalive = _ProgressKeepAlive(progress_callback, "tracking_overlay")
@@ -1005,7 +1070,8 @@ class TrackingOverlayWriter:
                 else:
                     overlay_frame = render_tracking_overlay_frame(frame_rgb, mask, color=color, fill_alpha=self.fill_alpha)
                 if overlay_stream is None:
-                    overlay_stream = _OpenCVFrameVideoWriter(overlay_video_path, overlay_frame, fps, "mp4v", channels=3)
+                    # overlay は VP9(webm) でブラウザ再生互換にする（mp4v 不可・ERR065）。
+                    overlay_stream = _ImageioWebmVideoWriter(overlay_video_path, overlay_frame, fps)
                 overlay_stream.write(overlay_frame)
                 write_png_frame(overlay_sequence_dir / f"frame_{local_index:06d}.png", overlay_frame)
                 overlay_keepalive.maybe(

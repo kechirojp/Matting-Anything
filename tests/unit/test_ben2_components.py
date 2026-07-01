@@ -194,25 +194,19 @@ def test_run_warms_up_ben2_before_first_frame(tmp_path):
     assert events.index("warm_up") < events.index("infer"), "warm_up は初回 infer_alpha より前に呼ぶこと"
 
 
-def test_run_routes_warmup_through_progress_keepalive(tmp_path, monkeypatch) -> None:
-    """ERR055: BEN2 の先読みロードを keep-alive ポンプ（run_with_progress_keepalive）経由で行う。
+def test_run_warms_up_ben2_directly_without_keepalive(tmp_path, monkeypatch) -> None:
+    """Layer A 撤去: BEN2 の先読みロードは keep-alive ポンプを介さず warm_up を直接呼ぶ。
 
-    BEN2 の初回モデル DL（約380MB）は ``warm_up`` 内の単一ブロッキング呼び出しで、
-    ループが無いため ``_ProgressKeepAlive`` では覆えない。その間 SSE が無通信になり
-    gradio.live / Colab が idle 切断する（ERR055=ERR048 follow-up）。``run()`` は
-    ``extractor.warm_up`` を ``run_with_progress_keepalive`` に渡し、ロード中も一定間隔で
-    進捗を送って接続を保つこと。
+    Windows local 直結では tunnel/SSE idle 切断が起きず、さらに非同期ジョブ(Layer C)で
+    処理全体が background thread 実行されるため、Colab/gradio.live 向けの
+    ``run_with_progress_keepalive`` ラップは不要。warm_up は直接呼び出され、進捗通知のみで
+    初回ロードを 1 区間に閉じ込めること（共有プリミティブ自体は温存）。
     """
     import pipelines.components.ben2_components as ben2_module
 
-    routed: dict[str, object] = {}
-
-    def _spy_keepalive(work, progress_callback, stage, *, fraction, description, **kwargs):
-        routed["work"] = work
-        routed["stage"] = stage
-        return work()
-
-    monkeypatch.setattr(ben2_module, "run_with_progress_keepalive", _spy_keepalive)
+    assert not hasattr(ben2_module, "run_with_progress_keepalive"), (
+        "ben2_components は run_with_progress_keepalive を import しない（Layer A 撤去）"
+    )
 
     events: list[str] = []
 
@@ -247,8 +241,7 @@ def test_run_routes_warmup_through_progress_keepalive(tmp_path, monkeypatch) -> 
         matte_mode="union",
     )
 
-    assert routed.get("stage") == "ben2_route_a", "warm_up を keep-alive ポンプ経由で実行していない"
-    assert routed.get("work") == recording.warm_up, "keep-alive ポンプへ extractor.warm_up を渡していない"
+    assert "warm_up" in events, "run() が BEN2 モデルを先読み（warm_up）していない"
     assert events.index("warm_up") < events.index("infer"), "warm_up は初回 infer_alpha より前"
 
 

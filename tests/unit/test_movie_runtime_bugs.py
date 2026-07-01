@@ -146,6 +146,26 @@ def test_warm_up_registers_samurai_searchpath_helper_called() -> None:
     assert "_ensure_samurai_config_searchpath" in source
 
 
+def test_warm_up_missing_checkpoint_raises_actionable_error(tmp_path) -> None:
+    """存在しない tracker checkpoint を選ぶと、深い import/torch.load エラーではなく
+    ファイル名と代替を明示する fail-fast エラーにする（ERR066）。
+
+    registry は SAM2.1/SAMURAI の Large/B+ 計4 tracker を提供するが、B+ 系 checkpoint
+    （sam2.1_hiera_base_plus.pt）が未配置だと選択時に sam2 内部の FileNotFoundError で
+    分かりにくく落ちる。build 前に存在検証し、原因と代替を案内する。
+    """
+    missing = tmp_path / "sam2.1_hiera_base_plus.pt"
+    propagator = video_model_components.SAM2VideoPropagator(
+        checkpoint_path=str(missing),
+        config_name="configs/sam2.1/sam2.1_hiera_l.yaml",
+    )
+    with pytest.raises(RuntimeError) as excinfo:
+        propagator.warm_up()
+    message = str(excinfo.value)
+    assert str(missing) in message
+    assert "checkpoint" in message.lower()
+
+
 # ─────────────────────────────────────────
 # Bug D: RGBA(透過)動画は imageio+ffmpeg で alpha 付き書き出す（cv2 は 4ch 不可）（ERR047）
 # ─────────────────────────────────────────
@@ -186,7 +206,10 @@ def test_select_rgba_codec_raises_clear_error_when_imageio_missing(monkeypatch, 
 
 
 def test_transparent_bg_video_rgba_streams_4channel_to_imageio(monkeypatch, tmp_path) -> None:
-    """動画モードの RGBA stream が 4ch RGBA を imageio へ append する（cv2 へは渡さない）。"""
+    """動画モードの RGBA stream が 4ch RGBA を imageio へ append する（cv2 へは渡さない）。
+
+    alpha/preview は VP9(`_ImageioWebmVideoWriter`) でブラウザ再生互換に書き出す（ERR065）。
+    """
     import numpy as np
 
     appended: list[np.ndarray] = []
@@ -204,20 +227,21 @@ def test_transparent_bg_video_rgba_streams_4channel_to_imageio(monkeypatch, tmp_
             writer_kwargs.update(kwargs)
             return _FakeImageioWriter()
 
-    captured_channels: list[int] = []
+    h264_frame_channels: list[int] = []
 
-    class _FakeOpenCVWriter:
-        def __init__(self, path, first_frame, fps, fourcc_name, channels) -> None:
-            captured_channels.append(int(channels))
+    class _FakeWebmWriter:
+        def __init__(self, path, first_frame, fps) -> None:
+            return None
 
         def write(self, frame: np.ndarray) -> None:
-            return None
+            frame_array = np.asarray(frame)
+            h264_frame_channels.append(1 if frame_array.ndim == 2 else int(frame_array.shape[2]))
 
         def close(self) -> None:
             return None
 
     monkeypatch.setattr(video_model_components, "_require_imageio", lambda: _FakeImageio())
-    monkeypatch.setattr(video_model_components, "_OpenCVFrameVideoWriter", _FakeOpenCVWriter)
+    monkeypatch.setattr(video_model_components, "_ImageioWebmVideoWriter", _FakeWebmWriter)
 
     extractor = video_model_components.TransparentBGVideoExtractor(output_dir=str(tmp_path))
 
@@ -240,6 +264,6 @@ def test_transparent_bg_video_rgba_streams_4channel_to_imageio(monkeypatch, tmp_
     # RGBA は imageio へ 4ch のまま 2 frame 渡る。
     assert len(appended) == 2
     assert appended[0].ndim == 3 and appended[0].shape[2] == 4
-    # alpha/preview のみ cv2 writer（1ch/3ch）。RGBA(4ch) は cv2 へ渡さない。
-    assert 4 not in captured_channels
+    # alpha/preview のみ VP9 writer（RGBA(4ch) は webm writer へ渡さない）。
+    assert h264_frame_channels and 4 not in h264_frame_channels
     assert writer_kwargs.get("pixelformat") == "yuva420p"

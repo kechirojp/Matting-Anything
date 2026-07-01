@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from typing import Any
 
+import cv2
 import numpy as np
 from haystack import component
 
@@ -66,6 +67,20 @@ class OwnershipResolver:
             ownership_map[int(frame_idx)] = ownership
             # 前景 soft = 1 - 背景所有権（最終チャネル）。
             foreground_masks[int(frame_idx)] = np.clip(1.0 - ownership[-1], 0.0, 1.0).astype(np.float32)
+
+        # DEVA tracker が host-RAM 抑制のため per_object_logits を縮小した場合、原寸 (H,W) が
+        # ``frame_hw`` に付与される（ERR068）。BEN2 union ゲートは原寸の soft guard を要求するため、
+        # foreground（frame_masks）を原寸へアップスケールする。frame_hw が無ければ（基底アプリ等）
+        # 従来通り logits 解像度のままとし、振る舞いを変えない。ownership は per_object 経路（frame_hw
+        # 未付与＝原寸）でのみ使われるため、ここでは拡大しない。
+        frame_hw = masks.get("frame_hw")
+        if frame_hw is not None:
+            target_h, target_w = int(frame_hw[0]), int(frame_hw[1])
+            for fi, fg in foreground_masks.items():
+                if fg.shape[:2] != (target_h, target_w):
+                    foreground_masks[fi] = cv2.resize(
+                        fg, (target_w, target_h), interpolation=cv2.INTER_LINEAR
+                    ).astype(np.float32)
 
         # 入力 FrameMaskSequence を引き継ぎつつ frame_masks を前景 soft に差し替える。
         result = dict(masks)

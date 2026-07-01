@@ -32,6 +32,235 @@
 
 ## エラー一覧
 
+### [ERR068] DEVA 方式動画アプリで 4K×多対象時に per_object_logits をフル解像度 float32 で全 frame 蓄積し host-RAM 枯渇 → `numpy._ArrayMemoryError`（約7分後クラッシュ）
+
+| 項目 | 内容 |
+|------|------|
+| **深刻度** | High |
+| **頻度** | DEVA 方式アプリで高解像度（例 4K）× 検出多数（例 person を19 box）動画で必発 |
+| **初回発生日** | 2026-07-01 |
+| **関連ファイル** | `pipelines/components/deva_semi_online_tracker.py`, `pipelines/components/ownership_resolver.py`, `pipelines/components/route_a_common.py`, `config/route_a.toml`, `gradio_app_sam2_ben2_route_a_deva_for_Movie.py`, `tests/unit/test_deva_semi_online_tracker.py`, `tests/unit/test_ownership_resolver.py`, `tests/unit/test_route_a_common.py` |
+
+**エラー内容**（`エラーログ/エラーログ_29.md`）:
+DEVA 方式アプリ（http://127.0.0.1:7863）を実行。GroundingDINO（CPU）読込→SAM2 伝播が semi-online で約19クリップ進行→VP9 webm 書き出し中、ログ末尾に約200件の Haystack シリアライズ WARNING に続き本当のスタックトレース:
+```
+File "pipelines/components/video_model_components.py", line 753, in run
+    per_object_logits[int(frame_index)] = np.stack(ordered, axis=0)
+numpy._core._exceptions._ArrayMemoryError:
+    Unable to allocate 641. MiB for an array with shape (19, 4096, 2160) and data type float32
+  ... direct cause of ...
+File "pipelines/components/deva_semi_online_tracker.py", line 219, in run
+File "gradio_app_sam2_ben2_route_a_deva_for_Movie.py", line 236
+File "haystack/core/pipeline/pipeline.py", line 429, in run
+```
+
+**原因**:
+- **真因は host-RAM（VRAM ではない）枯渇**。`DevaSemiOnlineTracker` が `global_per_object_logits` として**フル解像度 float32 の per-object logits（N対象×H×W）を動画の全 frame 蓄積**していた。GroundingDINO が "person" を多数（top_k=20, box_threshold=0.25 既定で19 box）検出 → 4K（4096×2160）で 19×4096×2160×4byte ≈ 641 MiB/frame × 約190 frame ≒ 120GB 超を要求し numpy が確保失敗。クラッシュは propagator の `np.stack` で表面化したが、直接原因は tracker の累積で既に RAM が埋まっていたこと。
+- **約200件の Haystack WARNING は無害なノイズ**。新しめの Haystack は Component が例外を投げると pipeline 状態の snapshot を試み、シリアライズ不能なフィールド（`progress_callback` クロージャ、numpy ndarray）で WARNING を出す。真の traceback はログ末尾にある（最後まで読むこと）。
+
+**対処法（修正＝根治、5箇所＋テスト、すべて後方互換）**:
+1. `config/route_a.toml` に `[deva] per_object_logits_max_side = 1024` を追加（メモリ制御。低 RAM 環境は 512 へ）。
+2. `route_a_common.py` の `_DEFAULT_ROUTE_A_CONFIG` に `"deva"` セクション追加。
+3. `deva_semi_online_tracker.py`: `_downsample_per_object_logits` ヘルパ追加、`run()` に `per_object_logits_max_side: int = 0`（0=原寸=後方互換）追加。>0 で蓄積 logits を長辺≤max_side へ縮小（per-object チャネルごと `cv2.resize` INTER_AREA、空クリップ `(0,H,W)` も縮小形状）し、原寸を `masks["frame_hw"]` に保持。`frame_masks`（overlay 用）は原寸維持。
+4. DEVA アプリ: `_deva_per_object_logits_max_side()` で config 値を読み tracker inputs へ注入。union 経路は config 値、**per_object 経路は所有権合成が原寸 logit を要するため 0**。
+5. `ownership_resolver.py`: `masks["frame_hw"]` があれば前景 `frame_masks` を `cv2.resize`（INTER_LINEAR）で原寸へアップスケール（BEN2 union ゲートが原寸 soft guard を要求）。frame_hw 無し（基底アプリ等）は従来解像度のまま。
+- 効果: per_object_logits は最終 α ではなく**膨張＋ブラーされる低周波の soft guard**のため縮小しても実害が小さい（最終 α は BEN2 が原寸生成）。メモリは 4K×19対象で 641→約45 MiB/frame（約1/14）に削減し、**非有界→有界**化。
+- TDD: tracker 縮小＋`frame_hw` 付与、空クリップ縮小、原寸 `frame_masks` 維持、resolver の原寸アップスケール、`route_a_common` の `deva` キー/型を検証。非 integration 全体 **347 passed**（回帰なし）。DEVA アプリ `--help` smoke 成功。
+
+**再発防止**:
+- **Haystack の snapshot-on-exception WARNING は真因を隠す**。例外時のログは**最後まで読み**、末尾の実トレースバックを真因とする。WARNING の洪水＝真因ではない。
+- per-frame・per-object のフル解像度 float32 を**動画の全 frame 蓄積する設計は host-RAM を非有界に消費する**。蓄積データは解像度・dtype・有界性を必ず見積もる。soft guard 用途のデータは低解像度で十分。
+- 解像度を変える Component 間契約は `frame_hw` のような原寸メタを添えて下流が復元できるようにする。後方互換のため「メタ無し＝従来挙動」を必ず担保する。
+- 既知の未防御（follow-up）: `per_object_logits_max_side>0` かつ per_object 経路の組合せは UI から到達不能だが、将来の別呼び出し元では `composite_alpha_by_ownership` が shape 不一致で `ValueError` になる（silent ではない）。境界ガード追加は別途検討。
+
+### [ERR067] DEVA 方式 検出島で複数 box を SAM2 画像モードに渡すと `(K,C,H,W)` 4 次元で `build_mask_set` が `ValueError`（masks は (H,W) または (N,H,W)）
+
+| 項目 | 内容 |
+|------|------|
+| **深刻度** | High |
+| **頻度** | DEVA 方式アプリで検出が2 box 以上のフレームで必発 |
+| **初回発生日** | 2026-06-30 |
+| **関連ファイル** | `pipelines/components/model_components.py`（`SAM2Segmenter.run`）, `pipelines/components/detection_island.py`, `pipelines/components/common.py`（`build_mask_set`/`normalize_masks`）, `tests/unit/test_sam2_segmenter_batched_boxes.py` |
+
+**エラー内容**:
+DEVA 方式アプリ（`gradio_app_sam2_ben2_route_a_deva_for_Movie.py`）を text_prompt="person" で実行すると、検出島が約3.4秒で `gr.Error` 終了。Playwright 検証は「完了:」を待ち続け30分タイムアウトした（実体はタイムアウトではなく即時エラー）。スタックトレース要点:
+```
+ValueError: masks は (H,W) または (N,H,W) 形式である必要があります: shape=(16, 3, 4096, 2160)
+detection_island._detect_one → SAM2Segmenter.run → build_mask_set → normalize_masks
+```
+
+**原因**:
+`SAM2Segmenter.run` は `boxes`（複数 box / batched）引数を構文上は受け付ける設計だが、SAM2 image predictor は複数 box を渡すと `(K, C, H, W)`（box 数 K × multimask 候補 C）の4次元を返す。`run` はこれを候補軸 C で畳まずそのまま `build_mask_set`→`normalize_masks`（(H,W)/(N,H,W) のみ受理）に渡すため4次元で `ValueError`。検出島側の `normalize_segmenter_masks`（4次元を畳む helper）に到達する前に segmenter 内部で落ちていた。基底アプリは常に単一 box / points（`(C,H,W)` 3次元）でしか呼ばないため顕在化していなかった。
+
+**対処法（修正＝根治）**:
+- `SAM2Segmenter.run` の `predict` 直後に「`masks.ndim == 4` のときだけ」候補軸 C を score 最大で畳んで `(K, H, W)`・scores を `(K,)` に正規化する処理を追加。`C == 1` は `[:, 0, :, :]`、`C > 1` は box ごと `argmax(score)` 候補を選択。
+- 単一 box / points 経路の `(C, H, W)` 3次元出力はこの分岐を通らず**完全に無変更**（基底アプリ・既存テストに影響なし）。
+- TDD: fake predictor で `(K, C, H, W)`→`(K, H, W)` 畳み込み、`C==1`、単一 box 非対象を検証する `tests/unit/test_sam2_segmenter_batched_boxes.py`（3 ケース）を追加。非 integration 全体 342 passed（回帰なし）。
+- 修正後、DEVA アプリを再起動し Playwright 実機検証 PASS（出力動画5本に src 充足、status に「完了:／処理時間」表示、SAM2 伝播はクリップ 11/11/10 で semi-online 動作、VP9 書き出し成功）。
+
+**再発防止**:
+- SAM2 image predictor に**複数 box（batched）を渡すと出力は4次元 `(K, C, H, W)`**。MaskSet 契約 `(N,H,W)` へは候補軸を畳んでから渡す。`build_mask_set`/`normalize_masks` は4次元を受理しない仕様。
+- Playwright 実機検証スクリプトは「完了:」だけでなく「失敗しました / Error」も `wait_for_function` 条件に含め、エラー時に長時間ハングさせない（`outputs/verify_routea_deva_sync_output.py` に反映済み）。
+- 新規 Haystack Component の I/O 契約（特に形状）は fake ではなく**実 run() を fake predictor で**通すテストで境界を踏むこと。fake が contract を肩代わりすると本体のバグを見逃す。
+
+### [ERR066] トラッカー B+ 系（sam2.1_hiera_base_plus.pt 未配置）選択時に sam2 内部の FileNotFoundError で分かりにくく落ちる／ネガティブ点が効かない疑惑の切り分け
+
+| 項目 | 内容 |
+|------|------|
+| **深刻度** | Medium |
+| **頻度** | B+ トラッカー（SAM2.1 Hiera-B+ / SAMURAI Hiera-B+）選択時に必発（B+ 重み未配置環境） |
+| **初回発生日** | 2026-06-27 |
+
+**エラー内容（調査の発端）**:
+ユーザー報告「(1) ネガティブポイントプロンプトをポジティブで伝えている疑惑がある。(2) トラッキングモデル二つと SAM2.1 の連携が取れていない気がする」。
+
+**調査結果（切り分け）**:
+- **(1) ネガティブ点はバグではない**: UI の `point_label` Radio（"positive"/"negative"）→ `select_sam2_prompt` で `is_positive = point_label.lower()=="positive"` → `state["labels"]` に `1`(positive)/`0`(negative) を `points` と同時 append（常に同期）→ `run_route_a_background_removal` が `labels` を `sam2_video_propagator` へ → `add_new_points_or_box(labels=np.int32([... 0 ...]))` まで `0` を保持。box 併用時も `assign_points_to_boxes` が最寄り box に割り当てつつ `assigned_labels` で label を保持。**負点は負点として正しく SAM2 に渡っている**。「効いていない」体感の主因は ERR064 で明文化済みの **ルートA設計**: SAM2 マスク（=point の反映先）は『背景ブラーのゲート G』専用で、最終 α は BEN2 が単独生成（BEN2 はマスク入力ポートなし）。`gate_alpha=OFF` だと point が最終 α を直接変えないため負点が無効に見える。`gate_alpha=ON` で α をゲート内に限定すると point が効く。Tracking Overlay で SAM2 マスクが point を反映して変わることを確認すれば SAM2 への伝達は検証できる（既に hint メッセージで案内済み）。
+- **(2) トラッカー連携の実害**: registry（`config/inference_models.toml`）は SAM2.1 Large/B+ と SAMURAI Large/B+ の計4 tracker を提供し、各 id は `get_route_a_pipeline` が個別の `config_name`/`checkpoint_path` で `SAM2VideoPropagator` を構築（id ごとに `_PIPELINE_CACHE`）＝配線は正しい。同梱 SAMURAI fork（`samurai/sam2/sam2`）は `configs/sam2.1` と `configs/samurai` の両方を持ち、`INFERENCE_TRACKER_VARIANT` 未設定で4 tracker 全て dropdown に表示・利用可。**しかし `checkpoints/SAM2/` には `sam2.1_hiera_large.pt` のみ存在し、B+ 系が参照する `sam2.1_hiera_base_plus.pt` が未配置**。B+ を選ぶと `warm_up`→`build_sam2_video_predictor`→`torch.load(missing, weights_only=True)` が **約9秒後に深い `FileNotFoundError`** で落ち、原因が分かりにくい。これが「連携が取れていない」感覚の実体。
+
+**原因**:
+`SAM2VideoPropagator.warm_up` が checkpoint の存在を build 前に検証していなかった。dropdown は `build_dropdown_choices("tracker")` が `requires`/`INFERENCE_TRACKER_VARIANT` でのみ可用判定し、**checkpoint 実在は判定しない**ため、重み未配置の B+ も選択肢に出る。
+
+**対処法**:
+`SAM2VideoPropagator.warm_up` 冒頭（冪等 early-return 直後・`require_gpu_for_heavy_inference` と sam2 import の前）に **fail-fast の checkpoint 存在検証**を追加。`Path(self.checkpoint_path).is_file()` が False なら、欠落ファイル名と代替（重みが揃った Large）を示す `RuntimeError` を送出。これで sam2 import 前に即時・明確に失敗し、全アプリ（RouteA / TB 動画）で共通に効く。ネガティブ点側はバグなしのためコード変更なし（設計説明のみ）。
+
+**検証**:
+- `tests/unit/test_movie_runtime_bugs.py::test_warm_up_missing_checkpoint_raises_actionable_error`（RED→GREEN）: 存在しない checkpoint で `warm_up` が `RuntimeError`（メッセージにファイル名・"checkpoint" を含む）を即時送出することを固定。RED 時は torch の `FileNotFoundError`（約9秒）だったのが GREEN で約5秒の明確エラーに。
+- `pytest -m "not integration"` → **294 passed / 3 deselected**。`get_errors` 0。
+- UI レンダリング変更ではなくバックエンドの fail-fast 検証のため ERR035 の Playwright 実機検証は非該当。
+
+**備考**:
+- 関連ファイル: `pipelines/components/video_model_components.py`（`SAM2VideoPropagator.warm_up` に存在検証追加）, `tests/unit/test_movie_runtime_bugs.py`。
+- 恒久対応の選択肢: B+ を使うなら `sam2.1_hiera_base_plus.pt` を `checkpoints/SAM2/` に配置する。配置しないなら現状は明確エラーで Large 選択を案内する（dropdown からの非表示化は今回スコープ外）。
+- 教訓: 選択式モデルは「config/変異(variant)が解決できる」ことと「重みが実在する」ことを別々に検証する。`torch.load` 直前ではなく選択直後（build 前）にファイル存在を fail-fast する。レビューは GPT-5.5 が実施（本タスクではサブエージェントレビュー未実行）。
+
+---
+
+### [ERR065] RouteA/TB 動画アプリで Alpha/Preview/Tracking Overlay 動画が UI に表示されない（cv2 'mp4v' は非対応コーデック）
+
+| 項目 | 内容 |
+|------|------|
+| **深刻度** | High |
+| **頻度** | 同期実行(ERR064)で出力が届くようになって以降、RGBA 以外の3動画で必発 |
+| **初回発生日** | 2026-06-26 |
+
+**エラー内容**:
+ERR064 で同期直結に戻して推論プログレスと出力配線が復活した後も、`gr.Video` の Alpha / Preview / Tracking Overlay の3本だけが「表示されない（再生できない）」。RGBA(webm) と進捗スピナーのみ正常。
+
+**原因**:
+RGBA は `_ImageioAlphaVideoWriter`（imageio+ffmpeg, webm/VP9）で書き出すのに対し、Alpha/Preview/Tracking Overlay は **cv2 `VideoWriter` の `'mp4v'`（MPEG-4 Part 2）** で書き出していた。MPEG-4 Part 2 は Chromium/Chrome の `<video>`（= `gr.Video`）でデコードできず（`MediaError code 4 = MEDIA_ERR_SRC_NOT_SUPPORTED`）、ファイルは生成されても画面に出ない。ERR064 以前は非同期 Timer 不発で出力自体が届かず、この潜在不具合が表面化していなかった。
+
+**対処法**:
+ブラウザ再生互換の **VP9/webm streaming writer `_ImageioWebmVideoWriter`**（imageio+ffmpeg, `codec="vp9"`, `pixelformat="yuv420p"`, `output_params=["-auto-alt-ref","0"]`, `macro_block_size=2`）を `pipelines/components/video_model_components.py` に追加。grayscale(2D/1ch)→RGB複製、RGBA(4ch)→先頭3ch に正規化して書き出す。cv2 `_OpenCVFrameVideoWriter("mp4v", ...)` を使っていた5箇所（BEN2 alpha/preview、TransparentBG alpha/preview、TrackingOverlayWriter overlay）を置換し、出力拡張子を `alpha.webm` / `preview.webm` / `tracking_overlay.webm` に変更（VP9 は mp4 コンテナ非互換のため webm 必須）。`_require_imageio()` の例外契約は維持。RGBA(webm/VP9) と統一したことで全 Chromium 系で再生互換。
+
+**検証**:
+- 新規 `tests/unit/test_browser_playable_video_writer.py`（RED→GREEN）: `_ImageioWebmVideoWriter` の出力を imageio-ffmpeg の `ffmpeg -i` でプローブし `vp9` を確認、`mpeg4`/`mpeg-4 part 2` 不在を確認。grayscale frame が RGB(3ch) に複製されることを再読込で確認。
+- 既存 `tests/unit/test_movie_runtime_bugs.py::test_transparent_bg_video_rgba_streams_4channel_to_imageio` を新コーデック契約（RGBA は imageio へ 4ch / alpha・preview は webm writer へ 3ch・1ch、`_ImageioWebmVideoWriter` 監視）へ更新。
+- `pytest -m "not integration"` → 293 passed / 3 deselected。`--help`（RouteA 動画）→ exit 0。
+- Playwright 実機（`outputs/verify_err065_video_playback.py`, Chromium 148）: 実際に生成した preview/alpha/overlay の webm を `<video>` に読み込み `readyState=4, videoWidth>0, error=null`（再生可）。対比で旧 cv2 'mp4v' は `error=4, videoWidth=0`（再生不可）を確認（ERR035 ランタイム検証）。
+
+**備考**:
+- 関連ファイル: `pipelines/components/video_model_components.py`（`_ImageioWebmVideoWriter` 追加・TB/overlay 置換）, `pipelines/components/ben2_components.py`（BEN2 置換・import 更新）, `tests/unit/test_browser_playable_video_writer.py`, `tests/unit/test_movie_runtime_bugs.py`, `outputs/verify_err065_video_playback.py`。
+- 教訓: `gr.Video` が再生できるのは webm/VP9・H.264(avc1)・AV1 等。cv2 既定の `'mp4v'`(MPEG-4 Part 2) は不可。動画出力は必ず webm/VP9 か H.264 で書き出す。H.264 は Playwright バンドル Chromium でデコードできない場合があるため、実機検証可能性と RGBA との一貫性を優先して VP9/webm に統一した。
+- レビューは GPT-5.5 が実施（本タスクではサブエージェントレビュー未実行）。
+
+---
+
+### [ERR064] RouteA 動画アプリで出力(alpha/preview/tracking overlay)が UI に描画されず推論プログレスも出ない（非同期 Timer ポーリング不発）
+
+| 項目 | 内容 |
+|------|------|
+| **深刻度** | High |
+| **頻度** | ローカル実行(127.0.0.1, トンネル不使用)で RouteA 動画を実行すると必発 |
+| **初回発生日** | 2026-06-26 |
+
+**エラー内容**:
+`gradio_app_sam2_ben2_route_a_for_Movie.py` で実行しても RGBA/Alpha/Preview/Tracking Overlay の各 `gr.Video` に出力が出ず、Gradio 標準の推論プログレス（スピナー）も表示されない。negative point も「効いていない」ように見える（実際は overlay 自体が出ないため確認不能）。
+
+**原因**:
+ERR058（gradio.live トンネルの SSE 切断対策）で導入した非同期ジョブ方式（`JobManager` + `gr.Timer` ポーリング）が原因。`run_btn.click` は `start_route_a_job`→job_id 即返しのみで、出力は `route_a_timer.tick(poll_route_a_job, ...)` 経由で流す設計だった。ローカル実行ではトンネル切断が起きず非同期方式は不要な上、Timer ポーリングが UI に出力・進捗を届けず空のままになった。同期 click でないため標準プログレスも出ない。negative point の伝播自体はデータ経路（`select_sam2_prompt` が label=0 を state 保存→`run_route_a_background_removal` が `labels` を `sam2_video_propagator` へ→`add_new_points_or_box(labels=...)`）に問題なく、overlay 非表示が「伝播なし」に見えた二次症状。
+
+**対処法**:
+ユーザー選択「ローカル前提で同期実行へ戻す」に従い、配線のみ最小変更:
+- `run_btn.click(start_route_a_job, outputs=[job_id, status, timer, btn])` + `route_a_timer.tick(poll_route_a_job, ...)` を撤去し、`run_btn.click(run_route_a_background_removal, inputs=[...19...], outputs=[rgba_video, alpha_video, preview_video, tracking_overlay_video, sequence_files, sequence_dirs, run_status])` へ同期直結。
+- BEN2 のみタブも `route_a_only_run_btn.click(run_route_a_only_background_removal, outputs=[...6...])` へ同期直結し `.tick` 撤去。
+- 非同期関数群（`start_*_job`/`poll_*_job`/`_ProgressBridge`/`_JOB_MANAGER`）と timer/job_id コンポーネント・`JobManager` import は Colab 再利用に備え温存（未配線=無害）。
+- fail-fast 検証（動画・prompt 未指定で `gr.Error`）は `run_route_a_background_removal` 内部に残存するため同期直結でも維持。
+
+**検証**:
+- 新規 `tests/unit/test_routea_movie_sync_wiring.py`: `demo.fns` 内省で run ボタンが各コア関数へ同期直結し Tracking Overlay 含む出力ラベルが outputs に含まれることを固定（RED→GREEN）。
+- `pytest -m "not integration"` → 291 passed / 3 deselected。`--help` → exit 0。
+- Playwright 実機（`outputs/verify_routea_sync_output.py`, port 7862, samurai_demo.mp4 30 frames, box + negative point）→ 完了表示 + 出力 `<video>` 5本に src 充足 PASS（ERR035 ランタイム検証）。
+
+**備考**:
+- 関連ファイル: `gradio_app_sam2_ben2_route_a_for_Movie.py`（配線 1331-1346 付近）, `tests/unit/test_routea_movie_sync_wiring.py`, `outputs/verify_routea_sync_output.py`。
+- 教訓: Colab/tunnel 専用の姑息療法（非同期ジョブ・keep-alive）はローカル実行では UX を損なう。実行環境に応じ同期/非同期を切替可能にしておく（今回は同期を既定化し非同期は温存）。
+
+---
+
+### [ERR063] RouteA 動画アプリで「Prompt をクリア / 点・bbox 削除」が UI（canvas）に反映されない（overlay 焼き込み）
+
+| 項目 | 内容 |
+|------|------|
+| **深刻度** | High |
+| **頻度** | RouteA 動画アプリで prompt を1つ以上置いた後のクリア/削除操作で必発 |
+| **初回発生日** | 2026-06-26 |
+| **関連ファイル** | `gradio_app_sam2_ben2_route_a_for_Movie.py`, `pipelines/components/ui_helpers.py`（`draw_prompt_overlay`）, `tests/unit/test_routea_movie_prompt_clear_wiring.py`, `outputs/verify_routea_prompt_clear.py` |
+
+**エラー内容**:
+- prompt（点 / box）を置いた後に「Prompt をクリア」や個別削除を押しても、状態は空になるのに canvas の overlay が消えず見た目に残る。
+
+**原因**:
+- overlay 描画ハンドラ群（`clear_prompt` / `select_sam2_prompt` / `extend_box_to_edge` / `detect_text_boxes_for_video` / `apply_selected_boxes` / `remove_selected_prompt_points` / `remove_selected_prompt_boxes`）が、描画の**基準画像に overlay 焼き込み済みの `prompt_canvas`** を渡していた。
+- `draw_prompt_overlay(input_image, state, mask)` は `input_image.copy()` 上に state を再描画する純関数。基準が「前回 overlay を焼き込んだ画像」だと、state を空にしても古い overlay が残ったまま新 state を重ねるため、クリア/削除が視覚的に消えない。
+
+**対処法**:
+- クリーンフレーム（overlay 無しの元フレーム）専用の **`prompt_base_image = gr.State(...)`** を追加し、overlay 描画は常にこのクリーンベースから行う（state を真実の源とする）。
+- フレーム取得系（`extract_first_frame_outputs` / 新規 `extract_first_frame_with_base` / `extract_prompt_frame_with_base`）が canvas と base の両方へ同一クリーンフレームを返し、base を更新するのは「フレームが変わるイベントのみ」。detect/apply/削除は base を出力に含めない（フレーム不変・追加情報は state が保持）。
+- 全 overlay ハンドラの描画基準入力を `prompt_canvas` → `prompt_base_image` に変更。
+
+**再発防止**:
+- Gradio で overlay を再描画する UI は、**表示中（overlay 済み）の画像を再描画基準に使わない**。クリーンベースを `gr.State` で保持し、overlay は毎回そこから state を基に再構築する（idempotent）。
+- 座標基準は base と表示 canvas が同解像度・同フレームなら一致するためズレない（`evt.index` を base.shape で clamp）。
+
+**検証（ERR035 準拠）**:
+- ソース配線回帰: `tests/unit/test_routea_movie_prompt_clear_wiring.py`（base State 存在 / 各ハンドラの描画基準 / フレーム取得 outputs / prewarm 撤去）。
+- Playwright 実機検証: `outputs/verify_routea_prompt_clear.py`。動画ロード→box 描画→クリアの canvas 差分で判定。結果 **PASS**（`diff(A_loaded,B_box)=1.523` / `diff(B_box,C_cleared)=1.523` / `diff(A_loaded,C_cleared)=0.000` ＝ クリア後にクリーンフレームへ完全一致）。
+
+**備考**:
+- 同セッションで Colab/tunnel 専用の姑息療法を撤去: Layer B（`prewarm_ben2_models` と未使用 import `warm_up_ben2_in_pipelines`）削除、Layer A（`ben2_components` の BEN2 warm_up を `run_with_progress_keepalive` ラップ→直呼び＋`_notify_progress` に戻す）。Layer C（非同期ジョブ JobManager + `gr.Timer`）と Layer D（`release_text_detector` の VRAM 解放、コメントのみ修正）は温存。
+- 共有プリミティブ `run_with_progress_keepalive`（`video_model_components.py`）と `warm_up_ben2_in_pipelines`（`route_a_video_pipeline.py`）は本番呼び出し元が消えたが、Colab 等での再運用を想定し docstring に温存理由を明記して残置。
+
+### [ERR062] Windows で `ProactorBasePipeTransport._call_connection_lost` が `WinError 10054` を出し続ける
+
+| 項目 | 内容 |
+|------|------|
+| **深刻度** | Medium |
+| **頻度** | RouteA 動画アプリ稼働中に時々（接続の張り替えタイミング依存） |
+| **初回発生日** | 2026-06-26 |
+| **関連ファイル** | `gradio_app_sam2_ben2_route_a_for_Movie.py` |
+
+**エラー内容**:
+- `ERROR:asyncio:Exception in callback _ProactorBasePipeTransport._call_connection_lost(None)`
+- `ConnectionResetError: [WinError 10054] 既存の接続はリモート ホストに強制的に切断されました。`
+
+**原因**:
+- Windows 既定の Proactor イベントループで、ブラウザ側の接続切断/再接続時に `connection_lost` コールバックが noisy に例外ログを出す既知パターン。
+- RouteA アプリは `gr.Timer` でジョブ進捗をポーリングするため、接続張り替えのタイミングで当たりやすい。
+- **重要**: 当初 `gradio` import 前に `asyncio.WindowsSelectorEventLoopPolicy()` を適用したが**効かなかった**。Gradio が内部で使う uvicorn は Windows でも自前で Proactor ループを使い続けるため、グローバルの event loop policy 切替ではサーバーループに反映されない（トレースバックが `proactor_events.py` のままなのが証拠）。
+
+**対処法**:
+- `gradio` import 前に Windows のみ、`asyncio.proactor_events._ProactorBasePipeTransport._call_connection_lost` を `functools.wraps` でラップし、**`ConnectionResetError`（WinError 10054）だけ**を握って `return None` する（他の例外は素通し）。
+- これは「クライアント切断時の競合で出る無害なシャットダウン例外」のみをピンポイントに抑制する定番対処。`try/except: pass` の全握り潰しではなく、対象例外型を限定している点に注意。
+- Selector policy 切替（旧案）は uvicorn の Proactor ループ採用により無効のため撤去済み。
+
+**再発防止**:
+- Windows + Gradio/uvicorn の `WinError 10054` ノイズは event loop policy 切替では消えない。Proactor トランスポートの `_call_connection_lost` ラップで対象例外型限定の抑制を行う。
+- これはログノイズ抑制であり、実ネットワーク断そのものは別問題として切り分ける。握り潰す例外型は `ConnectionResetError` のみに限定する。
+
+**備考**:
+- 動作確認: `python gradio_app_sam2_ben2_route_a_for_Movie.py --help` 正常。
+
 ### [ERR061] Windows の非ASCII（日本語）パスで `cv2.imwrite` / `cv2.imread` が無言失敗し `PNG 保存に失敗しました`（overlay frame_000000.png）
 
 | 項目 | 内容 |

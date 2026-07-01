@@ -92,6 +92,11 @@ def warm_up_ben2_in_pipelines(
 ) -> int:
     """各 Pipeline 内の BEN2 extractor を事前ロードし、成功件数を返す。
 
+    NOTE（2026-06-26）: Windows local 直結運用への移行に伴い、RouteA 動画アプリの本番
+    呼び出し元（``prewarm_ben2_models`` / ``__main__``）は撤去済み。local では tunnel/SSE
+    idle 切断が起きないため起動前 prewarm は不要。本関数は **Colab/gradio.live 等の共有
+    トンネルで再運用する場合のために温存**しており、現状はユニットテストからのみ参照される。
+
     BEN2 の重み（``from_pretrained`` 経由・約380MB）は既定で初回推論時に遅延 DL される。
     Colab/gradio.live ではこの DL がリクエスト処理中（SSE ストリーム中）に走ると、HF 未認証
     リクエストのレート制限で DL が長時間化し SSE が無通信→idle 切断され全出力「Error」になる

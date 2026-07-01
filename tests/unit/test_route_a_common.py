@@ -26,9 +26,10 @@ def test_load_route_a_config_returns_defaults_for_missing_file(tmp_path):
 def test_load_route_a_config_reads_repo_file():
     repo_toml = Path(__file__).resolve().parents[2] / "config" / "route_a.toml"
     config = load_route_a_config(repo_toml)
-    assert set(config.keys()) == {"alpha", "blur_guide", "composite"}
+    assert set(config.keys()) == {"alpha", "blur_guide", "composite", "deva"}
     assert config["alpha"]["ben2_repo_id"]
     assert isinstance(config["blur_guide"]["blur_kernel"], int)
+    assert isinstance(config["deva"]["per_object_logits_max_side"], int)
 
 
 def test_load_route_a_config_merges_partial_overrides(tmp_path):

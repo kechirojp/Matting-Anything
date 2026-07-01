@@ -553,6 +553,21 @@ class SAM2Segmenter:
             start = time.perf_counter()
             masks, scores, _logits = self._predictor.predict(**predict_kwargs)
             timings["predict"] = time.perf_counter() - start
+        # 複数 box（batched）を渡すと SAM2 は (K, C, H, W) を返す。候補軸 C を score 最大で畳んで
+        # (K, H, W) にし、MaskSet 契約（(N,H,W)）へ正規化する。単一 box / points 経路は (C,H,W) の
+        # 3 次元のままなので、この分岐は通らず影響しない。
+        masks = np.asarray(masks)
+        scores = np.asarray(scores)
+        if masks.ndim == 4:
+            k_dim, c_dim = int(masks.shape[0]), int(masks.shape[1])
+            if c_dim == 1:
+                masks = masks[:, 0, :, :]
+                scores = scores.reshape(k_dim, c_dim)[:, 0]
+            else:
+                score_kc = scores.reshape(k_dim, c_dim) if scores.size == k_dim * c_dim else np.zeros((k_dim, c_dim))
+                best = np.argmax(score_kc, axis=1)
+                masks = np.stack([masks[i, best[i]] for i in range(k_dim)], axis=0)
+                scores = np.stack([score_kc[i, best[i]] for i in range(k_dim)], axis=0)
         start = time.perf_counter()
         labels_out = [f"sam2_{index}" for index in range(len(masks))]
         mask_boxes = None

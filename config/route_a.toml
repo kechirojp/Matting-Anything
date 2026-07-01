@@ -53,3 +53,18 @@ gate_alpha = false
 # 前景ブラー/背景同系色で BEN2 saliency がフレーム毎に揺れる動画のちらつき抑制に有効。
 # gate_alpha（α を絞る/減算的）とは逆向き（α を底上げ/加算的）。両者は併用可能だが目的が逆。
 mask_floor_mode = "none"
+
+# ─────────────────────────────────────────
+# deva: DEVA 方式トラッカーのメモリ制御（gradio_app_sam2_ben2_route_a_deva_for_Movie.py 専用）
+# ─────────────────────────────────────────
+[deva]
+# per_object_logits（OwnershipResolver が消費する soft guard 用 logit）の長辺上限（px）。
+#   0          ... 縮小しない（原寸 float32 を全 frame 蓄積。基底アプリと同じ後方互換挙動）。
+#   1024（既定）... 長辺を 1024px 以下へ縮小し host-RAM を抑える。
+# ERR068: GroundingDINO が "person" を多数検出（例 19 box）し 4K 動画を処理すると、
+# 原寸 float32 の per_object_logits を全 frame 蓄積して host-RAM が枯渇し
+# numpy._ArrayMemoryError で 7 分後にクラッシュした。per_object_logits は最終 α ではなく
+# 膨張＋ブラーされる低周波の soft guard のため、縮小しても実害は小さい（最終 α は BEN2 が原寸生成）。
+# RAM が少ない環境ではさらに 512 へ下げると消費を半減できる。per_object 経路では原寸が必要なため
+# アプリ側が自動的に 0 を渡す（この値は union 経路にのみ適用される）。
+per_object_logits_max_side = 1024

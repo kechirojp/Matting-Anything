@@ -37,6 +37,11 @@ from .model_registry import (
     is_available,
     load_model_registry,
 )
+from .hybrid_alpha_components import (
+    BEN2TransparentHybridVideoExtractor,
+    build_person_region,
+    compose_hybrid_alpha,
+)
 from .video_common import FrameSampler
 from .video_model_components import (
     FrameSequenceWriter,
@@ -50,6 +55,7 @@ __all__ = [
     "AlphaCompositor",
     "BBoxFromMask",
     "BackgroundGenerator",
+    "BEN2TransparentHybridVideoExtractor",
     "ColorDecontaminator",
     "FrameSampler",
     "FrameSequenceWriter",
@@ -70,11 +76,13 @@ __all__ = [
     "TransparentBGVideoExtractor",
     "VideoReader",
     "VideoWriter",
+    "build_person_region",
     "clamp_prompt_point",
     "draw_prompt_overlay",
     "extend_box_to_edge",
     "normalize_box_from_points",
     "select_sam2_prompt",
+    "compose_hybrid_alpha",
     # model_registry
     "ModelEntry",
     "build_dropdown_choices",

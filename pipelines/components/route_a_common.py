@@ -45,6 +45,11 @@ _DEFAULT_ROUTE_A_CONFIG: dict[str, dict[str, Any]] = {
         "gate_alpha": False,
         "mask_floor_mode": "none",
     },
+    "deva": {
+        # per_object_logits の長辺上限（px）。0 で原寸（後方互換）。>0 で DEVA tracker が
+        # per_object_logits を縮小し host-RAM を抑える（ERR068: 4K×多対象で OOM）。
+        "per_object_logits_max_side": 1024,
+    },
 }
 
 
